@@ -1,0 +1,60 @@
+:root {
+    --bg-primary: #0a0c0e;
+    --bg-secondary: #111417;
+    --bg-tertiary: #1a1e24;
+    --border-color: #2a2f38;
+    --text-primary: #e0e0e0;
+    --text-secondary: #888;
+    --accent-color: #7aa2f7;
+    --success-color: #9ece6a;
+    --warning-color: #e5c890;
+    --error-color: #f7768e;
+    --king-color: #bb9af7;
+}
+
+* {
+    margin: 0;
+    padding: 0;
+    box-sizing: border-box;
+}
+
+body {
+    font-family: 'Segoe UI', system-ui, sans-serif;
+    background: var(--bg-primary);
+    color: var(--text-primary);
+    height: 100vh;
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+}
+
+/* Scrollbar */
+::-webkit-scrollbar {
+    width: 6px;
+    height: 6px;
+}
+
+::-webkit-scrollbar-track {
+    background: var(--bg-secondary);
+}
+
+::-webkit-scrollbar-thumb {
+    background: var(--border-color);
+    border-radius: 3px;
+}
+
+::-webkit-scrollbar-thumb:hover {
+    background: var(--text-secondary);
+}
+
+/* Animációk */
+@keyframes fadeIn {
+    from { opacity: 0; transform: translateY(5px); }
+    to { opacity: 1; transform: translateY(0); }
+}
+
+@keyframes pulse {
+    0% { opacity: 1; }
+    50% { opacity: 0.5; }
+    100% { opacity: 1; }
+}

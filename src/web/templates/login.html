@@ -1,0 +1,73 @@
+{% extends "base.html" %}
+
+{% block title %}Bejelentkezés{% endblock %}
+
+{% block content %}
+    <div class="login-container">
+        <div class="login-box">
+            <h1 class="login-title">✦ SOULCORE 3.0 ✦</h1>
+            <p class="login-subtitle">Admin bejelentkezés</p>
+            
+            <div class="login-form">
+                <div class="form-group">
+                    <label for="password">Jelszó</label>
+                    <input type="password" id="password" v-model="password" @keyup.enter="login" class="login-input">
+                </div>
+                
+                <button class="login-button" @click="login" :disabled="loading">
+                    <span v-if="!loading">Belépés</span>
+                    <span v-else>Belépés...</span>
+                </button>
+                
+                <div v-if="error" class="login-error">{{ error }}</div>
+            </div>
+            
+            <div class="login-footer">
+                <a href="/">← Vissza a főoldalra</a>
+            </div>
+        </div>
+    </div>
+{% endblock %}
+
+{% block scripts %}
+<script>
+    const { createApp, ref } = Vue;
+    
+    const loginApp = createApp({
+        setup() {
+            const password = ref('');
+            const loading = ref(false);
+            const error = ref('');
+            
+            const login = async () => {
+                loading.value = true;
+                error.value = '';
+                
+                try {
+                    const response = await fetch('/login', {
+                        method: 'POST',
+                        headers: {'Content-Type': 'application/json'},
+                        body: JSON.stringify({password: password.value})
+                    });
+                    
+                    const data = await response.json();
+                    
+                    if (data.success) {
+                        window.location.href = '/admin';
+                    } else {
+                        error.value = data.message || 'Hibás jelszó';
+                    }
+                } catch (err) {
+                    error.value = 'Hálózati hiba';
+                } finally {
+                    loading.value = false;
+                }
+            };
+            
+            return { password, loading, error, login };
+        }
+    });
+    
+    loginApp.mount('#app');
+</script>
+{% endblock %}

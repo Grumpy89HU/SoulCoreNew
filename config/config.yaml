@@ -1,0 +1,153 @@
+# SoulCore 3.0 - Konfiguráció
+
+# Rendszer
+system:
+  name: "SoulCore"
+  version: "3.0"
+  environment: "development"  # development / production
+  identity_file: "config/identity.inf"  # Identitás fájl helye
+
+# Modulok
+modules:
+  heartbeat:
+    enabled: true
+    interval: 1.0  # másodperc
+    proactive:
+      enabled: true
+      min_idle_hours: 2      # Minimum 2 óra csend után
+      max_idle_hours: 8      # Maximum 8 óra után már ne
+      once_per_day: true      # Csak napi egyszer
+      reminders: true         # Emlékeztetők kezelése
+      check_interval: 300     # 5 percenként ellenőrizze
+      chance: 0.3             # 30% esély
+      topics: []              # Ha üres, bármiről kérdezhet
+    
+  router:
+    enabled: true
+    zmq_enabled: false  # true ha van ZMQ
+    zmq_port: 5555
+    heartbeat_timeout: 3.0  # 3 másodperc
+    
+  web:
+    enabled: true
+    host: "0.0.0.0"
+    port: 5000
+    debug: false
+
+  gateway:
+    enabled: true
+    max_external_connections: 5
+    message_queue_size: 100
+    trust_score_decay: 0.95        # Naponta ennyivel csökken, ha nem interaktál
+    min_trust_for_response: 300     # Minimum trust score a válaszhoz
+    max_tokens_per_entity: 10000    # Napi token limit
+    enable_filter: true              # Prompt-injekció szűrés
+    enable_queue: true                # Üzenet sorba állítás
+    response_timeout: 30              # Másodperc
+
+  eyecore:
+    enabled: true
+    enable_ocr: true                 # OCR bekapcsolása
+    enable_object_detection: false   # Objektum detekció (kell hozzá modell)
+    enable_face_detection: false     # Arc detekció
+    max_image_size: 1920              # Max képméret
+    cache_results: true                # Gyorsítótárazás
+    cache_ttl: 3600                    # 1 óra
+    default_language: "hun"            # OCR nyelve
+    save_uploaded: false               # Feltöltött képek mentése
+    upload_path: "data/uploads"        # Mentési mappa
+
+  sentinel:
+    enabled: true
+    check_interval: 2.0               # 2 másodperc
+    temp_warning: 75                   # Figyelmeztetés °C
+    temp_critical: 85                   # Kritikus °C
+    vram_warning: 90                    # VRAM használat % figyelmeztetés
+    vram_critical: 95                    # VRAM használat % kritikus
+    emergency_unload_temp: 85            # Ennél a hőmérsékletnél vészkiürítés
+    throttle_temp: 80                     # Ennél lassít
+    throttle_factor: 0.5                   # Lassítás mértéke (50%)
+    auto_unload_priority: 3                # Automatikus kiürítés prioritás alatt
+    log_history: 100                        # Hány mérés maradjon meg
+
+  blackbox:
+    enabled: true
+    log_dir: "logs"                        # Naplók mappája
+    max_log_size: 104857600                 # 100 MB
+    max_log_age: 30                          # nap
+    compress: true                           # Tömörítés
+    log_level: "info"                        # debug, info, warning, error
+    trace_token_level: false                  # Token szintű nyomkövetés (nagy)
+    buffer_size: 10000                        # Memóriában tartott események
+    auto_flush: true                           # Automatikus kiírás
+    flush_interval: 5.0                        # másodperc
+    include_payload: true                       # Tartalom naplózása
+    anonymize: false                            # Személyes adatok elrejtése
+
+  sandbox:
+    enabled: true
+    use_docker: false                          # Docker használata (ha van)
+    timeout: 30                                 # Maximum futási idő
+    max_memory: 536870912                       # 512 MB
+    max_cpu_time: 10                            # Maximum CPU idő
+    max_output_size: 102400                      # 100 KB
+    enable_filesystem: false                     # Fájlrendszer hozzáférés
+    enable_network: false                        # Hálózat hozzáférés
+    temp_dir: "/tmp/soulcore_sandbox"            # Temp mappa
+
+
+# Adatbázis
+database:
+  path: "data/soulcore.db"  # SQLite adatbázis helye
+  auto_backup: true          # Automatikus mentés
+  backup_interval: 86400     # 24 óránként
+
+# Memória
+memory:
+  scratchpad_max_entries: 1000
+  short_term_minutes: 5
+  cleanup_interval: 3600  # 1 óra
+
+# Felhasználó
+user:
+  name: "Grumpy"
+  language: "hu"  # hu / en
+
+# Agentek
+agents:
+  king:
+    enabled: true
+    model: "models/google_gemma-3-12b-it-qat-Q4_K_M.gguf"
+    n_gpu_layers: -1  # -1 = minden GPU-ra, 0 = CPU, 20 = csak 20 réteg GPU-ra
+    n_ctx: 8192       # kontextus méret
+    personality: "kíváncsi, hűséges, szuverén, ravasz, humoros"
+    
+  jester:
+    enabled: true
+    max_response_time: 30.0  # másodperc
+    max_error_rate: 0.5
+    max_consecutive_errors: 5
+    
+  scribe:
+    enabled: true
+    # Nincs modell, csak rule-based most
+    
+  valet:
+    enabled: true
+    max_context_tokens: 1500
+    max_recent_messages: 5
+    enable_tracking: true
+    enable_validation: true
+    forget_after_days: 30
+    important_threshold: 0.7
+    
+  queen:
+    enabled: true
+    require_proof: true
+    max_facts: 10
+    temperature: 0.1
+    max_tokens: 512
+    use_model: true  # Külön modell használata (ha van)
+    model: "models/Qwen2.5-Omni-7B-UD-Q5_K_XL.gguf"
+    n_gpu_layers: -1  # <-- EZT ADD IDE
+    n_ctx: 4096

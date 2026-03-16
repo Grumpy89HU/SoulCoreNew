@@ -1,0 +1,82 @@
+/* Fejléc */
+.header {
+    background: var(--bg-tertiary);
+    padding: 12px 20px;
+    border-bottom: 1px solid var(--border-color);
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    flex-shrink: 0;
+    height: 60px;
+}
+
+.title {
+    font-size: 1.4rem;
+    font-weight: 500;
+    letter-spacing: 1px;
+}
+
+.title span {
+    color: var(--accent-color);
+    font-weight: 300;
+}
+
+.status-badge {
+    display: flex;
+    gap: 15px;
+}
+
+.badge {
+    padding: 4px 10px;
+    border-radius: 20px;
+    font-size: 0.8rem;
+    background: var(--bg-secondary);
+    display: flex;
+    align-items: center;
+    gap: 5px;
+}
+
+/* Fő tartalom */
+.main {
+    flex: 1;
+    display: flex;
+    min-height: 0; /* Firefox flex fix */
+    height: calc(100vh - 100px); /* 60px header + 40px footer = 100px */
+    overflow: hidden;
+}
+
+/* Lábléc */
+.footer {
+    background: var(--bg-tertiary);
+    border-top: 1px solid var(--border-color);
+    padding: 8px 20px;
+    font-size: 0.7rem;
+    color: var(--text-secondary);
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    flex-shrink: 0;
+    height: 40px;
+}
+
+.connection-status {
+    display: flex;
+    align-items: center;
+    gap: 5px;
+}
+
+.status-dot {
+    width: 8px;
+    height: 8px;
+    border-radius: 50%;
+    display: inline-block;
+}
+
+.status-dot.connected {
+    background: var(--success-color);
+    box-shadow: 0 0 5px var(--success-color);
+}
+
+.status-dot.disconnected {
+    background: var(--error-color);
+}

@@ -1,0 +1,56 @@
+{% extends "base.html" %}
+
+{% block title %}Admin Panel{% endblock %}
+
+{% block content %}
+    <div class="admin-container">
+        <div class="admin-sidebar">
+            <div class="admin-menu">
+                <a href="#modules" class="admin-menu-item active">Modulok</a>
+                <a href="#models" class="admin-menu-item">Modellek</a>
+                <a href="#prompts" class="admin-menu-item">Promptok</a>
+                <a href="#settings" class="admin-menu-item">Beállítások</a>
+                <a href="#logs" class="admin-menu-item">Naplók</a>
+                <a href="#users" class="admin-menu-item">Felhasználók</a>
+                <a href="#backup" class="admin-menu-item">Mentés</a>
+            </div>
+        </div>
+        
+        <div class="admin-content">
+            <div id="modules" class="admin-section active">
+                <h2>Modulok vezérlése</h2>
+                <module-control></module-control>
+            </div>
+            
+            <div id="models" class="admin-section">
+                <h2>Modellek kezelése</h2>
+                <model-manager></model-manager>
+            </div>
+            
+            <div id="prompts" class="admin-section">
+                <h2>Prompt sablonok</h2>
+                <prompt-manager></prompt-manager>
+            </div>
+            
+            <div id="settings" class="admin-section">
+                <h2>Rendszer beállítások</h2>
+                <settings-manager></settings-manager>
+            </div>
+            
+            <div id="logs" class="admin-section">
+                <h2>Rendszernaplók</h2>
+                <log-viewer></log-viewer>
+            </div>
+            
+            <div id="users" class="admin-section">
+                <h2>Felhasználók kezelése</h2>
+                <user-manager></user-manager>
+            </div>
+            
+            <div id="backup" class="admin-section">
+                <h2>Mentés és visszaállítás</h2>
+                <backup-manager></backup-manager>
+            </div>
+        </div>
+    </div>
+{% endblock %}

@@ -1,0 +1,51 @@
+<!DOCTYPE html>
+<html lang="hu">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=yes">
+    <title>SoulCore 3.0 - {% block title %}A Vár{% endblock %}</title>
+    
+    <!-- CSS -->
+    <link rel="stylesheet" href="{{ url_for('static', filename='css/main.css') }}">
+    <link rel="stylesheet" href="{{ url_for('static', filename='css/layout.css') }}">
+    <link rel="stylesheet" href="{{ url_for('static', filename='css/chat.css') }}">
+    <link rel="stylesheet" href="{{ url_for('static', filename='css/panels.css') }}">
+    <link rel="stylesheet" href="{{ url_for('static', filename='css/admin.css') }}">
+    <link rel="stylesheet" href="{{ url_for('static', filename='css/components.css') }}">
+    
+    <!-- Socket.IO -->
+    <script src="https://cdn.socket.io/4.5.4/socket.io.min.js"></script>
+    <!-- Vue.js -->
+    <script src="https://unpkg.com/vue@3/dist/vue.global.js"></script>
+    
+    {% block head %}{% endblock %}
+</head>
+<body>
+    <div id="app">
+        <!-- Ide kerül a child template tartalma -->
+        {% block content %}{% endblock %}
+    </div>
+    
+    <!-- JavaScript modulok -->
+	<script src="{{ url_for('static', filename='js/api.js') }}"></script>
+    <script src="{{ url_for('static', filename='js/store.js') }}"></script>
+    <script src="{{ url_for('static', filename='js/socket.js') }}"></script>
+    <script src="{{ url_for('static', filename='js/utils/formatters.js') }}"></script>
+    <script src="{{ url_for('static', filename='js/utils/validators.js') }}"></script>
+    
+    <!-- Vue komponensek -->
+    <script src="{{ url_for('static', filename='js/components/ModuleControl.js') }}"></script>
+    <script src="{{ url_for('static', filename='js/components/ModelSelector.js') }}"></script>
+    <script src="{{ url_for('static', filename='js/components/PromptEditor.js') }}"></script>
+    <script src="{{ url_for('static', filename='js/components/SettingsPanel.js') }}"></script>
+    <script src="{{ url_for('static', filename='js/components/ConversationList.js') }}"></script>
+    <script src="{{ url_for('static', filename='js/components/ChatBox.js') }}"></script>
+    <script src="{{ url_for('static', filename='js/components/TelemetryPanel.js') }}"></script>
+    <script src="{{ url_for('static', filename='js/components/AdminPanel.js') }}"></script>
+    
+    <!-- Fő alkalmazás -->
+    <script src="{{ url_for('static', filename='js/main.js') }}"></script>
+    
+    {% block scripts %}{% endblock %}
+</body>
+</html>

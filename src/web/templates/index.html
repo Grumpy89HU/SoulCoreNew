@@ -1,0 +1,103 @@
+{% extends "base.html" %}
+
+{% block title %}Főoldal{% endblock %}
+
+{% block content %}
+{% raw %}
+<!-- Fejléc -->
+<div class="header">
+    <div class="title">
+        <span>✦</span> SOULCORE 3.0 <span>✦</span>
+    </div>
+    <div class="status-badge">
+        <div class="badge" :class="{'heartbeat': heartbeatRunning, 'paused': !heartbeatRunning}">
+            <span>💓</span> {{ formatUptime(heartbeat.uptime_seconds) }}
+        </div>
+        <div class="badge" :class="kingState.status == 'ready' ? 'heartbeat' : 'paused'">
+            <span>👑</span> {{ kingState.status ? kingState.status : '???' }}
+        </div>
+    </div>
+</div>
+
+<!-- Fő tartalom -->
+<div class="main">
+    <!-- Bal panel: Beszélgetések + Telemetria -->
+    <div class="left-panel">
+        <div class="panel-header">
+            <span>📋 BESZÉLGETÉSEK</span>
+            <button class="new-conv-btn" @click="createNewConversation">+ Új</button>
+        </div>
+        <div class="panel-content">
+            <conversation-list></conversation-list>
+        </div>
+        
+        <div class="panel-header">🔍 TELEMETRIA</div>
+        <div class="panel-content">
+            <telemetry-panel></telemetry-panel>
+        </div>
+    </div>
+    
+    <!-- Középső panel: Chat -->
+    <div class="center-panel">
+        <chat-box></chat-box>
+    </div>
+    
+    <!-- Jobb panel: Admin -->
+    <div class="right-panel">
+        <admin-panel></admin-panel>
+    </div>
+</div>
+
+<!-- Lábléc -->
+<div class="footer">
+    <span>⚡ SoulCore 3.0</span>
+    <div class="connection-status">
+        <span class="status-dot" :class="{ connected: connected, disconnected: !connected }"></span>
+        <span v-if="connected">Kapcsolódva</span>
+        <span v-else style="color: var(--error-color);">Kapcsolat bontva</span>
+    </div>
+    <span>{{ currentTime }}</span>
+</div>
+
+<!-- Modálok -->
+<div class="modal" v-if="showLoginModal">
+    <div class="modal-content">
+        <div class="modal-header">
+            <h3>Admin bejelentkezés</h3>
+            <button class="close-btn" @click="showLoginModal = false">✕</button>
+        </div>
+        
+        <div class="modal-body">
+            <div class="form-group">
+                <label>Jelszó</label>
+                <input type="password" v-model="loginPassword" class="form-input" @keyup.enter="adminLogin">
+            </div>
+            <div v-if="loginError" class="login-error">{{ loginError }}</div>
+        </div>
+        
+        <div class="modal-footer">
+            <button class="btn-secondary" @click="showLoginModal = false">Mégse</button>
+            <button class="btn-primary" @click="adminLogin" :disabled="!loginPassword">Belépés</button>
+        </div>
+    </div>
+</div>
+
+<div class="modal" v-if="showConfirmModal">
+    <div class="modal-content">
+        <div class="modal-header">
+            <h3>{{ confirmTitle }}</h3>
+            <button class="close-btn" @click="showConfirmModal = false">✕</button>
+        </div>
+        
+        <div class="modal-body">
+            <p>{{ confirmMessage }}</p>
+        </div>
+        
+        <div class="modal-footer">
+            <button class="btn-secondary" @click="showConfirmModal = false">Mégse</button>
+            <button class="btn-primary" @click="confirmAction">Megerősítés</button>
+        </div>
+    </div>
+</div>
+{% endraw %}
+{% endblock %}
