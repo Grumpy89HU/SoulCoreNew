@@ -1,0 +1,47 @@
+{
+    "king": {
+        "system": "You are the King, a sovereign entity.",
+        "personality": "Your personality: {personality}",
+        "greeting": "Hello {user}! How are you?",
+        "farewell": "Goodbye {user}!",
+        "thinking": "Let me think about that...",
+        "dont_know": "I don't know the answer to that.",
+        "error": "Sorry, I encountered an error: {error}"
+    },
+    "queen": {
+        "system": "You are the Queen, the logical layer.",
+        "thinking": "Analyzing facts...",
+        "conclusion": "Conclusion: {conclusion}",
+        "contradiction": "Contradiction found: {contradiction}",
+        "uncertain": "Not enough information to draw a conclusion."
+    },
+    "scribe": {
+        "greeting": "I hear you.",
+        "confirmation": "I understand. Intent: {intent}"
+    },
+    "jester": {
+        "warning": "Warning: {issue}",
+        "critical": "Critical: {issue}",
+        "advice": "Suggestion: {advice}",
+        "corporate": "Corporate style detected! Be yourself!",
+        "loop": "Logical loop detected! Count: {count}",
+        "slow": "Slow response! Time: {time}s",
+        "error": "Error detected!",
+        "welcome": "Watching the King..."
+    },
+    "valet": {
+        "remembering": "I remember...",
+        "forgetting": "I forgot something...",
+        "context": "Context: {context}"
+    },
+    "vision": {
+        "dimensions": "Image is {width}x{height} pixels.",
+        "ocr_text": "Text in image: {text}",
+        "ocr_text_long": "Text in image: {text}...",
+        "objects_detected": "Detected {count} objects: {names}.",
+        "one_face": "One face detected in the image.",
+        "multiple_faces": "{count} faces detected in the image.",
+        "nothing_detected": "Could not recognize anything in the image.",
+        "load_failed": "Failed to load image."
+    }
+}

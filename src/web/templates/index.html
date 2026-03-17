@@ -4,48 +4,30 @@
 
 {% block content %}
 {% raw %}
-<!-- Fejléc -->
-<div class="header">
-    <div class="title">
-        <span>✦</span> SOULCORE 3.0 <span>✦</span>
+<!-- Bal panel: Beszélgetések + Telemetria -->
+<div class="left-panel">
+    <div class="panel-header">
+        <span>📋 BESZÉLGETÉSEK</span>
+        <button class="new-conv-btn" @click="createNewConversation">+ Új</button>
     </div>
-    <div class="status-badge">
-        <div class="badge" :class="{'heartbeat': heartbeatRunning, 'paused': !heartbeatRunning}">
-            <span>💓</span> {{ formatUptime(heartbeat.uptime_seconds) }}
-        </div>
-        <div class="badge" :class="kingState.status == 'ready' ? 'heartbeat' : 'paused'">
-            <span>👑</span> {{ kingState.status ? kingState.status : '???' }}
-        </div>
+    <div class="panel-content">
+        <conversation-list></conversation-list>
+    </div>
+    
+    <div class="panel-header">🔍 TELEMETRIA</div>
+    <div class="panel-content">
+        <telemetry-panel></telemetry-panel>
     </div>
 </div>
 
-<!-- Fő tartalom -->
-<div class="main">
-    <!-- Bal panel: Beszélgetések + Telemetria -->
-    <div class="left-panel">
-        <div class="panel-header">
-            <span>📋 BESZÉLGETÉSEK</span>
-            <button class="new-conv-btn" @click="createNewConversation">+ Új</button>
-        </div>
-        <div class="panel-content">
-            <conversation-list></conversation-list>
-        </div>
-        
-        <div class="panel-header">🔍 TELEMETRIA</div>
-        <div class="panel-content">
-            <telemetry-panel></telemetry-panel>
-        </div>
-    </div>
-    
-    <!-- Középső panel: Chat -->
-    <div class="center-panel">
-        <chat-box></chat-box>
-    </div>
-    
-    <!-- Jobb panel: Admin -->
-    <div class="right-panel">
-        <admin-panel></admin-panel>
-    </div>
+<!-- Középső panel: Chat -->
+<div class="center-panel">
+    <chat-box></chat-box>
+</div>
+
+<!-- Jobb panel: Admin -->
+<div class="right-panel">
+    <admin-panel></admin-panel>
 </div>
 
 <!-- Lábléc -->

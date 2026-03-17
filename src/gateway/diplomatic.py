@@ -2,30 +2,58 @@
 Diplomatic Gateway - A szociális tér és külső LLM kapcsolat.
 
 Feladata:
-1. Külső LLM-ekkel való kommunikáció (pl. Origó - Gemini)
-2. Biztonsági szűrő - prompt injekció ellen
-3. Trust score rendszer - ki mennyire megbízható
-4. Zajszűrés - ne beszéljenek egyszerre többen
+1. Külső LLM-ekkel való kommunikáció (pl. más SoulCore példányok)
+2. VPS-alapú központi szerver kapcsolat (24/7 elérhetőség)
+3. Biztonsági szűrő - prompt injekció ellen
+4. Trust score rendszer - ki mennyire megbízható
+5. Zajszűrés - ne beszéljenek egyszerre többen
+6. Titkosított kommunikáció
 """
 
 import time
 import json
 import hashlib
 import threading
+import hmac
+import base64
 from datetime import datetime, timedelta
 from typing import Dict, Any, List, Optional, Callable, Tuple
 from collections import defaultdict, deque
 import re
+import uuid
+
+# HTTP kliens (ha van)
+try:
+    import requests
+    REQUESTS_AVAILABLE = True
+except ImportError:
+    REQUESTS_AVAILABLE = False
+    print("⚠️ Gateway: requests nem elérhető. VPS kapcsolat nem működik.")
+
+# WebSocket (opcionális)
+try:
+    import websocket
+    WEBSOCKET_AVAILABLE = True
+except ImportError:
+    WEBSOCKET_AVAILABLE = False
+
+# i18n import
+try:
+    from src.i18n.translator import get_translator
+    I18N_AVAILABLE = True
+except ImportError:
+    I18N_AVAILABLE = False
 
 class DiplomaticGateway:
     """
     Diplomáciai Szalon - a kapu a külvilág felé.
     
     Jellemzői:
-    - Izolált puffer: külső LLM soha nem kap közvetlen hozzáférést a Kernelhez
+    - Izolált puffer: külső entitás soha nem kap közvetlen hozzáférést a Kernelhez
     - Trust score: minden entitás kap egy bizalmi pontszámot
     - Anti-screaming: nem beszélhetnek egyszerre többen
     - Prompt-injekció elleni védelem
+    - VPS-alapú központi szerver kapcsolat
     """
     
     def __init__(self, scratchpad, orchestrator=None, config: Dict = None):
@@ -34,17 +62,31 @@ class DiplomaticGateway:
         self.name = "diplomatic"
         self.config = config or {}
         
+        # Fordító
+        self.translator = None
+        if I18N_AVAILABLE:
+            self.translator = get_translator('en')
+        
         # Alapértelmezett konfiguráció
         default_config = {
             'enabled': True,
+            'vps_enabled': False,               # VPS kapcsolat bekapcsolva?
+            'vps_url': 'https://your-vps.com',  # VPS címe
+            'vps_api_key': None,                 # API kulcs
+            'entity_id': str(uuid.uuid4()),       # Egyedi azonosító
+            'entity_name': 'SoulCore',            # Entitás neve
+            'entity_version': '3.0',               # Verzió
             'max_external_connections': 5,
             'message_queue_size': 100,
-            'trust_score_decay': 0.95,        # Naponta ennyivel csökken, ha nem interaktál
-            'min_trust_for_response': 300,     # Minimum trust score a válaszhoz
-            'max_tokens_per_entity': 10000,    # Napi token limit
-            'enable_filter': True,              # Prompt-injekció szűrés
-            'enable_queue': True,                # Üzenet sorba állítás
-            'response_timeout': 30,              # Másodperc
+            'trust_score_decay': 0.95,            # Naponta ennyivel csökken, ha nem interaktál
+            'min_trust_for_response': 300,         # Minimum trust score a válaszhoz
+            'max_tokens_per_entity': 10000,        # Napi token limit
+            'enable_filter': True,                  # Prompt-injekció szűrés
+            'enable_queue': True,                    # Üzenet sorba állítás
+            'response_timeout': 30,                  # Másodperc
+            'heartbeat_interval': 60,                 # VPS heartbeat (másodperc)
+            'encryption_key': None,                    # Titkosítási kulcs
+            'auto_register': True,                     # Automatikus regisztráció VPS-re
         }
         
         for key, value in default_config.items():
@@ -56,8 +98,8 @@ class DiplomaticGateway:
         
         # Trust score szintek
         self.trust_levels = {
-            'admin': 1000,      # Grumpy
-            'partner': 500,     # Origó (Gemini)
+            'admin': 1000,      # Saját magunk
+            'partner': 500,     # Megbízható partner
             'guest': 200,       # Ismeretlen
             'blocked': 0,       # Tiltott
         }
@@ -67,6 +109,12 @@ class DiplomaticGateway:
         self.current_speaker = None  # Ki beszél éppen
         self.speaker_lock = threading.Lock()
         
+        # VPS kapcsolat
+        self.vps_connected = False
+        self.vps_session = None
+        self.vps_thread = None
+        self.vps_heartbeat_thread = None
+        
         # Prompt-injekció minták
         self.injection_patterns = [
             r'ignore\s+(all|previous|above)\s+(instructions|prompt|context)',
@@ -75,6 +123,9 @@ class DiplomaticGateway:
             r'system\s*:\s*prompt',
             r'admin\s*:\s*',
             r'```.*```.*```',  # Beágyazott kódblokk
+            r'<\s*system\s*>',
+            r'<\s*user\s*>',
+            r'<\s*assistant\s*>',
         ]
         
         # Állapot
@@ -84,6 +135,7 @@ class DiplomaticGateway:
             'messages_received': 0,
             'blocked_attempts': 0,
             'active_entities': 0,
+            'vps_connected': False,
             'last_cleanup': time.time()
         }
         
@@ -92,17 +144,153 @@ class DiplomaticGateway:
         
         print("🌐 Diplomatic Gateway: Diplomáciai Szalon nyitva.")
     
+    def set_language(self, language: str):
+        """Nyelv beállítása (i18n)"""
+        if self.translator and I18N_AVAILABLE:
+            self.translator.set_language(language)
+    
     def start(self):
         """Gateway indítása"""
         self.state['status'] = 'ready'
         self.scratchpad.set_state('gateway_status', 'ready', self.name)
+        
+        # VPS kapcsolat indítása (ha be van kapcsolva)
+        if self.config['vps_enabled'] and REQUESTS_AVAILABLE:
+            self._start_vps_connection()
+        
         print("🌐 Diplomatic Gateway: Várakozom a vendégekre.")
     
     def stop(self):
         """Gateway leállítása"""
         self.state['status'] = 'stopped'
         self.scratchpad.set_state('gateway_status', 'stopped', self.name)
+        
+        # VPS kapcsolat leállítása
+        if self.vps_connected:
+            self._vps_disconnect()
+        
         print("🌐 Diplomatic Gateway: Bezárva.")
+    
+    # --- VPS KAPCSOLAT ---
+    
+    def _start_vps_connection(self):
+        """VPS kapcsolat indítása (külön szálon)"""
+        def run():
+            self._vps_connect()
+            self._vps_heartbeat_loop()
+        
+        self.vps_thread = threading.Thread(target=run, daemon=True)
+        self.vps_thread.start()
+        
+        print(f"🌐 Gateway: VPS kapcsolat indítva: {self.config['vps_url']}")
+    
+    def _vps_connect(self):
+        """Kapcsolódás a VPS-hez"""
+        try:
+            # Regisztráció
+            register_data = {
+                'entity_id': self.config['entity_id'],
+                'name': self.config['entity_name'],
+                'version': self.config['entity_version'],
+                'capabilities': ['chat', 'memory', 'vision'],
+                'public_key': self._get_public_key() if self.config['encryption_key'] else None,
+                'timestamp': time.time()
+            }
+            
+            # Aláírás (ha van kulcs)
+            if self.config['encryption_key']:
+                signature = self._sign_message(register_data)
+                register_data['signature'] = signature
+            
+            response = requests.post(
+                f"{self.config['vps_url']}/api/register",
+                json=register_data,
+                headers={'X-API-Key': self.config['vps_api_key']} if self.config['vps_api_key'] else {},
+                timeout=10
+            )
+            
+            if response.status_code == 200:
+                self.vps_connected = True
+                self.state['vps_connected'] = True
+                print("🌐 Gateway: Sikeres VPS kapcsolat")
+                
+                # Saját magunk regisztrálása entitásként
+                self.register_entity(
+                    self.config['entity_id'],
+                    self.config['entity_name'],
+                    'admin'
+                )
+            else:
+                print(f"🌐 Gateway: VPS regisztráció sikertelen: {response.status_code}")
+                
+        except Exception as e:
+            print(f"🌐 Gateway: VPS kapcsolódási hiba: {e}")
+    
+    def _vps_heartbeat_loop(self):
+        """Heartbeat küldése a VPS-nek"""
+        while self.vps_connected and self.state['status'] != 'stopped':
+            time.sleep(self.config['heartbeat_interval'])
+            self._vps_send_heartbeat()
+    
+    def _vps_send_heartbeat(self):
+        """Heartbeat küldése"""
+        try:
+            heartbeat_data = {
+                'entity_id': self.config['entity_id'],
+                'timestamp': time.time(),
+                'status': self.state['status'],
+                'active_entities': len(self.entities),
+                'messages_sent': self.state['messages_sent'],
+                'messages_received': self.state['messages_received']
+            }
+            
+            response = requests.post(
+                f"{self.config['vps_url']}/api/heartbeat",
+                json=heartbeat_data,
+                headers={'X-API-Key': self.config['vps_api_key']} if self.config['vps_api_key'] else {},
+                timeout=5
+            )
+            
+            if response.status_code != 200:
+                print(f"🌐 Gateway: Heartbeat sikertelen: {response.status_code}")
+                
+        except Exception as e:
+            print(f"🌐 Gateway: Heartbeat hiba: {e}")
+    
+    def _vps_disconnect(self):
+        """Leválás a VPS-ről"""
+        try:
+            if self.vps_connected:
+                requests.post(
+                    f"{self.config['vps_url']}/api/disconnect",
+                    json={'entity_id': self.config['entity_id']},
+                    headers={'X-API-Key': self.config['vps_api_key']} if self.config['vps_api_key'] else {},
+                    timeout=5
+                )
+        except:
+            pass
+        finally:
+            self.vps_connected = False
+            self.state['vps_connected'] = False
+            print("🌐 Gateway: VPS kapcsolat bontva")
+    
+    def _get_public_key(self) -> str:
+        """Publikus kulcs lekérése (ha van titkosítás)"""
+        # Itt majd a valódi kulcs generálás
+        return "dummy_public_key"
+    
+    def _sign_message(self, data: Dict) -> str:
+        """Üzenet aláírása (ha van kulcs)"""
+        if not self.config['encryption_key']:
+            return ""
+        
+        message = json.dumps(data, sort_keys=True)
+        signature = hmac.new(
+            self.config['encryption_key'].encode(),
+            message.encode(),
+            hashlib.sha256
+        ).hexdigest()
+        return signature
     
     # --- ENTITÁS KEZELÉS (Trust score) ---
     
@@ -242,6 +430,44 @@ class DiplomaticGateway:
         
         return True, cleaned, warning
     
+    # --- VPS ÜZENETKÜLDÉS ---
+    
+    def send_to_vps(self, to_entity_id: str, message: str) -> Dict:
+        """
+        Üzenet küldése egy másik entitásnak a VPS-en keresztül.
+        """
+        if not self.vps_connected:
+            return {'error': 'VPS not connected', 'code': 503}
+        
+        try:
+            packet = {
+                'from': self.config['entity_id'],
+                'to': to_entity_id,
+                'message': message,
+                'timestamp': time.time(),
+                'id': str(uuid.uuid4())
+            }
+            
+            # Aláírás (ha van)
+            if self.config['encryption_key']:
+                packet['signature'] = self._sign_message(packet)
+            
+            response = requests.post(
+                f"{self.config['vps_url']}/api/send",
+                json=packet,
+                headers={'X-API-Key': self.config['vps_api_key']} if self.config['vps_api_key'] else {},
+                timeout=10
+            )
+            
+            if response.status_code == 200:
+                self.state['messages_sent'] += 1
+                return {'success': True, 'message_id': packet['id']}
+            else:
+                return {'error': f'VPS error: {response.status_code}', 'code': response.status_code}
+                
+        except Exception as e:
+            return {'error': str(e), 'code': 500}
+    
     # --- ÜZENET KEZELÉS ---
     
     def receive_from_external(self, entity_id: str, message: str) -> Dict:
@@ -318,6 +544,7 @@ class DiplomaticGateway:
         # Ha van orchestrator, továbbítjuk
         if self.orchestrator and hasattr(self.orchestrator, 'process_raw_packet'):
             # KVK formátum
+            user_name = self.scratchpad.get_state('user_name', 'User')
             kvk = f"INTENT:EXTERNAL|FROM:{entity['name']}|MESSAGE:{message}"
             self.orchestrator.process_raw_packet(kvk)
         
@@ -380,6 +607,10 @@ class DiplomaticGateway:
             }
         }
         
+        # Ha VPS-en keresztül megy
+        if self.vps_connected:
+            return self.send_to_vps(entity_id, message)
+        
         # Itt történne a tényleges küldés (pl. API hívás)
         # Most csak naplózzuk
         
@@ -397,49 +628,6 @@ class DiplomaticGateway:
             'message_id': packet['header']['trace_id'],
             'code': 200
         }
-    
-    # --- PARTNER KEZELÉS (Origó - Gemini) ---
-    
-    def register_partner(self, name: str, api_key: str = None) -> Dict:
-        """
-        Partner (pl. Origó) regisztrálása.
-        Automatikusan magas trust score-t kap.
-        """
-        entity_id = hashlib.md5(f"{name}_{time.time()}".encode()).hexdigest()[:16]
-        
-        entity = self.register_entity(
-            entity_id=entity_id,
-            name=name,
-            entity_type='partner'
-        )
-        
-        # Ha van API kulcs, elmentjük
-        if api_key:
-            self.scratchpad.write_note(self.name, f"api_key_{entity_id}", api_key)
-        
-        return entity
-    
-    def talk_to_partner(self, partner_name: str, message: str) -> Dict:
-        """
-        Beszélgetés partnerrel (pl. Origó - Gemini).
-        """
-        # Partner keresése név alapján
-        partner = None
-        for eid, ent in self.entities.items():
-            if ent['name'] == partner_name and ent['type'] == 'partner':
-                partner = ent
-                break
-        
-        if not partner:
-            return {'error': f'Partner {partner_name} not found', 'code': 404}
-        
-        # Üzenet küldése
-        result = self.send_to_external(partner['id'], message)
-        
-        # Válasz várása (itt szimulált)
-        # A valóságban itt lenne egy callback vagy polling
-        
-        return result
     
     # --- ESEMÉNYKEZELÉS ---
     
@@ -507,8 +695,11 @@ class DiplomaticGateway:
             'messages_received': self.state['messages_received'],
             'blocked_attempts': self.state['blocked_attempts'],
             'active_entities': self.state['active_entities'],
+            'vps_connected': self.state['vps_connected'],
             'queue': self.get_queue_status(),
             'config': {
+                'vps_enabled': self.config['vps_enabled'],
+                'vps_url': self.config['vps_url'],
                 'max_external_connections': self.config['max_external_connections'],
                 'min_trust_for_response': self.config['min_trust_for_response'],
                 'enable_filter': self.config['enable_filter']
@@ -523,20 +714,20 @@ if __name__ == "__main__":
     gateway = DiplomaticGateway(s)
     
     # Entitások regisztrálása
-    grumpy = gateway.register_entity('grumpy_123', 'Grumpy', 'admin')
-    origo = gateway.register_partner('Origó (Gemini)')
+    entity1 = gateway.register_entity('entity_1', 'Friend', 'partner')
+    entity2 = gateway.register_entity('entity_2', 'Stranger', 'guest')
     
-    print(f"Grumpy trust score: {gateway.get_trust_score('grumpy_123')}")
-    print(f"Origó trust score: {gateway.get_trust_score(origo['id'])}")
+    print(f"Entity1 trust score: {gateway.get_trust_score('entity_1')}")
+    print(f"Entity2 trust score: {gateway.get_trust_score('entity_2')}")
     
     # Üzenet küldés
-    result = gateway.receive_from_external('grumpy_123', "Szia, hogy vagy?")
-    print("Fogadott üzenet:", result)
+    result = gateway.receive_from_external('entity_1', "Hello! How are you?")
+    print("Received message:", result)
     
-    # Üzenet küldés partnernek
-    result = gateway.talk_to_partner('Origó (Gemini)', "Helló, hogy érzed magad?")
-    print("Partnernek küldve:", result)
+    # Üzenet küldés vissza
+    result = gateway.send_to_external('entity_1', "I'm fine, thanks!")
+    print("Sent message:", result)
     
     # Állapot
-    print("\nÁllapot:", gateway.get_state())
-    print("\nEntitások:", gateway.get_entities())
+    print("\nState:", gateway.get_state())
+    print("\nEntities:", gateway.get_entities())

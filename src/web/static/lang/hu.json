@@ -1,0 +1,9 @@
+{
+    "ui": {
+        "connected": "Kapcsolódva",
+        "disconnected": "Kapcsolat bontva",
+        "dashboard": "Főoldal",
+        "admin": "Admin",
+        "logout": "Kijelentkezés"
+    }
+}

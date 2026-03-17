@@ -1,0 +1,20 @@
+{
+    "not_found": "{resource} not found",
+    "unauthorized": "Unauthorized access",
+    "forbidden": "Access forbidden",
+    "server_error": "Server error: {error}",
+    "validation_error": "Validation error: {field} is invalid",
+    "model_not_loaded": "Model not loaded",
+    "model_load_error": "Failed to load model: {error}",
+    "generation_error": "Generation error: {error}",
+    "timeout": "Request timeout",
+    "connection_error": "Connection error",
+    "database_error": "Database error: {error}",
+    "file_not_found": "File not found: {path}",
+    "permission_denied": "Permission denied",
+    "invalid_input": "Invalid input: {input}",
+    "missing_parameter": "Missing parameter: {param}",
+    "already_exists": "{item} already exists",
+    "cannot_delete": "Cannot delete {item} because it is in use",
+    "offline": "You are offline"
+}

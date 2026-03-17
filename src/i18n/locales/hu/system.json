@@ -1,0 +1,20 @@
+{
+    "starting": "SoulCore indul...",
+    "started": "SoulCore sikeresen elindult",
+    "stopping": "Leállítás...",
+    "stopped": "SoulCore leállt",
+    "module_loaded": "{name} modul betöltve",
+    "module_started": "{name} modul elindult",
+    "module_stopped": "{name} modul leállt",
+    "module_error": "{name} modul hiba: {error}",
+    "config_loaded": "Konfiguráció betöltve: {path}",
+    "config_error": "Konfigurációs hiba: {error}",
+    "database_connected": "Adatbázis kapcsolódva: {path}",
+    "database_error": "Adatbázis hiba: {error}",
+    "gpu_detected": "GPU {index} észlelve: {name}",
+    "gpu_error": "GPU hiba: {error}",
+    "memory_usage": "Memória használat: {used}/{total} MB ({percent}%)",
+    "uptime": "Üzemidő: {uptime}",
+    "idle_time": "Inaktivitás: {idle}",
+    "response_time": "Válaszidő: {time} ms"
+}

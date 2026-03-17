@@ -6,6 +6,7 @@ Feladata:
 2. Token szintű visszajátszás - látni, hogy mit gondolt a modell
 3. Hibakeresés - ha valami elromlik, vissza lehet nézni
 4. Teljesítmény elemzés - válaszidők, tokenek száma
+5. Playback funkció - visszajátszás idővonalon
 """
 
 import time
@@ -13,11 +14,19 @@ import json
 import os
 import threading
 import gzip
+import uuid
 from datetime import datetime, timedelta
 from typing import Dict, Any, List, Optional, Callable
 from pathlib import Path
 from collections import defaultdict, deque
 import hashlib
+
+# i18n import (opcionális)
+try:
+    from src.i18n.translator import get_translator
+    I18N_AVAILABLE = True
+except ImportError:
+    I18N_AVAILABLE = False
 
 class BlackBox:
     """
@@ -46,12 +55,18 @@ class BlackBox:
         'warning': 10,    # Figyelmeztetés
         'debug': 11,      # Debug üzenet
         'trace': 12,      # Nyomkövetés (token szint)
+        'performance': 13 # Teljesítmény adat
     }
     
     def __init__(self, scratchpad, config: Dict = None):
         self.scratchpad = scratchpad
         self.name = "blackbox"
         self.config = config or {}
+        
+        # Fordító (később állítjuk be)
+        self.translator = None
+        if I18N_AVAILABLE:
+            self.translator = get_translator('en')
         
         # Alapértelmezett konfiguráció
         default_config = {
@@ -67,6 +82,10 @@ class BlackBox:
             'flush_interval': 5.0,  # másodperc
             'include_payload': True,  # Tartalom naplózása
             'anonymize': False,  # Személyes adatok elrejtése
+            'enable_playback': True,  # Visszajátszás engedélyezése
+            'max_playback_speed': 10,  # Max visszajátszási sebesség
+            'quantum_logging': False,  # Token szintű naplózás (Quantum-Logger)
+            'retention_days': 30,  # Megőrzési idő
         }
         
         for key, value in default_config.items():
@@ -81,6 +100,7 @@ class BlackBox:
         self.current_log = None
         self.current_log_path = None
         self.current_log_size = 0
+        self.current_log_date = datetime.now().date()
         
         # Buffer a memóriában
         self.buffer = deque(maxlen=self.config['buffer_size'])
@@ -89,6 +109,17 @@ class BlackBox:
         self.index_by_trace = defaultdict(list)  # trace_id -> események
         self.index_by_type = defaultdict(list)   # típus -> események
         self.index_by_time = []                   # időrendben
+        self.index_by_module = defaultdict(list)  # modul -> események
+        
+        # Visszajátszás állapota
+        self.playback_state = {
+            'active': False,
+            'speed': 1.0,
+            'start_time': None,
+            'current_position': None,
+            'events': [],
+            'subscribers': []
+        }
         
         # Teljesítmény statisztikák
         self.stats = {
@@ -99,7 +130,9 @@ class BlackBox:
             'errors': 0,
             'warnings': 0,
             'start_time': time.time(),
-            'last_flush': time.time()
+            'last_flush': time.time(),
+            'log_files': 0,
+            'disk_usage': 0
         }
         
         # Szálkezelés
@@ -107,7 +140,15 @@ class BlackBox:
         self.thread = None
         self.lock = threading.RLock()
         
+        # Régi log fájlok törlése indításkor
+        self._cleanup_old_logs()
+        
         print("📼 Fekete Doboz: Mindent rögzítek.")
+    
+    def set_language(self, language: str):
+        """Nyelv beállítása (i18n)"""
+        if self.translator and I18N_AVAILABLE:
+            self.translator.set_language(language)
     
     def start(self):
         """Fekete Doboz indítása"""
@@ -214,6 +255,7 @@ class BlackBox:
             self.index_by_trace[trace_id].append(event)
             self.index_by_type[event_type].append(event)
             self.index_by_time.append(event)
+            self.index_by_module[source].append(event)
             
             # Statisztikák
             self.stats['total_events'] += 1
@@ -228,8 +270,7 @@ class BlackBox:
             if event_type == 'king' and isinstance(data, dict):
                 if 'tokens_used' in data:
                     self.stats['total_tokens'] += data['tokens_used']
-                elif 'response' in data:
-                    # Becslés
+                elif 'response' in data and isinstance(data['response'], str):
                     self.stats['total_tokens'] += len(data['response'].split())
             
             # Válaszidő számítás
@@ -253,7 +294,7 @@ class BlackBox:
     
     def _generate_trace_id(self) -> str:
         """Egyedi nyomkövetési azonosító"""
-        return f"trace_{int(time.time())}_{hashlib.md5(str(time.time()).encode()).hexdigest()[:6]}"
+        return f"trace_{int(time.time())}_{uuid.uuid4().hex[:8]}"
     
     def _anonymize(self, data: Any) -> Any:
         """
@@ -264,7 +305,7 @@ class BlackBox:
         
         if isinstance(data, dict):
             # Érzékeny kulcsok
-            sensitive_keys = ['user', 'name', 'email', 'phone', 'address', 'password', 'token']
+            sensitive_keys = ['user', 'name', 'email', 'phone', 'address', 'password', 'token', 'api_key']
             result = {}
             for k, v in data.items():
                 if any(s in k.lower() for s in sensitive_keys):
@@ -275,10 +316,11 @@ class BlackBox:
         
         if isinstance(data, str):
             # E-mail címek
-            import re
             data = re.sub(r'[\w\.-]+@[\w\.-]+\.\w+', '[EMAIL]', data)
             # Telefonszámok
             data = re.sub(r'(\+?[0-9]{1,3}[ -]?)?[0-9]{2,4}[ -]?[0-9]{3,4}[ -]?[0-9]{3,4}', '[PHONE]', data)
+            # IP címek
+            data = re.sub(r'\d{1,3}\.\d{1,3}\.\d{1,3}\.\d{1,3}', '[IP]', data)
             return data
         
         if isinstance(data, list):
@@ -291,26 +333,34 @@ class BlackBox:
     def _rotate_log(self):
         """Naplófájl rotálása (ha kell)"""
         now = datetime.now()
-        log_filename = f"blackbox_{now.strftime('%Y%m%d_%H%M%S')}.log"
         
-        if self.config['compress']:
-            log_filename += '.gz'
-        
-        log_path = self.log_dir / log_filename
-        
-        # Régi fájlok törlése
-        self._cleanup_old_logs()
-        
-        # Új fájl megnyitása
-        if self.config['compress']:
-            self.current_log = gzip.open(log_path, 'wt', encoding='utf-8')
-        else:
-            self.current_log = open(log_path, 'w', encoding='utf-8')
-        
-        self.current_log_path = log_path
-        self.current_log_size = 0
-        
-        print(f"📼 Új naplófájl: {log_path}")
+        # Ha új nap van, új fájl
+        if now.date() != self.current_log_date:
+            if self.current_log:
+                self.current_log.close()
+            
+            log_filename = f"blackbox_{now.strftime('%Y%m%d_%H%M%S')}.log"
+            
+            if self.config['compress']:
+                log_filename += '.gz'
+            
+            log_path = self.log_dir / log_filename
+            
+            # Régi fájlok törlése
+            self._cleanup_old_logs()
+            
+            # Új fájl megnyitása
+            if self.config['compress']:
+                self.current_log = gzip.open(log_path, 'wt', encoding='utf-8')
+            else:
+                self.current_log = open(log_path, 'w', encoding='utf-8')
+            
+            self.current_log_path = log_path
+            self.current_log_size = 0
+            self.current_log_date = now.date()
+            self.stats['log_files'] += 1
+            
+            print(f"📼 Új naplófájl: {log_path}")
     
     def _cleanup_old_logs(self):
         """Régi naplófájlok törlése"""
@@ -318,10 +368,19 @@ class BlackBox:
             now = time.time()
             max_age = self.config['max_log_age'] * 86400
             
+            deleted = 0
             for f in self.log_dir.glob('blackbox_*.log*'):
                 if now - f.stat().st_mtime > max_age:
                     f.unlink()
-                    print(f"📼 Régi napló törölve: {f}")
+                    deleted += 1
+            
+            if deleted > 0:
+                print(f"📼 {deleted} régi napló törölve")
+                
+            # Lemezhasználat számítás
+            total_size = sum(f.stat().st_size for f in self.log_dir.glob('*'))
+            self.stats['disk_usage'] = total_size
+            
         except Exception as e:
             print(f"📼 Takarítási hiba: {e}")
     
@@ -338,6 +397,9 @@ class BlackBox:
                 return
             
             try:
+                # Rotáció ellenőrzés
+                self._rotate_log()
+                
                 while self.buffer:
                     event = self.buffer.popleft()
                     line = json.dumps(event, ensure_ascii=False) + '\n'
@@ -358,7 +420,8 @@ class BlackBox:
     # --- VISSZAJÁTSZÁS ---
     
     def replay(self, start_time: float = None, end_time: float = None, 
-               trace_id: str = None, event_type: str = None) -> List[Dict]:
+               trace_id: str = None, event_type: str = None, 
+               source: str = None, speed: float = 1.0) -> List[Dict]:
         """
         Események visszajátszása.
         
@@ -367,6 +430,8 @@ class BlackBox:
             end_time: vég időpont
             trace_id: nyomkövetési azonosító
             event_type: esemény típus
+            source: forrás modul
+            speed: visszajátszási sebesség
             
         Returns:
             List[Dict]: események listája
@@ -380,6 +445,9 @@ class BlackBox:
             elif event_type:
                 # Típus alapján
                 events = self.index_by_type.get(event_type, [])
+            elif source:
+                # Forrás alapján
+                events = self.index_by_module.get(source, [])
             else:
                 # Idő alapján
                 events = list(self.index_by_time)
@@ -396,7 +464,44 @@ class BlackBox:
                     filtered.append(e)
                 events = filtered
             
+            # Sebesség beállítása
+            if speed != 1.0 and self.config['enable_playback']:
+                speed = min(speed, self.config['max_playback_speed'])
+                self.playback_state['speed'] = speed
+            
             return events
+    
+    def start_playback(self, events: List[Dict], speed: float = 1.0):
+        """
+        Visszajátszás indítása.
+        """
+        self.playback_state['active'] = True
+        self.playback_state['speed'] = min(speed, self.config['max_playback_speed'])
+        self.playback_state['start_time'] = time.time()
+        self.playback_state['events'] = events
+        self.playback_state['current_position'] = 0
+        
+        # Értesítés a feliratkozóknak
+        for callback in self.playback_state['subscribers']:
+            try:
+                callback('start', self.playback_state)
+            except:
+                pass
+    
+    def stop_playback(self):
+        """Visszajátszás leállítása"""
+        self.playback_state['active'] = False
+        self.playback_state['current_position'] = None
+        
+        for callback in self.playback_state['subscribers']:
+            try:
+                callback('stop', self.playback_state)
+            except:
+                pass
+    
+    def subscribe_playback(self, callback: Callable):
+        """Feliratkozás visszajátszási eseményekre"""
+        self.playback_state['subscribers'].append(callback)
     
     def get_trace(self, trace_id: str) -> List[Dict]:
         """Egy teljes nyomkövetés lekérése"""
@@ -425,7 +530,9 @@ class BlackBox:
                 'uptime': time.time() - self.stats['start_time'],
                 'buffer_size': len(self.buffer),
                 'last_flush': datetime.fromtimestamp(self.stats['last_flush']).isoformat(),
-                'log_file': str(self.current_log_path) if self.current_log_path else None
+                'log_file': str(self.current_log_path) if self.current_log_path else None,
+                'log_files': self.stats['log_files'],
+                'disk_usage_mb': round(self.stats['disk_usage'] / (1024 * 1024), 2)
             }
     
     def get_token_usage(self, period: str = 'hour') -> Dict:
@@ -452,7 +559,7 @@ class BlackBox:
             if isinstance(data, dict):
                 if 'tokens_used' in data:
                     total += data['tokens_used']
-                elif 'response' in data:
+                elif 'response' in data and isinstance(data['response'], str):
                     total += len(data['response'].split())
         
         return {
@@ -466,9 +573,9 @@ class BlackBox:
     
     def trace_token(self, token: str, probability: float, source: str, context: Dict = None):
         """
-        Token szintű nyomkövetés (opcionális).
+        Token szintű nyomkövetés (Quantum-Logger).
         """
-        if not self.config['trace_token_level']:
+        if not self.config['quantum_logging']:
             return
         
         self.log(
@@ -482,16 +589,45 @@ class BlackBox:
             level='debug'
         )
     
+    def export(self, format: str = 'json', query: Dict = None) -> str:
+        """
+        Események exportálása különböző formátumokban.
+        """
+        events = self.replay(**query) if query else list(self.index_by_time)
+        
+        if format == 'json':
+            return json.dumps(events, indent=2)
+        elif format == 'csv':
+            import csv
+            import io
+            output = io.StringIO()
+            writer = csv.writer(output)
+            # Fejléc
+            writer.writerow(['id', 'timestamp', 'datetime', 'type', 'source', 'level', 'trace_id'])
+            # Adatok
+            for e in events[-1000:]:  # Max 1000 sor
+                writer.writerow([
+                    e['id'], e['timestamp'], e['datetime'], 
+                    e['type'], e['source'], e['level'], e['trace_id']
+                ])
+            return output.getvalue()
+        else:
+            return str(events)
+    
     def get_state(self) -> Dict:
         """Állapot lekérése"""
         return {
             'status': 'running' if self.running else 'stopped',
             'stats': self.get_stats(),
+            'playback': {
+                'active': self.playback_state['active'],
+                'speed': self.playback_state['speed']
+            },
             'config': {
                 'log_dir': str(self.log_dir),
                 'log_level': self.config['log_level'],
                 'buffer_size': self.config['buffer_size'],
-                'trace_token_level': self.config['trace_token_level']
+                'trace_token_level': self.config['quantum_logging']
             }
         }
 
@@ -504,12 +640,11 @@ if __name__ == "__main__":
     bb.start()
     
     # Teszt események
-    bb.log('system', 'test', {'message': 'Indulás'}, 'info')
-    bb.log('user', 'web', {'text': 'Szia Kópé!'}, 'info')
-    bb.log('king', 'king', {'response': 'Szia Grumpy!', 'tokens_used': 5}, 'info')
-    bb.log('error', 'test', {'error': 'Valami hiba'}, 'error')
+    bb.log('system', 'test', {'message': 'Starting'}, 'info')
+    bb.log('user', 'web', {'text': 'Hello!'}, 'info')
+    bb.log('king', 'king', {'response': 'Hi there!', 'tokens_used': 5}, 'info')
+    bb.log('error', 'test', {'error': 'Something went wrong'}, 'error')
     
-    # Várunk
     time.sleep(1)
     
     # Statisztikák
@@ -522,5 +657,10 @@ if __name__ == "__main__":
     print("\n--- Utolsó események ---")
     for e in bb.replay()[-5:]:
         print(f"[{e['datetime']}] {e['source']}: {e['type']}")
+    
+    # Export
+    print("\n--- Export CSV ---")
+    csv_data = bb.export('csv')
+    print(csv_data[:500] + "...")
     
     bb.stop()

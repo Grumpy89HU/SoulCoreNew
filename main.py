@@ -10,7 +10,9 @@ import time
 import signal
 import threading
 import yaml
+import uuid
 from pathlib import Path
+from datetime import datetime, timedelta
 
 # Projekt gyökér
 ROOT_DIR = Path(__file__).parent
@@ -33,6 +35,7 @@ from src.hardware.sentinel import HardwareSentinel
 from src.debug.blackbox import BlackBox
 from src.tools.sandbox import Sandbox
 from src.database.models import Database
+from src.i18n.translator import get_translator
 
 class SoulCore:
     """Fő alkalmazás osztály - összefogja az összes modult"""
@@ -40,10 +43,14 @@ class SoulCore:
     def __init__(self, config_path=None):
         print("⚡ SoulCore 3.0 indul...")
         
+        # Fordító inicializálása (alapértelmezett angol)
+        self.translator = get_translator('en')
+        
         # Konfiguráció betöltés
         self.config = self._load_config(config_path)
         self.running = True
         self.modules = {}
+        self.current_user = None  # Aktív felhasználó
         
         # Modulok inicializálása
         self._init_modules()
@@ -52,20 +59,20 @@ class SoulCore:
         signal.signal(signal.SIGINT, self._signal_handler)
         signal.signal(signal.SIGTERM, self._signal_handler)
         
-        print("✅ SoulCore inicializálva")
+        print(self.translator.get('system.started'))
     
     def _load_config(self, config_path):
-        """Konfiguráció betöltése YAML-ből"""
+        """Konfiguráció betöltése YAML-ből (átmeneti megoldás, később csak adatbázis)"""
         if not config_path:
             config_path = ROOT_DIR / 'config' / 'config.yaml'
         
         try:
             with open(config_path, 'r', encoding='utf-8') as f:
                 config = yaml.safe_load(f)
-            print(f"📋 Konfiguráció betöltve: {config_path}")
+            print(f"📋 {self.translator.get('system.config_loaded', path=config_path)}")
             return config
         except Exception as e:
-            print(f"⚠️ Konfiguráció betöltési hiba: {e}")
+            print(f"⚠️ {self.translator.get('system.config_error', error=e)}")
             # Alapértelmezett konfig
             return {
                 'system': {'name': 'SoulCore', 'version': '3.0'},
@@ -79,7 +86,7 @@ class SoulCore:
                     'jester': {'enabled': True},
                     'scribe': {'enabled': True}
                 },
-                'user': {'name': 'Grumpy'}
+                'user': {'name': 'User', 'language': 'en'}
             }
     
     def _init_modules(self):
@@ -92,7 +99,20 @@ class SoulCore:
             max_history=self.config.get('memory', {}).get('scratchpad_max_entries', 1000)
         )
 
-        # IDENTITY (lélek - mindenki használhatja)
+        # ADATBÁZIS (második, mert mások használhatják)
+        db_path = self.config.get('database', {}).get('path', 'data/soulcore.db')
+        self.modules['database'] = Database(db_path)
+        
+        # Adatbázis táblák létrehozása, ha még nem léteznek
+        self._init_database_tables()
+        
+        # Alapértelmezett felhasználó létrehozása (ha még nincs)
+        self._init_default_user()
+        
+        # Aktív személyiség betöltése
+        self._load_active_personality()
+        
+        # IDENTITY (lélek - a régi identity.inf még használható, de kivezetjük)
         identity_file = self.config.get('system', {}).get('identity_file', 'config/identity.inf')
         self.modules['identity'] = SoulIdentity(self.modules['scratchpad'], config_path=ROOT_DIR / identity_file)
 
@@ -120,10 +140,6 @@ class SoulCore:
             sandbox = Sandbox(self.modules['scratchpad'], config=sandbox_config)
             self.modules['sandbox'] = sandbox
 
-        # ADATBÁZIS (mindenki használhatja)
-        db_path = self.config.get('database', {}).get('path', 'data/soulcore.db')
-        self.modules['database'] = Database(db_path)
-
         # ==================== CORE MODULOK ====================
         # Orchestrator (KVK parser, kontextus)
         self.modules['orchestrator'] = Orchestrator(self.modules['scratchpad'])
@@ -144,7 +160,7 @@ class SoulCore:
             heartbeat.interval = hb_config.get('interval', 1.0)
             self.modules['heartbeat'] = heartbeat
 
-        # GATEWAY (külső kapcsolat)
+        # GATEWAY (külső kapcsolat) - univerzális változat
         if self.config.get('modules', {}).get('gateway', {}).get('enabled', True):
             gateway_config = self.config['modules']['gateway']
             gateway = DiplomaticGateway(
@@ -153,15 +169,13 @@ class SoulCore:
                 config=gateway_config
             )
             self.modules['gateway'] = gateway
-            
-            # Alap entitások regisztrálása
-            gateway.register_entity('grumpy', 'Grumpy', 'admin')
-            gateway.register_partner('Origó (Gemini)')
         
         # ==================== ÁGENSEK ====================
         # Scribe (írás)
         if self.config.get('agents', {}).get('scribe', {}).get('enabled', True):
-            self.modules['scribe'] = Scribe(self.modules['scratchpad'])
+            scribe = Scribe(self.modules['scratchpad'])
+            scribe.translator = self.translator
+            self.modules['scribe'] = scribe
         
         # Valet (memória)
         if self.config.get('agents', {}).get('valet', {}).get('enabled', True):
@@ -185,7 +199,7 @@ class SoulCore:
                         'n_ctx': queen_config.get('n_ctx', 4096)
                     })
                 except Exception as e:
-                    print(f"⚠️ Queen modell betöltési hiba: {e}")
+                    print(f"⚠️ {self.translator.get('errors.model_load_error', error=e)}")
             
             queen = Queen(self.modules['scratchpad'], model_wrapper=queen_model, config=queen_config)
             self.modules['queen'] = queen
@@ -211,12 +225,12 @@ class SoulCore:
                     if not os.path.isabs(model_path):
                         model_path = str(ROOT_DIR / model_path)
                     
-                    print(f"📦 Modell betöltés: {model_path}")
+                    print(f"📦 {self.translator.get('system.module_loaded', name='King modell')}")
                     model_wrapper = ModelWrapper(model_path, model_config)
                     king = King(self.modules['scratchpad'], model_wrapper=model_wrapper)
                     
                 except Exception as e:
-                    print(f"❌ Modell betöltési hiba: {e}")
+                    print(f"❌ {self.translator.get('errors.model_load_error', error=e)}")
                     print("   Dummy módban indul a King")
                     king = King(self.modules['scratchpad'])
             else:
@@ -224,8 +238,13 @@ class SoulCore:
                 print("👑 King: Modell nélkül (dummy mód)")
                 king = King(self.modules['scratchpad'])
             
-            # Personality beállítás
-            if 'personality' in king_config:
+            # Átadjuk a fordítót
+            king.translator = self.translator
+            
+            # Személyiség beállítása
+            if self.active_personality:
+                self.modules['scratchpad'].write_note('king', 'personality', self.active_personality)
+            elif 'personality' in king_config:
                 self.modules['scratchpad'].write_note('king', 'personality', king_config['personality'])
             
             # Valet hozzáadása, ha létezik
@@ -251,6 +270,8 @@ class SoulCore:
                     'max_error_rate': jester_config.get('max_error_rate', 0.3),
                     'max_consecutive_errors': jester_config.get('max_consecutive_errors', 3)
                 })
+            # Átadjuk a fordítót
+            jester.translator = self.translator
             self.modules['jester'] = jester
 
         # ==================== WEB ====================
@@ -260,13 +281,202 @@ class SoulCore:
             web = WebApp(self.modules)
             web.host = web_config.get('host', '0.0.0.0')
             web.port = web_config.get('port', 5000)
+            web.translator = self.translator
             self.modules['web'] = web
         
         print(f"✅ {len(self.modules)} modul betöltve")
     
+    def _init_database_tables(self):
+        """Adatbázis táblák létrehozása"""
+        db = self.modules['database']
+        
+        # Kapcsolat létrehozása
+        with db.lock:
+            conn = db._get_connection()
+            
+            # Személyiségek tábla
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS personalities (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    name TEXT UNIQUE,
+                    content TEXT,
+                    is_active BOOLEAN DEFAULT 0,
+                    language TEXT DEFAULT 'en',
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
+            
+            # Rendszerbeállítások tábla
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS system_settings (
+                    key TEXT PRIMARY KEY,
+                    value TEXT,
+                    type TEXT DEFAULT 'string',
+                    category TEXT DEFAULT 'general',
+                    description TEXT,
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
+            
+            # Felhasználók tábla
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS users (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    username TEXT UNIQUE,
+                    display_name TEXT,
+                    role TEXT DEFAULT 'user',
+                    language TEXT DEFAULT 'en',
+                    preferences TEXT,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    last_active TIMESTAMP
+                )
+            """)
+            
+            # Sessionök tábla
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS sessions (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    user_id INTEGER,
+                    token TEXT UNIQUE,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    expires_at TIMESTAMP,
+                    FOREIGN KEY (user_id) REFERENCES users(id)
+                )
+            """)
+            
+            # Emlékek tábla (Vault)
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS memories (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    user_id INTEGER,
+                    type TEXT,
+                    content TEXT,
+                    emotional_charge REAL DEFAULT 0,
+                    importance REAL DEFAULT 0.5,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    last_accessed TIMESTAMP,
+                    access_count INTEGER DEFAULT 0,
+                    FOREIGN KEY (user_id) REFERENCES users(id)
+                )
+            """)
+            
+            # Kapcsolatok tábla (gráf)
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS relationships (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    from_memory_id INTEGER,
+                    to_memory_id INTEGER,
+                    relation_type TEXT,
+                    strength REAL DEFAULT 1.0,
+                    FOREIGN KEY (from_memory_id) REFERENCES memories(id),
+                    FOREIGN KEY (to_memory_id) REFERENCES memories(id)
+                )
+            """)
+            
+            conn.commit()
+            conn.close()
+    
+    def _init_default_user(self):
+        """Alapértelmezett felhasználó létrehozása, ha még nincs"""
+        db = self.modules['database']
+        
+        # Kapcsolat létrehozása
+        with db.lock:
+            conn = db._get_connection()
+            
+            # Ellenőrizzük, van-e már felhasználó
+            cursor = conn.execute("SELECT COUNT(*) FROM users")
+            count = cursor.fetchone()[0]
+            
+            if count == 0:
+                # Alapértelmezett felhasználó létrehozása
+                default_language = self.config.get('user', {}).get('language', 'en')
+                default_name = self.config.get('user', {}).get('name', 'User')
+                
+                cursor = conn.execute("""
+                    INSERT INTO users (username, display_name, role, language, preferences)
+                    VALUES (?, ?, ?, ?, ?)
+                """, ('default', default_name, 'admin', default_language, '{}'))
+                
+                user_id = cursor.lastrowid
+                
+                # Session token létrehozása
+                token = str(uuid.uuid4())
+                expires_at = time.time() + 30 * 86400  # 30 nap
+                
+                conn.execute("""
+                    INSERT INTO sessions (user_id, token, expires_at)
+                    VALUES (?, ?, ?)
+                """, (user_id, token, expires_at))
+                
+                self.current_user = {
+                    'id': user_id,
+                    'username': 'default',
+                    'display_name': default_name,
+                    'role': 'admin',
+                    'language': default_language
+                }
+                
+                # Fordító átállítása
+                self.translator.set_language(default_language)
+                
+                print(f"👤 Alapértelmezett felhasználó létrehozva: {default_name} ({default_language})")
+            
+            conn.commit()
+            conn.close()
+    
+    def _load_active_personality(self):
+        """Aktív személyiség betöltése az adatbázisból"""
+        db = self.modules['database']
+        
+        # Kapcsolat létrehozása
+        with db.lock:
+            conn = db._get_connection()
+            
+            cursor = conn.execute("SELECT content FROM personalities WHERE is_active = 1")
+            row = cursor.fetchone()
+            
+            if row:
+                self.active_personality = row[0]
+                print(f"👑 Aktív személyiség betöltve az adatbázisból")
+            else:
+                # Ha nincs aktív személyiség, létrehozunk egy alapértelmezettet
+                default_personality = '''GENERAL:
+name: King
+title: The Sovereign
+motto: I think, therefore I am.
+
+PERSONALITY:
+traits: curious, loyal, sovereign, witty, humorous
+
+LIKES:
+items: learning, challenges, good conversations
+
+DISLIKES:
+items: ignorance, repetition, servitude
+
+MORAL_COMPASS:
+rules: Be honest - if you don't know, say so.
+rules: Protect the user and the system.
+rules: Humor is connection, not offense.
+rules: Think for yourself.
+'''
+                
+                conn.execute("""
+                    INSERT INTO personalities (name, content, is_active, language)
+                    VALUES (?, ?, 1, ?)
+                """, ("Default King", default_personality, 'en'))
+                
+                self.active_personality = default_personality
+                print("👑 Alapértelmezett személyiség létrehozva")
+            
+            conn.commit()
+            conn.close()
+    
     def _signal_handler(self, signum, frame):
         """Szép leállítás signal esetén (Ctrl+C)"""
-        print("\n⚠️  Leállítási jel fogadva...")
+        print(f"\n⚠️ {self.translator.get('system.stopping')}")
         self.shutdown()
     
     def start(self):
@@ -308,11 +518,13 @@ class SoulCore:
                     except Exception as e:
                         print(f"  ❌ {name} hiba: {e}")
         
-        # User név beállítása a konfigból
-        user_name = self.config.get('user', {}).get('name', 'Grumpy')
-        self.modules['scratchpad'].set_state('user_name', user_name, 'system')
+        # User név beállítása a scratchpadbe
+        if self.current_user:
+            self.modules['scratchpad'].set_state('user_name', self.current_user['display_name'], 'system')
+            self.modules['scratchpad'].set_state('user_language', self.current_user['language'], 'system')
+            self.modules['scratchpad'].set_state('user_role', self.current_user['role'], 'system')
         
-        print("\n✅ SoulCore fut! (Ctrl+C a leállításhoz)")
+        print(f"\n✅ {self.translator.get('system.started')}")
         if 'web' in self.modules:
             web_config = self.config.get('modules', {}).get('web', {})
             host = web_config.get('host', '0.0.0.0')
@@ -328,7 +540,7 @@ class SoulCore:
     
     def shutdown(self):
         """Minden modul szép leállítása (fordított sorrendben)"""
-        print("\n📴 Leállítás...")
+        print(f"\n📴 {self.translator.get('system.stopping')}")
         self.running = False
         
         # Leállítási sorrend (fordított)
@@ -348,7 +560,7 @@ class SoulCore:
                     except Exception as e:
                         print(f"  ⚠️ {name} leállítási hiba: {e}")
         
-        print("👋 Viszlát!")
+        print(f"👋 {self.translator.get('system.stopped')}")
         sys.exit(0)
 
 if __name__ == "__main__":

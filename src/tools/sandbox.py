@@ -2,10 +2,11 @@
 Python-Sandbox - Dinamikus eszközhasználat.
 
 Feladata:
-1. Izolált környezet - resource limit, timeout
+1. Izolált környezet - resource limit, timeout, Docker
 2. Kód futtatás - amit a King ír, azt lefuttatja
 3. Eredmény visszajelzés - a King beépítheti a válaszába
 4. Biztonsági szűrők - tiltott importok, végtelen ciklusok
+5. Tool-Caller mechanizmus - script generálás, validáció, futtatás
 
 Minden futás egy szigetelt környezetben történik, hogy ne fagyassza le a rendszert.
 """
@@ -17,10 +18,12 @@ import io
 import contextlib
 import signal
 import threading
-from typing import Dict, Any, List, Optional, Tuple
-from pathlib import Path
 import traceback
 import resource
+import tempfile
+import os
+from typing import Dict, Any, List, Optional, Tuple, Callable
+from pathlib import Path
 
 # Opcionális: Docker támogatás
 try:
@@ -28,6 +31,13 @@ try:
     DOCKER_AVAILABLE = True
 except ImportError:
     DOCKER_AVAILABLE = False
+
+# i18n import (opcionális)
+try:
+    from src.i18n.translator import get_translator
+    I18N_AVAILABLE = True
+except ImportError:
+    I18N_AVAILABLE = False
 
 class TimeoutException(Exception):
     """Timeout kivétel"""
@@ -42,18 +52,20 @@ class Sandbox:
     - Tiltott importok szűrése
     - Időkorlát kezelés
     - Eredmény capture
+    - Docker izoláció (opcionális)
+    - Tool-Caller mechanizmus
     """
     
     # Tiltott importok (biztonsági okokból)
     FORBIDDEN_IMPORTS = {
-        'os', 'subprocess', 'sys', 'socket', 'requests',
-        'urllib', 'httpx', 'pickle', 'shelve', 'sqlite3',
-        'threading', 'multiprocessing', 'signal', 'ctypes',
-        'pty', 'tty', 'fcntl', 'termios', 'grp', 'pwd',
-        'crypt', 'curses', 'readline', 'rlcompleter',
+        'os', 'subprocess', 'socket', 'requests', 'urllib', 'httpx',
+        'pickle', 'shelve', 'sqlite3', 'threading', 'multiprocessing',
+        'signal', 'ctypes', 'pty', 'tty', 'fcntl', 'termios',
+        'grp', 'pwd', 'crypt', 'curses', 'readline', 'rlcompleter',
         'shutil', 'tempfile', 'glob', 'fnmatch', 'linecache',
-        'macpath', 'ntpath', 'posixpath', 'pathlib', 'shlex',
-        'zipfile', 'tarfile', 'gzip', 'bz2', 'lzma', 'zlib',
+        'macpath', 'ntpath', 'posixpath', 'shlex', 'zipfile',
+        'tarfile', 'gzip', 'bz2', 'lzma', 'zlib', 'importlib',
+        'sys', 'os.path', 'pathlib', 'inspect', 'site'
     }
     
     # Engedélyezett importok
@@ -63,12 +75,25 @@ class Sandbox:
         'string', 're', 'statistics', 'decimal', 'fractions',
         'array', 'copy', 'enum', 'heapq', 'bisect', 'queue',
         'struct', 'weakref', 'types', 'typing', 'warnings',
+        'hashlib', 'base64', 'binascii', 'codecs', 'uuid'
+    }
+    
+    # Veszélyes függvények
+    DANGEROUS_FUNCTIONS = {
+        'eval', 'exec', 'compile', 'globals', 'locals',
+        '__import__', 'open', 'input', 'getattr', 'setattr',
+        'delattr', 'execfile', 'compile', 'eval', 'exec'
     }
     
     def __init__(self, scratchpad, config: Dict = None):
         self.scratchpad = scratchpad
         self.name = "sandbox"
         self.config = config or {}
+        
+        # Fordító (később állítjuk be)
+        self.translator = None
+        if I18N_AVAILABLE:
+            self.translator = get_translator('en')
         
         # Alapértelmezett konfiguráció
         default_config = {
@@ -80,9 +105,12 @@ class Sandbox:
             'max_output_size': 1024 * 100,   # 100 KB
             'allowed_imports': list(self.ALLOWED_IMPORTS),
             'forbidden_imports': list(self.FORBIDDEN_IMPORTS),
-            'enable_filesystem': False,       # Fájlrendszer hozzáférés
-            'enable_network': False,          # Hálózat hozzáférés
-            'temp_dir': '/tmp/soulcore_sandbox'
+            'enable_filesystem': False,      # Fájlrendszer hozzáférés
+            'enable_network': False,         # Hálózat hozzáférés
+            'temp_dir': '/tmp/soulcore_sandbox',
+            'enable_tool_caller': True,      # Tool-Caller engedélyezése
+            'max_code_length': 10000,         # Max kód hossz (karakter)
+            'validation_level': 'strict'      # strict, normal, permissive
         }
         
         for key, value in default_config.items():
@@ -94,10 +122,13 @@ class Sandbox:
         if self.config['use_docker'] and DOCKER_AVAILABLE:
             try:
                 self.docker_client = docker.from_env()
-                print("🐳 Docker sandbox elérhető")
+                print("🐳 Sandbox: Docker sandbox elérhető")
             except Exception as e:
-                print(f"⚠️ Docker hiba: {e}")
+                print(f"⚠️ Sandbox: Docker hiba: {e}")
                 self.config['use_docker'] = False
+        
+        # Tool registry (elérhető eszközök)
+        self.tools = {}
         
         # Állapot
         self.state = {
@@ -106,13 +137,20 @@ class Sandbox:
             'successful': 0,
             'failed': 0,
             'timeouts': 0,
-            'last_execution': None
+            'blocked': 0,
+            'last_execution': None,
+            'errors': []
         }
         
         # Temp könyvtár létrehozása
         Path(self.config['temp_dir']).mkdir(parents=True, exist_ok=True)
         
         print("📦 Python-Sandbox: Izolált környezet készen áll.")
+    
+    def set_language(self, language: str):
+        """Nyelv beállítása (i18n)"""
+        if self.translator and I18N_AVAILABLE:
+            self.translator.set_language(language)
     
     def start(self):
         """Sandbox indítása"""
@@ -137,49 +175,51 @@ class Sandbox:
         """
         warnings = []
         
-        # 1. Szintaxis ellenőrzés
+        # 1. Hossz ellenőrzés
+        if len(code) > self.config['max_code_length']:
+            return False, f"Code too long: {len(code)} > {self.config['max_code_length']}", warnings
+        
+        # 2. Szintaxis ellenőrzés
         try:
             tree = ast.parse(code)
         except SyntaxError as e:
-            return False, f"Szintaktikai hiba: {e}", warnings
+            return False, f"Syntax error: {e}", warnings
+        except Exception as e:
+            return False, f"Parse error: {e}", warnings
         
-        # 2. Tiltott importok keresése
+        # 3. Tiltott importok keresése
         for node in ast.walk(tree):
             if isinstance(node, ast.Import):
                 for alias in node.names:
                     module = alias.name.split('.')[0]
                     if module in self.config['forbidden_imports']:
-                        return False, f"Tiltott import: {module}", warnings
-                    if module not in self.config['allowed_imports']:
-                        warnings.append(f"Nem engedélyezett import: {module}")
+                        return False, f"Forbidden import: {module}", warnings
+                    if self.config['validation_level'] == 'strict':
+                        if module not in self.config['allowed_imports']:
+                            warnings.append(f"Non-allowed import: {module}")
             
             elif isinstance(node, ast.ImportFrom):
                 module = node.module.split('.')[0] if node.module else ''
                 if module in self.config['forbidden_imports']:
-                    return False, f"Tiltott import: {module}", warnings
-                if module and module not in self.config['allowed_imports']:
-                    warnings.append(f"Nem engedélyezett import: {module}")
+                    return False, f"Forbidden import: {module}", warnings
+                if self.config['validation_level'] == 'strict':
+                    if module and module not in self.config['allowed_imports']:
+                        warnings.append(f"Non-allowed import: {module}")
         
-        # 3. Veszélyes függvények keresése
-        dangerous_functions = {
-            'eval', 'exec', 'compile', 'globals', 'locals',
-            '__import__', 'open', 'input', 'print',  # print megengedett, de figyeljük
-            'getattr', 'setattr', 'delattr', 'execfile'
-        }
-        
+        # 4. Veszélyes függvények keresése
         for node in ast.walk(tree):
             if isinstance(node, ast.Call):
                 if isinstance(node.func, ast.Name):
-                    if node.func.id in dangerous_functions:
-                        warnings.append(f"Veszélyes függvény: {node.func.id}")
+                    if node.func.id in self.DANGEROUS_FUNCTIONS:
+                        warnings.append(f"Dangerous function: {node.func.id}")
         
-        # 4. Végtelen ciklus gyanú
+        # 5. Végtelen ciklus gyanú
         loop_count = 0
         for node in ast.walk(tree):
             if isinstance(node, (ast.While, ast.For)):
                 loop_count += 1
-        if loop_count > 3:
-            warnings.append(f"Sok ciklus ({loop_count}), lehet végtelen ciklus")
+        if loop_count > 5:
+            warnings.append(f"Many loops ({loop_count}), possible infinite loop")
         
         return True, "", warnings
     
@@ -223,6 +263,7 @@ class Sandbox:
         if not valid:
             result['error'] = error_msg
             self.state['failed'] += 1
+            self.state['blocked'] += 1
             self.state['status'] = 'idle'
             result['execution_time'] = time.time() - start_time
             return result
@@ -241,11 +282,14 @@ class Sandbox:
         # Resource limit beállítások
         def set_limits():
             # CPU idő limit
-            resource.setrlimit(resource.RLIMIT_CPU, 
-                (self.config['max_cpu_time'], self.config['max_cpu_time'] + 5))
-            # Memória limit
-            resource.setrlimit(resource.RLIMIT_AS,
-                (self.config['max_memory'], self.config['max_memory']))
+            try:
+                resource.setrlimit(resource.RLIMIT_CPU, 
+                    (self.config['max_cpu_time'], self.config['max_cpu_time'] + 5))
+                # Memória limit
+                resource.setrlimit(resource.RLIMIT_AS,
+                    (self.config['max_memory'], self.config['max_memory']))
+            except:
+                pass
         
         # Output capture
         stdout_capture = io.StringIO()
@@ -271,7 +315,19 @@ class Sandbox:
         
         # Timeout kezelés
         def timeout_handler(signum, frame):
-            raise TimeoutException("A kód túl sokáig futott")
+            raise TimeoutException(f"Code execution timed out after {self.config['timeout']} seconds")
+        
+        # Ideiglenes fájl létrehozása (ha kell)
+        temp_file = None
+        if self.config['enable_filesystem']:
+            temp_file = tempfile.NamedTemporaryFile(
+                mode='w', 
+                dir=self.config['temp_dir'],
+                delete=False,
+                suffix='.py'
+            )
+            temp_file.write(code)
+            temp_file.close()
         
         try:
             # Resource limit beállítása
@@ -279,7 +335,7 @@ class Sandbox:
             
             # Signal timeout (Unix only)
             if hasattr(signal, 'SIGALRM'):
-                signal.signal(signal.SIGALRM, timeout_handler)
+                old_handler = signal.signal(signal.SIGALRM, timeout_handler)
                 signal.alarm(self.config['timeout'])
             
             # Kód futtatása
@@ -300,21 +356,26 @@ class Sandbox:
             # Timeout kikapcsolása
             if hasattr(signal, 'SIGALRM'):
                 signal.alarm(0)
+                signal.signal(signal.SIGALRM, old_handler)
             
             result['success'] = True
             self.state['successful'] += 1
             
         except TimeoutException as e:
-            result['error'] = f"Timeout: {e}"
+            result['error'] = str(e)
             self.state['timeouts'] += 1
             self.state['failed'] += 1
         except Exception as e:
-            result['error'] = f"Hiba: {e}\n{traceback.format_exc()}"
+            result['error'] = f"{e}\n{traceback.format_exc()}"
             self.state['failed'] += 1
         finally:
             # Timeout kikapcsolása
             if hasattr(signal, 'SIGALRM'):
                 signal.alarm(0)
+            
+            # Temp fájl törlése
+            if temp_file and os.path.exists(temp_file.name):
+                os.unlink(temp_file.name)
         
         # Output összegyűjtése
         result['output'] = stdout_capture.getvalue()[:self.config['max_output_size']]
@@ -335,17 +396,23 @@ class Sandbox:
         if not self.docker_client:
             return self._execute_local(code, context, result, start_time)
         
+        temp_file = None
         try:
             # Kód fájlba írása
-            code_file = Path(self.config['temp_dir']) / f"script_{int(time.time())}.py"
-            with open(code_file, 'w') as f:
-                f.write(code)
+            temp_file = tempfile.NamedTemporaryFile(
+                mode='w',
+                dir=self.config['temp_dir'],
+                delete=False,
+                suffix='.py'
+            )
+            temp_file.write(code)
+            temp_file.close()
             
             # Docker konténer futtatása
             container = self.docker_client.containers.run(
                 image='python:3.11-slim',
                 command=['python', '/script.py'],
-                volumes={str(code_file): {'bind': '/script.py', 'mode': 'ro'}},
+                volumes={temp_file.name: {'bind': '/script.py', 'mode': 'ro'}},
                 mem_limit=f"{self.config['max_memory']}b",
                 cpu_period=100000,
                 cpu_quota=int(100000 * self.config['max_cpu_time']),
@@ -365,26 +432,90 @@ class Sandbox:
                 if result['success']:
                     self.state['successful'] += 1
                 else:
-                    result['error'] = f"Kilépési kód: {result_container['StatusCode']}"
+                    result['error'] = f"Exit code: {result_container['StatusCode']}"
                     self.state['failed'] += 1
                     
             except Exception as e:
                 container.kill()
-                result['error'] = f"Docker timeout vagy hiba: {e}"
+                result['error'] = f"Docker timeout or error: {e}"
                 self.state['timeouts'] += 1
                 self.state['failed'] += 1
             finally:
                 container.remove()
-                code_file.unlink()
             
         except Exception as e:
-            result['error'] = f"Docker hiba: {e}"
+            result['error'] = f"Docker error: {e}"
             self.state['failed'] += 1
+        finally:
+            if temp_file and os.path.exists(temp_file.name):
+                os.unlink(temp_file.name)
         
         result['execution_time'] = time.time() - start_time
         self.state['status'] = 'idle'
         
         return result
+    
+    # --- TOOL-CALLER MECHANIZMUS ---
+    
+    def register_tool(self, name: str, description: str, function: Callable, schema: Dict = None):
+        """
+        Eszköz regisztrálása a tool registry-be.
+        
+        Args:
+            name: eszköz neve
+            description: leírás (King számára)
+            function: a függvény, ami meghívódik
+            schema: paraméter séma (JSON Schema formátumban)
+        """
+        self.tools[name] = {
+            'name': name,
+            'description': description,
+            'function': function,
+            'schema': schema or {},
+            'calls': 0
+        }
+        print(f"🔧 Sandbox: Tool registered: {name}")
+    
+    def call_tool(self, name: str, **kwargs) -> Any:
+        """
+        Eszköz meghívása név alapján.
+        """
+        tool = self.tools.get(name)
+        if not tool:
+            return f"Tool '{name}' not found"
+        
+        try:
+            tool['calls'] += 1
+            result = tool['function'](**kwargs)
+            return result
+        except Exception as e:
+            return f"Tool execution error: {e}"
+    
+    def list_tools(self) -> List[Dict]:
+        """
+        Elérhető eszközök listázása.
+        """
+        return [
+            {
+                'name': t['name'],
+                'description': t['description'],
+                'schema': t['schema'],
+                'calls': t['calls']
+            }
+            for t in self.tools.values()
+        ]
+    
+    def generate_tool_code(self, tool_name: str, parameters: Dict) -> str:
+        """
+        Kód generálása egy eszköz meghívásához.
+        """
+        param_str = ', '.join([f"{k}={repr(v)}" for k, v in parameters.items()])
+        return f"""
+# Tool call: {tool_name}
+_result = sandbox.call_tool('{tool_name}', {param_str})
+if _result:
+    print(f"Result: {{_result}}")
+"""
     
     # --- KING INTEGRÁCIÓ ---
     
@@ -398,15 +529,15 @@ class Sandbox:
         if result['success']:
             output = []
             if result['output']:
-                output.append(f"Kimenet:\n{result['output']}")
+                output.append(f"Output:\n{result['output']}")
             if result['result'] is not None:
-                output.append(f"Eredmény: {result['result']}")
+                output.append(f"Result: {result['result']}")
             if result['warnings']:
-                output.append(f"Figyelmeztetések: {', '.join(result['warnings'])}")
+                output.append(f"Warnings: {', '.join(result['warnings'])}")
             
-            return "\n".join(output) if output else "A kód sikeresen lefutott, de nem volt kimenet."
+            return "\n".join(output) if output else "Code executed successfully, no output."
         else:
-            return f"Hiba a kód futtatásakor:\n{result['error']}"
+            return f"Execution failed:\n{result['error']}"
     
     # --- STATISZTIKA ---
     
@@ -418,14 +549,32 @@ class Sandbox:
             'successful': self.state['successful'],
             'failed': self.state['failed'],
             'timeouts': self.state['timeouts'],
+            'blocked': self.state['blocked'],
             'last_execution': self.state['last_execution'],
+            'tools': len(self.tools),
+            'tool_calls': sum(t['calls'] for t in self.tools.values()),
             'config': {
                 'timeout': self.config['timeout'],
                 'use_docker': self.config['use_docker'],
                 'docker_available': DOCKER_AVAILABLE,
-                'allowed_imports': len(self.config['allowed_imports'])
-            }
+                'allowed_imports': len(self.config['allowed_imports']),
+                'validation_level': self.config['validation_level']
+            },
+            'errors': self.state['errors'][-5:]
         }
+
+# Példa tool-ok (ha később kellenek)
+def example_math_tool(operation: str, a: float, b: float) -> float:
+    """Példa matematikai eszköz"""
+    if operation == 'add':
+        return a + b
+    elif operation == 'subtract':
+        return a - b
+    elif operation == 'multiply':
+        return a * b
+    elif operation == 'divide':
+        return a / b if b != 0 else float('inf')
+    return 0.0
 
 # Teszt
 if __name__ == "__main__":
@@ -434,12 +583,27 @@ if __name__ == "__main__":
     s = Scratchpad()
     sandbox = Sandbox(s)
     
+    # Tool regisztráció példa
+    sandbox.register_tool(
+        'math',
+        'Basic mathematical operations',
+        example_math_tool,
+        {
+            'type': 'object',
+            'properties': {
+                'operation': {'type': 'string', 'enum': ['add', 'subtract', 'multiply', 'divide']},
+                'a': {'type': 'number'},
+                'b': {'type': 'number'}
+            }
+        }
+    )
+    
     # Teszt kódok
     test_codes = [
-        "print('Hello, világ!')",
+        "print('Hello, world!')",
         "import math\n_result = math.sqrt(16)",
-        "import os\nprint('Ha van os, ez nem futna le')",
-        "while True: pass  # Végtelen ciklus",
+        "import os\nprint('This should fail')",
+        "while True: pass  # Infinite loop",
         """
 def fibonacci(n):
     a, b = 0, 1
@@ -448,8 +612,15 @@ def fibonacci(n):
     return a
 _result = fibonacci(10)
 print(f'Fibonacci 10: {_result}')
+        """,
+        """
+# Tool call example
+_result = sandbox.call_tool('math', operation='add', a=10, b=5)
+print(f'10 + 5 = {_result}')
         """
     ]
+    
+    print("Elérhető tool-ok:", sandbox.list_tools())
     
     for code in test_codes:
         print(f"\n--- Futtatás: {code[:50]}... ---")

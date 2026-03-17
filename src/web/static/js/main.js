@@ -23,6 +23,7 @@ const App = {
         const loginError = Vue.ref('');
         const confirmTitle = Vue.ref('');
         const confirmMessage = Vue.ref('');
+        const language = Vue.ref(window.i18n?.language || 'en');
         let confirmCallback = null;
         
         // Computed property-k a store-ból
@@ -58,6 +59,23 @@ const App = {
             showConfirmModal.value = false;
         };
         
+        // i18n függvények
+        const gettext = (key, params = {}) => {
+            if (window.gettext) {
+                return window.gettext(key, params);
+            }
+            return key;
+        };
+        
+        const changeLanguage = (lang) => {
+            language.value = lang;
+            if (window.changeLanguage) {
+                window.changeLanguage(lang);
+            } else if (window.i18n) {
+                window.i18n.load(lang);
+            }
+        };
+        
         // Idő frissítése
         setInterval(() => {
             currentTime.value = new Date().toLocaleTimeString();
@@ -73,6 +91,7 @@ const App = {
             loginError,
             confirmTitle,
             confirmMessage,
+            language,
             
             // Computed
             heartbeat,
@@ -83,7 +102,9 @@ const App = {
             formatUptime,
             createNewConversation,
             adminLogin,
-            confirmAction
+            confirmAction,
+            gettext,
+            changeLanguage
         };
     }
 };

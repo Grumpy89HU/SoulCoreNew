@@ -1,9 +1,9 @@
 <!DOCTYPE html>
-<html lang="hu">
+<html lang="{{ language }}">
 <head>
     <meta charset="UTF-8">
     <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=yes">
-    <title>SoulCore 3.0 - {% block title %}A Vár{% endblock %}</title>
+    <title>SoulCore 3.0 - {% block title %}{{ gettext('ui.dashboard') }}{% endblock %}</title>
     
     <!-- CSS -->
     <link rel="stylesheet" href="{{ url_for('static', filename='css/main.css') }}">
@@ -17,17 +17,57 @@
     <script src="https://cdn.socket.io/4.5.4/socket.io.min.js"></script>
     <!-- Vue.js -->
     <script src="https://unpkg.com/vue@3/dist/vue.global.js"></script>
+    <!-- i18n -->
+    <script src="{{ url_for('static', filename='js/i18n.js') }}"></script>
     
     {% block head %}{% endblock %}
 </head>
 <body>
     <div id="app">
-        <!-- Ide kerül a child template tartalma -->
-        {% block content %}{% endblock %}
+		{% raw %}
+        <!-- Fejléc (most már itt van, nem külön include) -->
+        <div class="header">
+            <div class="title">
+                <span>✦</span> SOULCORE 3.0 <span>✦</span>
+            </div>
+            <div class="status-badge">
+                <div class="badge" :class="{'heartbeat': heartbeatRunning, 'paused': !heartbeatRunning}">
+                    <span>💓</span> <span v-text="formatUptime(heartbeat.uptime_seconds)"></span>
+                </div>
+                <div class="badge" :class="kingState.status == 'ready' ? 'heartbeat' : 'paused'">
+                    <span>👑</span> <span v-text="kingState.status || '???'"></span>
+                </div>
+                <div class="badge">
+                    <select v-model="language" @change="changeLanguage" class="language-select">
+                        <option value="en">English</option>
+                        <option value="hu">Magyar</option>
+                    </select>
+                </div>
+            </div>
+        </div>
+        {% endraw %}
+        
+        <!-- Fő tartalom - EZ MÁR KÍVÜL VAN A raw BLOKKON -->
+        <div class="main">
+            {% block content %}{% endblock %}
+        </div>
+        
+        {% raw %}
+        <!-- Lábléc -->
+        <div class="footer">
+            <span>⚡ SoulCore 3.0</span>
+            <div class="connection-status">
+                <span class="status-dot" :class="{ connected: connected, disconnected: !connected }"></span>
+				<span v-if="connected" v-text="gettext('ui.connected')"></span>
+				<span v-else style="color: var(--error-color);" v-text="gettext('ui.disconnected')"></span>
+            </div>
+            <span v-text="currentTime"></span>
+        </div>
+		{% endraw %}
     </div>
     
     <!-- JavaScript modulok -->
-	<script src="{{ url_for('static', filename='js/api.js') }}"></script>
+    <script src="{{ url_for('static', filename='js/api.js') }}"></script>
     <script src="{{ url_for('static', filename='js/store.js') }}"></script>
     <script src="{{ url_for('static', filename='js/socket.js') }}"></script>
     <script src="{{ url_for('static', filename='js/utils/formatters.js') }}"></script>

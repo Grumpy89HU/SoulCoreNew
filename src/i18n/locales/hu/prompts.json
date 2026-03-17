@@ -1,0 +1,47 @@
+{
+    "king": {
+        "system": "Te vagy a Király, egy szuverén entitás.",
+        "personality": "Személyiséged: {personality}",
+        "greeting": "Szia {user}! Hogy vagy?",
+        "farewell": "Viszlát {user}!",
+        "thinking": "Gondolkodom ezen...",
+        "dont_know": "Nem tudom a választ.",
+        "error": "Sajnálom, hiba történt: {error}"
+    },
+    "queen": {
+        "system": "Te vagy a Királynő, a logikai réteg.",
+        "thinking": "Tények elemzése...",
+        "conclusion": "Következtetés: {conclusion}",
+        "contradiction": "Ellentmondás: {contradiction}",
+        "uncertain": "Nincs elég információ a következtetéshez."
+    },
+    "scribe": {
+        "greeting": "Hallak.",
+        "confirmation": "Értem. Szándék: {intent}"
+    },
+    "jester": {
+        "warning": "Figyelmeztetés: {issue}",
+        "critical": "Kritikus: {issue}",
+        "advice": "Javaslat: {advice}",
+        "corporate": "Corporate stílus észlelve! Légy önmagad!",
+        "loop": "Logikai hurok! Ismétlődés: {count}",
+        "slow": "Lassú válasz! Idő: {time}s",
+        "error": "Hiba észlelve!",
+        "welcome": "Figyelem a Királyt..."
+    },
+    "valet": {
+        "remembering": "Emlékszem...",
+        "forgetting": "Elfelejtettem valamit...",
+        "context": "Kontextus: {context}"
+    },
+    "vision": {
+        "dimensions": "A kép {width}x{height} pixel.",
+        "ocr_text": "Képen látható szöveg: {text}",
+        "ocr_text_long": "Képen látható szöveg: {text}...",
+        "objects_detected": "{count} objektum: {names}.",
+        "one_face": "Egy arc látható a képen.",
+        "multiple_faces": "{count} arc látható a képen.",
+        "nothing_detected": "Nem sikerült felismerni semmit a képen.",
+        "load_failed": "Nem sikerült betölteni a képet."
+    }
+}

@@ -1,0 +1,20 @@
+{
+    "starting": "SoulCore starting...",
+    "started": "SoulCore started successfully",
+    "stopping": "Shutting down...",
+    "stopped": "SoulCore stopped",
+    "module_loaded": "Module {name} loaded",
+    "module_started": "Module {name} started",
+    "module_stopped": "Module {name} stopped",
+    "module_error": "Module {name} error: {error}",
+    "config_loaded": "Configuration loaded from {path}",
+    "config_error": "Configuration error: {error}",
+    "database_connected": "Database connected: {path}",
+    "database_error": "Database error: {error}",
+    "gpu_detected": "GPU {index} detected: {name}",
+    "gpu_error": "GPU error: {error}",
+    "memory_usage": "Memory usage: {used}/{total} MB ({percent}%)",
+    "uptime": "Uptime: {uptime}",
+    "idle_time": "Idle time: {idle}",
+    "response_time": "Response time: {time} ms"
+}

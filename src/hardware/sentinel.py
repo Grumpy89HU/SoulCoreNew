@@ -2,10 +2,12 @@
 Hardver-Sentinel - A Vár fizikai integritásának őre.
 
 Feladata:
-1. GPU állapot figyelés - hőmérséklet, VRAM használat
+1. GPU állapot figyelés - hőmérséklet, VRAM használat, kihasználtság
 2. Throttle-logika - ha túl meleg, lassít
 3. Emergency unload - ha kritikus, modell kiürítés
 4. VRAM scheduler - modellek közötti memória megosztás
+5. Termikus és erőforrás-gazdálkodás
+6. Vészhelyzeti protokoll (Blackout & Recovery)
 """
 
 import time
@@ -21,7 +23,7 @@ try:
     NVML_AVAILABLE = True
 except ImportError:
     NVML_AVAILABLE = False
-    print("⚠️ pynvml nem elérhető. Hardver-menedzsment korlátozott módban.")
+    print("⚠️ Sentinel: pynvml nem elérhető. Korlátozott módban futok.")
 
 # Psutil (CPU, RAM)
 try:
@@ -29,6 +31,13 @@ try:
     PSUTIL_AVAILABLE = True
 except ImportError:
     PSUTIL_AVAILABLE = False
+
+# i18n import (opcionális)
+try:
+    from src.i18n.translator import get_translator
+    I18N_AVAILABLE = True
+except ImportError:
+    I18N_AVAILABLE = False
 
 class HardwareSentinel:
     """
@@ -64,6 +73,11 @@ class HardwareSentinel:
         self.name = "sentinel"
         self.config = config or {}
         
+        # Fordító (később állítjuk be)
+        self.translator = None
+        if I18N_AVAILABLE:
+            self.translator = get_translator('en')
+        
         # Alapértelmezett konfiguráció
         default_config = {
             'enabled': True,
@@ -76,7 +90,11 @@ class HardwareSentinel:
             'throttle_temp': 80,                  # Ennél lassít
             'throttle_factor': 0.5,                # Lassítás mértéke (50%)
             'auto_unload_priority': 3,             # Automatikus kiürítés prioritás alatt
-            'log_history': 100,                     # Hány mérés maradjon meg
+            'log_history': 100,                    # Hány mérés maradjon meg
+            'enable_emergency_protocol': True,      # Vészhelyzeti protokoll
+            'recovery_after_seconds': 300,          # 5 perc után próbál újra
+            'max_consecutive_critical': 3,          # 3 kritikus után vészleállás
+            'enable_throttle': True                  # Throttle engedélyezése
         }
         
         for key, value in default_config.items():
@@ -99,9 +117,9 @@ class HardwareSentinel:
                     handle = pynvml.nvmlDeviceGetHandleByIndex(i)
                     self.gpu_handles.append(handle)
                 
-                print(f"🔧 NVML inicializálva, {self.gpu_count} GPU található")
+                print(f"🔧 Sentinel: NVML inicializálva, {self.gpu_count} GPU található")
             except Exception as e:
-                print(f"⚠️ NVML hiba: {e}")
+                print(f"⚠️ Sentinel: NVML hiba: {e}")
                 self.nvml_available = False
         
         # GPU állapotok
@@ -118,7 +136,8 @@ class HardwareSentinel:
                 'throttled': False,
                 'status': 'unknown',
                 'last_seen': time.time(),
-                'history': []
+                'history': [],
+                'consecutive_critical': 0
             }
         
         # Modell slotok (melyik GPU-n mi fut)
@@ -131,6 +150,9 @@ class HardwareSentinel:
             'critical_alerts': [],
             'throttle_active': False,
             'last_emergency': None,
+            'emergency_count': 0,
+            'recovery_mode': False,
+            'recovery_until': 0,
             'check_count': 0
         }
         
@@ -140,6 +162,11 @@ class HardwareSentinel:
         self.lock = threading.Lock()
         
         print("🔧 Hardver-Sentinel: Őrszem ébred.")
+    
+    def set_language(self, language: str):
+        """Nyelv beállítása (i18n)"""
+        if self.translator and I18N_AVAILABLE:
+            self.translator.set_language(language)
     
     def start(self):
         """Sentinel indítása külön szálon"""
@@ -152,7 +179,7 @@ class HardwareSentinel:
             self.thread.start()
             
             self.scratchpad.set_state('sentinel_status', 'running', self.name)
-            print("🔧 Hardver-Sentinel: Figyelek.")
+            print("🔧 Sentinel: Figyelek.")
     
     def stop(self):
         """Sentinel leállítása"""
@@ -169,7 +196,7 @@ class HardwareSentinel:
                 pass
         
         self.scratchpad.set_state('sentinel_status', 'stopped', self.name)
-        print("🔧 Hardver-Sentinel: Leállt.")
+        print("🔧 Sentinel: Leállt.")
     
     def _run(self):
         """Fő figyelő ciklus"""
@@ -191,23 +218,27 @@ class HardwareSentinel:
         for i, handle in enumerate(self.gpu_handles):
             gpu_state = self._check_gpu(i, handle)
             
+            # Hőmérséklet ellenőrzés
             if gpu_state['temperature'] >= self.config['temp_critical']:
-                criticals.append(f"GPU{i} túlmelegedés: {gpu_state['temperature']}°C")
+                criticals.append(f"GPU{i} overheat: {gpu_state['temperature']}°C")
+                self.gpu_states[i]['consecutive_critical'] += 1
                 self.state['critical_alerts'].append({
                     'time': time.time(),
                     'gpu': i,
                     'type': 'overheat',
                     'value': gpu_state['temperature']
                 })
-            
             elif gpu_state['temperature'] >= self.config['temp_warning']:
-                warnings.append(f"GPU{i} meleg: {gpu_state['temperature']}°C")
+                warnings.append(f"GPU{i} warm: {gpu_state['temperature']}°C")
+                self.gpu_states[i]['consecutive_critical'] = 0
+            else:
+                self.gpu_states[i]['consecutive_critical'] = 0
             
+            # VRAM ellenőrzés
             if gpu_state['vram_percent'] >= self.config['vram_critical']:
-                criticals.append(f"GPU{i} VRAM kritikus: {gpu_state['vram_percent']}%")
-            
+                criticals.append(f"GPU{i} VRAM critical: {gpu_state['vram_percent']:.1f}%")
             elif gpu_state['vram_percent'] >= self.config['vram_warning']:
-                warnings.append(f"GPU{i} VRAM magas: {gpu_state['vram_percent']}%")
+                warnings.append(f"GPU{i} VRAM high: {gpu_state['vram_percent']:.1f}%")
         
         # CPU/RAM ellenőrzés
         if PSUTIL_AVAILABLE:
@@ -215,27 +246,28 @@ class HardwareSentinel:
             ram = psutil.virtual_memory()
             
             if cpu_percent > 90:
-                warnings.append(f"CPU magas: {cpu_percent}%")
+                warnings.append(f"CPU high: {cpu_percent}%")
             
             if ram.percent > 90:
-                warnings.append(f"RAM magas: {ram.percent}%")
+                warnings.append(f"RAM high: {ram.percent}%")
         
         # Throttle ellenőrzés
-        if any(g['temperature'] >= self.config['throttle_temp'] for g in self.gpu_states.values()):
-            if not self.state['throttle_active']:
-                print(f"🔧 Throttle aktiválva (hőmérséklet)")
-                self.state['throttle_active'] = True
-        else:
-            if self.state['throttle_active']:
-                print(f"🔧 Throttle kikapcsolva")
-                self.state['throttle_active'] = False
+        if self.config['enable_throttle']:
+            if any(g['temperature'] >= self.config['throttle_temp'] for g in self.gpu_states.values()):
+                if not self.state['throttle_active']:
+                    print(f"🔧 Sentinel: Throttle aktiválva (hőmérséklet)")
+                    self.state['throttle_active'] = True
+            else:
+                if self.state['throttle_active']:
+                    print(f"🔧 Sentinel: Throttle kikapcsolva")
+                    self.state['throttle_active'] = False
         
-        # Emergency unload ellenőrzés
-        if criticals:
-            self._handle_emergency(criticals)
+        # Vészhelyzet ellenőrzés
+        if self.config['enable_emergency_protocol']:
+            self._check_emergency(criticals)
         
         # Állapot mentése
-        self.state['warnings'] = warnings[-10:]  # Utolsó 10 figyelmeztetés
+        self.state['warnings'] = warnings[-10:]
         self.scratchpad.write(self.name, {
             'gpus': self.gpu_states,
             'warnings': warnings,
@@ -274,7 +306,7 @@ class HardwareSentinel:
                 
                 state['status'] = 'ok'
             else:
-                # Dummy adatok
+                # Dummy adatok (teszteléshez)
                 state['temperature'] = 45
                 state['vram_used'] = 2048
                 state['vram_total'] = 8192
@@ -297,34 +329,52 @@ class HardwareSentinel:
             
         except Exception as e:
             state['status'] = 'error'
-            print(f"🔧 GPU{index} hiba: {e}")
+            print(f"🔧 Sentinel: GPU{index} hiba: {e}")
         
         return state
     
-    def _handle_emergency(self, criticals: List[str]):
+    def _check_emergency(self, criticals: List[str]):
         """
-        Vészhelyzet kezelése.
+        Vészhelyzet ellenőrzése és kezelése.
         - Kritikus hőmérséklet -> vészkiürítés
         - VRAM kritikus -> alacsony prioritású modellek kiürítése
+        - Túl sok egymás utáni kritikus -> vészleállás
         """
         now = time.time()
-        self.state['last_emergency'] = now
         
-        print(f"🔧 VÉSZHELYZET! {criticals}")
+        # Ha recovery módban vagyunk, ne csináljunk semmit
+        if self.state['recovery_mode']:
+            if now > self.state['recovery_until']:
+                self.state['recovery_mode'] = False
+                print("🔧 Sentinel: Recovery mód vége")
+            return
+        
+        if not criticals:
+            return
+        
+        self.state['last_emergency'] = now
+        self.state['emergency_count'] += 1
+        
+        print(f"🔧 Sentinel: VÉSZHELYZET! {criticals}")
         
         # 1. Kritikus hőmérséklet -> minden kiürítése
-        if any('túlmelegedés' in c for c in criticals):
+        if any('overheat' in c for c in criticals):
             self._emergency_unload_all()
+            
+            # Ellenőrizzük, hogy túl sokszor volt-e
+            max_critical = self.config['max_consecutive_critical']
+            if any(g['consecutive_critical'] >= max_critical for g in self.gpu_states.values()):
+                self._emergency_shutdown()
         
         # 2. VRAM kritikus -> alacsony prioritásúak kiürítése
-        elif any('VRAM kritikus' in c for c in criticals):
+        elif any('VRAM critical' in c for c in criticals):
             self._emergency_unload_low_priority()
     
     def _emergency_unload_all(self):
         """Minden modell kiürítése (vészhelyzet)"""
-        print("🔧 VÉSZKIÜRÍTÉS: Minden modell kiürítve")
+        print("🔧 Sentinel: VÉSZKIÜRÍTÉS: Minden modell kiürítve")
         
-        # Értesítés a Kingnek (ha van)
+        # Értesítés a Kingnek
         self.scratchpad.write(self.name, 
             {'action': 'emergency_unload_all', 'reason': 'critical temperature'},
             'emergency'
@@ -336,13 +386,26 @@ class HardwareSentinel:
     
     def _emergency_unload_low_priority(self):
         """Alacsony prioritású modellek kiürítése"""
-        print("🔧 VÉSZKIÜRÍTÉS: Alacsony prioritású modellek")
+        print("🔧 Sentinel: VÉSZKIÜRÍTÉS: Alacsony prioritású modellek")
         
         threshold = self.config['auto_unload_priority']
         
         for slot_name, slot in self.slots.items():
             if slot['priority'] > threshold:  # Alacsony prioritás (nagyobb szám)
                 self.unload_model(slot_name, emergency=True)
+    
+    def _emergency_shutdown(self):
+        """Vészleállás (túl sok kritikus esemény)"""
+        print("🔧 Sentinel: KRITIKUS VÉSZLEÁLLÁS!")
+        
+        self.state['recovery_mode'] = True
+        self.state['recovery_until'] = time.time() + self.config['recovery_after_seconds']
+        
+        # Értesítés a Kingnek
+        self.scratchpad.write(self.name, 
+            {'action': 'emergency_shutdown', 'reason': 'too many critical events'},
+            'emergency_shutdown'
+        )
     
     # --- SLOT KEZELÉS (modellek) ---
     
@@ -364,7 +427,7 @@ class HardwareSentinel:
                 'last_used': None
             }
             
-            print(f"🔧 Slot regisztrálva: {slot_name} (prio:{priority})")
+            print(f"🔧 Sentinel: Slot regisztrálva: {slot_name} (prio:{priority})")
     
     def load_model(self, slot_name: str) -> bool:
         """
@@ -376,7 +439,7 @@ class HardwareSentinel:
         
         # VRAM ellenőrzés (ha van)
         if not self._check_vram_available(slot.get('vram_estimate', 2048)):
-            print(f"🔧 Nincs elég VRAM a {slot_name} betöltéséhez")
+            print(f"🔧 Sentinel: Nincs elég VRAM a {slot_name} betöltéséhez")
             return False
         
         # Itt történne a tényleges betöltés
@@ -384,7 +447,7 @@ class HardwareSentinel:
         slot['loaded_time'] = time.time()
         slot['last_used'] = time.time()
         
-        print(f"🔧 Modell betöltve: {slot_name}")
+        print(f"🔧 Sentinel: Modell betöltve: {slot_name}")
         return True
     
     def unload_model(self, slot_name: str, emergency: bool = False) -> bool:
@@ -399,7 +462,7 @@ class HardwareSentinel:
         slot['loaded'] = False
         
         reason = "vészhelyzet" if emergency else "normál"
-        print(f"🔧 Modell kiürítve: {slot_name} ({reason})")
+        print(f"🔧 Sentinel: Modell kiürítve: {slot_name} ({reason})")
         
         return True
     
@@ -434,6 +497,9 @@ class HardwareSentinel:
         Throttle faktor lekérése (King használhatja a generálás sebességéhez).
         1.0 = normál, 0.5 = fél sebesség, 0.0 = leállás
         """
+        if self.state['recovery_mode']:
+            return 0.0
+        
         if self.state['throttle_active']:
             return self.config['throttle_factor']
         
@@ -443,10 +509,22 @@ class HardwareSentinel:
         
         return 1.0
     
+    def is_throttled(self) -> bool:
+        """Visszaadja, hogy throttling van-e"""
+        return self.state['throttle_active']
+    
+    def get_recommended_batch_size(self, original: int) -> int:
+        """
+        Throttling esetén kisebb batch méret javaslata.
+        """
+        if self.state['throttle_active']:
+            return max(1, original // 2)
+        return original
+    
     # --- LEKÉRDEZÉSEK ---
     
     def get_gpu_status(self) -> List[Dict]:
-        """GPU állapotok lekérése"""
+        """GPU állapotok lekérése (UI-nak)"""
         return [
             {
                 'index': i,
@@ -455,7 +533,8 @@ class HardwareSentinel:
                 'vram_total': state['vram_total'],
                 'vram_percent': round(state['vram_percent'], 1),
                 'utilization': state['utilization'],
-                'status': state['status']
+                'status': state['status'],
+                'throttled': state['throttled']
             }
             for i, state in self.gpu_states.items()
         ]
@@ -481,8 +560,10 @@ class HardwareSentinel:
             'nvml_available': self.nvml_available,
             'throttle_active': self.state['throttle_active'],
             'throttle_factor': self.get_throttle_factor(),
+            'recovery_mode': self.state['recovery_mode'],
             'warnings': self.state['warnings'],
             'critical_alerts': len(self.state['critical_alerts']),
+            'emergency_count': self.state['emergency_count'],
             'check_count': self.state['check_count'],
             'slots': len(self.slots),
             'loaded_slots': sum(1 for s in self.slots.values() if s['loaded'])
@@ -512,5 +593,7 @@ if __name__ == "__main__":
     print("\n--- Slotok ---")
     for slot in sentinel.get_slots():
         print(f"{slot['name']}: {slot['loaded']}")
+    
+    print(f"\nThrottle faktor: {sentinel.get_throttle_factor()}")
     
     sentinel.stop()

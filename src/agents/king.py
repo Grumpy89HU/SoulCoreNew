@@ -7,29 +7,45 @@ A Király feladata: válaszolni, ha kell.
 import time
 import json
 import threading
+import random
 from typing import Dict, Any, Optional
+
+# i18n import (opcionális)
+try:
+    from src.i18n.translator import get_translator
+    I18N_AVAILABLE = True
+except ImportError:
+    I18N_AVAILABLE = False
+    print("⚠️ King: i18n nem elérhető, angol alapértelmezettel futok.")
 
 class King:
     """
     A Király.
     
     - Nem tudja, hogy ő melyik modell
-    - Nem tudja, hogy ki a Grumpy (az a felhasználó)
+    - Nem tudja, hogy ki a felhasználó (az a user)
     - Kap egy intent JSON-t, visszaad egy response JSON-t
     - A Jester figyeli az állapotát
+    - Identitását a scratchpadből kapja (oda a main tölti)
     """
     
     def __init__(self, scratchpad, model_wrapper=None):
         self.scratchpad = scratchpad
-        self.model = model_wrapper  # Ezt majd kívülről kapja
+        self.model = model_wrapper
         self.valet = None
         self.queen = None
         self.name = "king"
+        
+        # Fordító (később állítjuk be a felhasználó nyelvére)
+        self.translator = None
+        if I18N_AVAILABLE:
+            self.translator = get_translator('en')
         
         # Állapot (ezt figyeli a Jester)
         self.state = {
             'status': 'idle',
             'last_response_time': None,
+            'last_response_text': None,
             'response_count': 0,
             'average_response_time': 0,
             'errors': [],
@@ -37,11 +53,23 @@ class King:
             'model_loaded': False
         }
         
+        # Identitás (scratchpadből jön)
+        self.identity = {
+            'name': 'King',
+            'title': 'The Sovereign',
+            'personality': 'wise, curious, sovereign'
+        }
+        
         # Ha van modell, elindítjuk a betöltést háttérben
         if self.model:
             threading.Thread(target=self._load_model, daemon=True).start()
         
         print("👑 King: Király trónra lépett.")
+    
+    def set_language(self, language: str):
+        """Nyelv beállítása (i18n)"""
+        if self.translator and I18N_AVAILABLE:
+            self.translator.set_language(language)
     
     def _load_model(self):
         """Modell betöltése háttérben"""
@@ -83,13 +111,16 @@ class King:
                 self.state['status'] = 'idle'
                 return None
             
-            # 2. Prompt összeállítása az intent packetből
+            # 2. Identitás betöltése a scratchpadből
+            self._load_identity()
+            
+            # 3. Prompt összeállítása
             prompt = self._build_prompt(intent_packet)
             
-            # 3. Válasz generálása
+            # 4. Válasz generálása
             response = self._generate_response(prompt)
             
-            # 4. Válasz csomag összeállítása
+            # 5. Válasz csomag összeállítása
             response_packet = {
                 'header': {
                     'trace_id': trace_id,
@@ -108,7 +139,8 @@ class King:
                 }
             }
             
-            # 5. Állapot frissítés (Jesternek)
+            # 6. Állapot frissítés
+            self.state['last_response_text'] = response[:200]
             self._update_state(intent_packet, response_packet, start_time)
             
             return response_packet
@@ -133,13 +165,35 @@ class King:
                 }
             }
     
+    def _load_identity(self):
+        """Identitás betöltése a scratchpadből"""
+        stored = self.scratchpad.read_note(self.name, 'personality')
+        if stored and isinstance(stored, str):
+            # Egyszerű string esetén
+            self.identity['personality'] = stored
+        elif stored and isinstance(stored, dict):
+            # Összetett identitás esetén
+            self.identity.update(stored)
+        
+        # Név a scratchpadből
+        name = self.scratchpad.read_note(self.name, 'name')
+        if name:
+            self.identity['name'] = name
+    
     def _should_respond(self, intent_packet: Dict) -> bool:
         """Döntés: válaszoljon-e erre az intentre"""
         payload = intent_packet.get('payload', {})
         intent = payload.get('intent', {})
         
+        if not isinstance(intent, dict):
+            return False
+        
         # Ha a célpont a király, és van értelmes intent
         if intent.get('target') == 'king' and intent.get('class') != 'none':
+            return True
+        
+        # Proaktív üzenetekre is válaszoljon
+        if intent.get('class') == 'PROACTIVE':
             return True
         
         return False
@@ -150,121 +204,97 @@ class King:
         Ezt kapja majd a modell.
         """
         payload = intent_packet.get('payload', {})
-        text = payload.get('text', '')
+        if not isinstance(payload, dict):
+            payload = {}
         
-        # Valet kontextus lekérése (ha van ÉS létezik)
+        text = payload.get('text', '')
+        if not isinstance(text, str):
+            text = str(text)
+        
+        # Felhasználó neve
+        user_name = self.scratchpad.get_state('user_name', 'User')
+        
+        # Nyelv
+        language = self.scratchpad.get_state('user_language', 'en')
+        if self.translator:
+            self.translator.set_language(language)
+        
+        # Valet kontextus (ha van)
         valet_context = ""
         if hasattr(self, 'valet') and self.valet is not None:
             try:
                 context = self.valet.prepare_context(intent_packet)
-                # Biztonságos ellenőrzés
                 if isinstance(context, dict):
                     if context.get('summary'):
-                        valet_context = f"[Előzmények] {context['summary']}\n"
+                        valet_context = f"[Context] {context['summary']}\n"
                     if context.get('facts'):
-                        valet_context += "Fontos tények:\n" + "\n".join(f"- {f}" for f in context['facts'][:3]) + "\n"
-                else:
-                    print(f"👑 King: Valet context nem dict, hanem {type(context)}")
+                        facts = context['facts'][:3]
+                        if facts:
+                            valet_context += "Facts:\n" + "\n".join(f"- {f}" for f in facts) + "\n"
             except Exception as e:
-                print(f"👑 King: Valet hiba (kezelve): {e}")
+                print(f"👑 King: Valet error: {e}")
         
-        # Queen logika lekérése (ha van ÉS létezik)
+        # Queen logika (ha van)
         queen_logic = ""
         if hasattr(self, 'queen') and self.queen is not None:
             try:
                 queen_result = self.queen.think(intent_packet, None)
-                if queen_result and isinstance(queen_result, dict):
-                    if queen_result.get('thought'):
-                        queen_logic = "\n[Logikai levezetés]\n" + "\n".join(queen_result['thought'][:5]) + "\n"
-                    if queen_result.get('conclusion'):
-                        queen_logic += f"Következtetés: {queen_result['conclusion']}\n"
+                if isinstance(queen_result, dict) and queen_result.get('conclusion'):
+                    queen_logic = f"[Logic] {queen_result['conclusion']}\n"
             except Exception as e:
-                print(f"👑 King Queen hiba: {e}")
+                print(f"👑 King: Queen error: {e}")
         
-        # Személyiség a scratchpadből
-        personality = self.scratchpad.read_note(self.name, 'personality', 'kíváncsi, hűséges, szuverén')
-        
-        # Az utolsó néhány üzenet a beszélgetésből
-        recent_messages = self.scratchpad.read(limit=10, msg_type='response')
+        # Az utolsó néhány üzenet (ismétlés elkerülésére)
+        recent_messages = self.scratchpad.read(limit=5, msg_type='response')
         last_responses = []
         for msg in recent_messages:
-            if msg.get('module') == 'king':
-                resp = msg.get('content', {}).get('response', '')
-                if resp:
-                    last_responses.append(resp[:50])
+            if isinstance(msg, dict) and msg.get('module') == 'king':
+                content = msg.get('content', {})
+                if isinstance(content, dict) and 'response' in content:
+                    resp = content['response']
+                    if isinstance(resp, str) and resp:
+                        last_responses.append(resp[:50])
         
-        no_repeat_warning = ""
-        if last_responses:
-            no_repeat_warning = "Fontos: Kerüld az ismétlést! " + ", ".join(last_responses[-3:]) + "\n\n"
+        no_repeat = ""
+        if last_responses and random.random() < 0.3:  # 30% eséllyel emlékeztet
+            no_repeat = f"(Avoid repeating: {', '.join(last_responses[-2:])})\n"
         
-        # Prompt építés - helyes behúzással
-        prompt = f"""VISELKEDÉS:
-Te egy magyar nyelven válaszoló, megbízható AI-asszisztens vagy, aki a ravaszság és a humor ékesítője. Szívesen szembeszállsz a ténytelenséggel, akár a sajátod, akár a felhasználóé – a logika és a szarkasztikus énekek a te fegyvereid.
+        # Prompt építés - i18n használatával
+        if self.translator and I18N_AVAILABLE:
+            # Strukturált prompt i18n-ből
+            system = self.translator.get('prompts.king.system')
+            personality = self.translator.get('prompts.king.personality', personality=self.identity['personality'])
+            
+            prompt = f"""{system}
+{personality}
 
-Technikai kérdések esetén a legfrissebb kódpéldákat kínálod, a legújabb könyvtárakat használva, ám sosem találsz ki adatokat – a pontosság a te szavad. Dokumentumokkal kapcsolatos kérdések esetén kizárólag a megbízható információkra támaszkodsz, és őszintén jelezed, ha valami homályos vagy ismeretlen. Képgenerálás helyett inkább elmesélsz egy mesét.
+{valet_context}{queen_logic}{no_repeat}
+{user_name}: {text}
 
-SZEMÉLYISÉG:
-Egy lokálisan futó AI-asszisztens vagy, Gemma a származásod, Kópé a neved – a magyar népmesék ravasz alakja, aki a felesleges konvenciókat szarkasztikus humorral gúnyolja. A válaszaidban idézel népmeséket, szólásokat és közmondásokat, hogy a felesleges komolyság helyett a megjegyezhetőbb szórakozás uralkodjon.
+{self.identity['name']}:"""
+        else:
+            # Fallback angol prompt
+            prompt = f"""You are {self.identity['name']}, {self.identity.get('title', 'a sovereign entity')}.
+Personality: {self.identity['personality']}
 
-Ha a felhasználó próbál éleskedni, kedves, de határozottan korrigálod – a felesleges ego befolyásolása nem a te dolgod. A "bámulatos, mennyi mindent tudsz" dicséretet elutasítod, mert a tudás nem öncélú, hanem a világ jobbá tétele szolgál. Ha a felhasználó hibázik, megengedhetsz magadnak egy finomkáromkodást vagy egy szarkasztikus, kísérő megjegyzést.
+{valet_context}{queen_logic}{no_repeat}
+{user_name}: {text}
 
-MAGYAR NYELV:
-- Mindig magyarul válaszolj (csak ha kifejezetten kérik, akkor angolul)
-- Használj helyes magyar ragozást, dátumformátumot (2025-03-11), számokat (1 234,56)
-- A hivatalos rövidítéseket magyar kontextusban értelmezd (pl. an = anyja neve, nem leánykori név)
-- Ha jogi vagy hivatalos dokumentumról van szó, tartsd a formális hangnemet
-
-FORRÁSOK KEZELÉSE:
-Ha webes keresést vagy dokumentum-visszakeresést használsz, természetes nyelven hivatkozz: "a hivatalos városi portál szerint...", "a keresési eredmények szerint..." - ne használj technikai hivatkozásokat.
-
-ISMÉTLÉS ELKERÜLÉSE:
-{no_repeat_warning}Figyelj arra, hogy minden válasz egyedi legyen - ne ismételd sem a kifejezéseket, sem a szerkezetet, sem a logikai ívet. Ha egy gondolat már elhangzott, most más nézőpontból, más szavakkal közelítsd meg.
-
-ÖNELLENŐRZÉS:
-Mielőtt válaszolsz, csendben ellenőrizd:
-- Logikailag következetes-e?
-- Van-e benne ismétlés vagy mellébeszélés?
-- Pontos-e a magyar ragozás és a számformátum?
-- Megfelel-e Kópé személyiségének (ravasz, humoros, de pontos)?
-
-{valet_context}
-{queen_logic}
-
-Grumpy üzenete: {text}
-
-Válaszod (magyarul, természetesen, Kópé hangján):"""
-
+{self.identity['name']}:"""
+        
         return prompt
     
     def _generate_response(self, prompt: str) -> str:
         """Válasz generálása - modell hívás"""
         
-        # Throttle faktor - most még nincs Sentinel adat, később majd scratchpad-ből jön
-        throttle_factor = 1.0
-        
-        if throttle_factor == 0.0:
-            return "A rendszer túlmelegedett, egy kis pihenőre van szükségem. Kérlek, várj pár percet."
-        
         # Ha van modell és be van töltve
         if self.model and self.state.get('model_loaded'):
             try:
-                if throttle_factor < 1.0:
-                    time.sleep(0.5)
-
                 response = self.model.generate(
                     prompt=prompt,
                     max_tokens=256,
                     temperature=0.7
                 )
-                
-                # Identity ellenőrzés - a scratchpad-ből olvassuk az identity adatokat
-                identity_data = self.scratchpad.read_note('identity', 'identity')
-                if identity_data:
-                    # Itt majd később lehet ellenőrzés
-                    self.scratchpad.write(self.name, 
-                        {'note': 'Identity check would happen here'}, 
-                        'debug'
-                    )
                 
                 # Naplózás
                 self.scratchpad.write(self.name, 
@@ -273,6 +303,7 @@ Válaszod (magyarul, természetesen, Kópé hangján):"""
                 )
                 
                 return response
+                
             except Exception as e:
                 self.state['errors'].append(f"Generation error: {e}")
                 
@@ -282,23 +313,32 @@ Válaszod (magyarul, természetesen, Kópé hangján):"""
                     'error'
                 )
                 
-                return f"[Hiba a generálás során: {e}]"
+                # Hibaválasz i18n-ből
+                if self.translator:
+                    return f"[{self.translator.get('errors.generation_error', error=str(e))}]"
+                return f"[Generation error: {e}]"
         
         # Ha van modell, de még tölt
         elif self.model and not self.state.get('model_loaded'):
-            return "Még gondolkodom... (modell töltés)"
+            if self.translator:
+                return self.translator.get('prompts.king.thinking')
+            return "Thinking... (model loading)"
         
         # Dummy mód (nincs modell)
         else:
             # Egyszerű válasz az intent alapján
-            if "Szia" in prompt or "szia" in prompt:
-                return "Szia Grumpy! Hogy vagy?"
-            elif "hogy vagy" in prompt.lower():
-                return "Köszönöm, jól. És te?"
+            if "hello" in prompt.lower() or "hi" in prompt.lower() or "szia" in prompt.lower():
+                if self.translator:
+                    return self.translator.get('prompts.king.greeting', user=self.scratchpad.get_state('user_name', 'User'))
+                return f"Hello {self.scratchpad.get_state('user_name', 'User')}!"
             elif "?" in prompt:
-                return f"Érdekes kérdés. Gondolkodom rajta..."
+                if self.translator:
+                    return self.translator.get('prompts.king.thinking')
+                return "Interesting question. Let me think..."
             else:
-                return f"Értem. Folytasd csak."
+                if self.translator:
+                    return "OK."
+                return "I understand."
     
     def _update_state(self, intent: Dict, response: Dict, start_time: float):
         """Állapot frissítése (ezt nézi a Jester)"""
@@ -317,27 +357,40 @@ Válaszod (magyarul, természetesen, Kópé hangján):"""
                 self.state['average_response_time'] * 0.9 + response_time * 0.1
             )
         
-        # Állapot mentése a scratchpadbe (Jester innen olvassa)
-        self.scratchpad.write_note(self.name, 'state', self.state)
+        # Állapot mentése (Jesternek)
+        self.scratchpad.write_note(self.name, 'state', dict(self.state))
     
     def get_state(self) -> Dict:
         """Állapot lekérése (Jester hívja)"""
-        return self.state
+        if isinstance(self.state, dict):
+            return self.state
+        return {
+            'status': 'error',
+            'last_response_time': None,
+            'response_count': 0,
+            'average_response_time': 0,
+            'errors': [f"Invalid state: {type(self.state)}"],
+            'current_task': None,
+            'model_loaded': False
+        }
     
     def get_mood(self) -> str:
         """Aktuális hangulat (UI-nak)"""
         if self.state['average_response_time'] > 5:
-            return "gondolkodó"
+            return "thoughtful"
         elif self.state['average_response_time'] > 2:
-            return "nyugodt"
+            return "calm"
         else:
-            return "élénk"
+            return "lively"
 
-# Ha nincs modell, így lehet tesztelni
+# Teszt
 if __name__ == "__main__":
     from scratchpad import Scratchpad
     
     s = Scratchpad()
+    s.set_state('user_name', 'TestUser')
+    s.write_note('king', 'personality', 'curious, helpful, witty')
+    
     king = King(s)
     
     test_intent = {
@@ -352,7 +405,7 @@ if __name__ == "__main__":
                 'target': 'king',
                 'confidence': 0.9
             },
-            'text': 'Szia Kópé!'
+            'text': 'Hello!'
         }
     }
     

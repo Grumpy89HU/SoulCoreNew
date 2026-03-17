@@ -1,0 +1,14 @@
+{% extends "base.html" %}
+{% block title %}Személyiségek{% endblock %}
+{% block content %}
+<div id="personalities-app">
+    <div class="personality-list">
+        <div v-for="p in personalities" class="personality-card">
+            <h3>{{ p.name }}</h3>
+            <pre>{{ p.content }}</pre>
+            <button @click="activate(p.id)">Aktiválás</button>
+        </div>
+    </div>
+    <button @click="showNew = true">Új személyiség</button>
+</div>
+{% endblock %}

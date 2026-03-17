@@ -1,0 +1,20 @@
+{
+    "not_found": "{resource} nem található",
+    "unauthorized": "Illetéktelen hozzáférés",
+    "forbidden": "Hozzáférés megtagadva",
+    "server_error": "Szerver hiba: {error}",
+    "validation_error": "Érvénytelen {field} mező",
+    "model_not_loaded": "A modell nincs betöltve",
+    "model_load_error": "Nem sikerült betölteni a modellt: {error}",
+    "generation_error": "Generálási hiba: {error}",
+    "timeout": "Időtúllépés",
+    "connection_error": "Kapcsolódási hiba",
+    "database_error": "Adatbázis hiba: {error}",
+    "file_not_found": "A fájl nem található: {path}",
+    "permission_denied": "Nincs jogosultságod",
+    "invalid_input": "Érvénytelen bemenet: {input}",
+    "missing_parameter": "Hiányzó paraméter: {param}",
+    "already_exists": "{item} már létezik",
+    "cannot_delete": "{item} nem törölhető, mert használatban van",
+    "offline": "Offline módban vagy"
+}

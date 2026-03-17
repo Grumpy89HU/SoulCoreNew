@@ -5,15 +5,16 @@ Feladata:
 1. Rendszeres "PING" küldése (időérzék)
 2. Időalapú események generálása
 3. Inaktivitás detektálás
-4. Proaktív gondolatok indítása - emlékeztetők és érdeklődés (nem zaklatás!)
+4. Proaktív gondolatok indítása (emlékeztetők, érdeklődés)
+5. A rendszer időtudatosságának fenntartása
 """
 
 import time
 import threading
 import random
-import re
 from datetime import datetime, timedelta
 from typing import Dict, Any, Optional, Callable, List
+import re
 
 class Heartbeat:
     """
@@ -30,14 +31,9 @@ class Heartbeat:
         self.scratchpad = scratchpad
         self.orchestrator = orchestrator  # hogy tudjon packet-et küldeni
         self.name = "heartbeat"
-        self.config = config or {}  # Konfiguráció (kívülről kapja)
+        self.config = config or {}
         
-        # Szálkezelés
-        self.running = False
-        self.thread = None
-        self.lock = threading.Lock()
-        
-        # Alapértelmezett értékek (ha nincs config)
+        # Alapértelmezett konfiguráció
         default_config = {
             'interval': 1.0,
             'proactive': {
@@ -46,9 +42,18 @@ class Heartbeat:
                 'max_idle_hours': 8,      # Maximum 8 óra után már ne
                 'once_per_day': True,      # Csak napi egyszer
                 'reminders': True,         # Emlékeztetők kezelése
-                'check_interval': 300,      # 5 percenként ellenőrizze
-                'chance': 0.3,              # 30% esély (ha több feltétel is teljesül)
-                'topics': []                 # Ha üres, bármiről kérdezhet
+                'check_interval': 300,     # 5 percenként ellenőrizze
+                'chance': 0.3,             # 30% esély (ha több feltétel is teljesül)
+                'topics': []                # Ha üres, bármiről kérdezhet
+            },
+            'events': {
+                'status_check': 5.0,        # 5 másodperc
+                'idle_check': 60.0,          # 1 perc
+                'proactive_thought': 300.0,  # 5 perc
+                'reminder_check': 3600.0,    # 1 óra
+                'deep_thought': 3600.0,      # 1 óra
+                'cleanup': 7200.0,            # 2 óra
+                'state_snapshot': 300.0       # 5 perc (állapot mentés)
             }
         }
         
@@ -61,21 +66,18 @@ class Heartbeat:
                     if subkey not in self.config[key]:
                         self.config[key][subkey] = subvalue
         
+        # Szálkezelés
+        self.running = False
+        self.thread = None
+        self.lock = threading.Lock()
+        
         # Időzítők
         self.interval = self.config.get('interval', 1.0)
         self.last_beat = time.time()
         self.start_time = time.time()
         
         # Események (konfig alapján)
-        proactive_interval = self.config.get('proactive', {}).get('check_interval', 300)
-        self.events = {
-            'status_check': 5.0,                    # 5 másodperc
-            'idle_check': 60.0,                      # 1 perc
-            'proactive_thought': proactive_interval, # konfigból
-            'reminder_check': 3600.0,                 # 1 óránként emlékeztető ellenőrzés
-            'deep_thought': 3600.0,                   # 1 óra
-            'cleanup': 7200.0,                         # 2 óra
-        }
+        self.events = self.config.get('events', {})
         
         # Utolsó futási idők
         self.last_run = {event: 0 for event in self.events}
@@ -84,23 +86,38 @@ class Heartbeat:
         self.state = {
             'beats': 0,
             'uptime_seconds': 0,
+            'uptime_formatted': '0s',
             'last_interaction': None,
             'idle_since': None,
             'idle_seconds': 0,
+            'idle_formatted': '0s',
             'proactive_count': 0,
+            'reminder_count': 0,
             'last_proactive': 0,           # Mikor volt utoljára proaktív megszólalás
             'proactive_today': False,       # Volt-e már ma
             'last_proactive_date': None,    # Melyik nap volt utoljára
-            'reminders_sent': []             # Elküldött emlékeztetők ID-i
+            'reminders_sent': [],            # Elküldött emlékeztetők ID-i
+            'current_time': datetime.now().isoformat(),
+            'time_of_day': self._get_time_of_day()
         }
         
-        # Időpont minták felismeréséhez (magyar nyelvű)
-        self.time_patterns = [
-            (r'(kedden|szerdán|csütörtökön|pénteken|szombaton|vasárnap|hétfőn)', self._parse_weekday),
-            (r'(holnap|holnapután|ma|most)', self._parse_relative),
-            (r'(\d{4}\.\s*\d{1,2}\.\s*\d{1,2})', self._parse_absolute),  # 2025. 03. 11
-            (r'(\d{1,2})[-/](\d{1,2})', self._parse_short),               # 03/11
-        ]
+        # Időpont minták felismeréséhez (többnyelvű támogatás)
+        self.time_patterns = {
+            'en': [
+                (r'(monday|tuesday|wednesday|thursday|friday|saturday|sunday)', self._parse_weekday_en),
+                (r'(tomorrow|today|now)', self._parse_relative),
+                (r'(\d{4}[-/]\d{1,2}[-/]\d{1,2})', self._parse_absolute),  # 2025-03-11
+                (r'(\d{1,2})[/-](\d{1,2})', self._parse_short),               # 03/11
+                (r'in (\d+) (hour|day|week)s?', self._parse_in_duration)
+            ],
+            'hu': [
+                (r'(hétfő|kedd|szerda|csütörtök|péntek|szombat|vasárnap)', self._parse_weekday_hu),
+                (r'(holnap|holnapután|ma|most)', self._parse_relative),
+                (r'(\d{4}\.\s*\d{1,2}\.\s*\d{1,2})', self._parse_absolute_hu),  # 2025. 03. 11
+                (r'(\d{1,2})[-/](\d{1,2})', self._parse_short),                 # 03/11
+                (r'(\d+) (óra|nap|hét) múlva', self._parse_in_duration_hu)
+            ]
+        }
         
         print("💓 Heartbeat: Szív indul. Dobogok.")
     
@@ -147,9 +164,13 @@ class Heartbeat:
         self.last_beat = now
         self.state['beats'] += 1
         self.state['uptime_seconds'] = int(now - self.start_time)
+        self.state['uptime_formatted'] = self._format_uptime(self.state['uptime_seconds'])
+        self.state['current_time'] = datetime.now().isoformat()
+        self.state['time_of_day'] = self._get_time_of_day()
         
-        # Uptime frissítése
+        # Uptime frissítése a scratchpadben
         self.scratchpad.set_state('uptime_seconds', self.state['uptime_seconds'], self.name)
+        self.scratchpad.set_state('uptime_formatted', self.state['uptime_formatted'], self.name)
         
         # Utolsó interakció ellenőrzése
         last_interaction = self.scratchpad.get_state('last_interaction')
@@ -157,11 +178,12 @@ class Heartbeat:
             self.state['last_interaction'] = last_interaction
             idle = now - last_interaction
             self.state['idle_seconds'] = int(idle)
+            self.state['idle_formatted'] = self._format_uptime(self.state['idle_seconds'])
             
             if idle > 60 and not self.state['idle_since']:
                 self.state['idle_since'] = last_interaction
                 self.scratchpad.write(self.name, 
-                    {'idle_seconds': int(idle)}, 
+                    {'idle_seconds': int(idle), 'idle_formatted': self.state['idle_formatted']}, 
                     'idle_start'
                 )
         
@@ -182,10 +204,14 @@ class Heartbeat:
         """Egy esemény kezelése"""
         
         if event == 'status_check':
+            # Rendszer státusz ellenőrzés
             status = {
                 'uptime': self.state['uptime_seconds'],
+                'uptime_formatted': self.state['uptime_formatted'],
                 'idle': self.state['idle_seconds'],
+                'idle_formatted': self.state['idle_formatted'],
                 'beats': self.state['beats'],
+                'time_of_day': self.state['time_of_day'],
                 'king_status': self.scratchpad.get_state('king_status', 'unknown'),
                 'jester_status': self.scratchpad.get_state('jester_status', 'unknown'),
                 'orchestrator_status': self.scratchpad.get_state('orchestrator_status', 'unknown'),
@@ -193,9 +219,11 @@ class Heartbeat:
             self.scratchpad.write(self.name, status, 'heartbeat_status')
             
         elif event == 'idle_check':
-            if self.state['idle_seconds'] > 300:
+            # Inaktivitás ellenőrzés (5 perc után)
+            if self.state['idle_seconds'] > 300:  # 5 perc
                 self.scratchpad.write(self.name, 
-                    {'idle_minutes': self.state['idle_seconds'] // 60}, 
+                    {'idle_minutes': self.state['idle_seconds'] // 60,
+                     'idle_formatted': self.state['idle_formatted']}, 
                     'long_idle'
                 )
         
@@ -210,13 +238,50 @@ class Heartbeat:
                 self._check_reminders()
         
         elif event == 'deep_thought':
+            # Mély gondolat (ritkán) - rendszer optimalizálás
             self.scratchpad.write(self.name, 
                 {'type': 'deep_thought', 'time': now}, 
                 'heartbeat_deep'
             )
         
         elif event == 'cleanup':
+            # Takarítás (régi trace-ek törlése)
             self.scratchpad.cleanup_old(max_age_seconds=3600)
+        
+        elif event == 'state_snapshot':
+            # Állapot snapshot mentése (XVI. fejezet)
+            self._save_state_snapshot()
+    
+    def _save_state_snapshot(self):
+        """
+        Állapot snapshot mentése (XVI. fejezet - Lélek-lenyomat)
+        5 percenként menti a rendszer állapotát.
+        """
+        snapshot = {
+            'timestamp': time.time(),
+            'uptime': self.state['uptime_seconds'],
+            'last_interaction': self.state['last_interaction'],
+            'idle': self.state['idle_seconds'],
+            'proactive_count': self.state['proactive_count'],
+            'reminder_count': self.state['reminder_count'],
+            'king_status': self.scratchpad.get_state('king_status', 'unknown'),
+            'jester_status': self.scratchpad.get_state('jester_status', 'unknown'),
+            'active_traces': self.scratchpad.get_state('active_traces', 0)
+        }
+        
+        self.scratchpad.write_note(self.name, f"snapshot_{int(time.time())}", snapshot)
+        
+        # Csak az utolsó 10 snapshotot tartjuk meg
+        self._cleanup_old_snapshots(10)
+    
+    def _cleanup_old_snapshots(self, keep: int = 10):
+        """Régi snapshotok törlése"""
+        notes = self.scratchpad.read_all_notes(self.name)
+        snapshots = [(k, v) for k, v in notes.items() if k.startswith('snapshot_')]
+        snapshots.sort(key=lambda x: x[1].get('timestamp', 0))
+        
+        for key, _ in snapshots[:-keep]:
+            self.scratchpad.write_note(self.name, key, None)  # Törlés
     
     # --- PROAKTÍV ÉRDEKLŐDÉS (nem zaklatás!) ---
     
@@ -248,10 +313,9 @@ class Heartbeat:
             last_date = self.state.get('last_proactive_date')
             
             if last_date == today:
-                # Már volt ma
                 return
             
-            # Ellenőrizzük, hogy tényleg volt-e ma (lehet, hogy régi)
+            # Ellenőrizzük, hogy tényleg volt-e ma
             if last_date and (today - last_date).days == 0:
                 return
         
@@ -274,7 +338,8 @@ class Heartbeat:
         self._send_proactive({
             'type': 'interest',
             'topic': last_topic,
-            'idle_hours': round(idle_hours, 1)
+            'idle_hours': round(idle_hours, 1),
+            'idle_formatted': self.state['idle_formatted']
         })
     
     def _check_reminders(self):
@@ -288,6 +353,7 @@ class Heartbeat:
         
         notes = self.scratchpad.read_all_notes()
         today = datetime.now().strftime("%Y%m%d")
+        user_language = self.scratchpad.get_state('user_language', 'en')
         
         for module, notes_dict in notes.items():
             for key, note in notes_dict.items():
@@ -306,17 +372,19 @@ class Heartbeat:
                     
                     # Ha ma van az esemény, ÉS még nem küldtük el
                     if date_str == today and reminder_id not in self.state['reminders_sent']:
-                        topic = parts[2] if len(parts) > 2 else 'esemény'
+                        topic = parts[2] if len(parts) > 2 else 'event'
                         note_text = note.get('value', '')
                         
                         self._send_proactive({
                             'type': 'reminder',
                             'topic': topic,
                             'note': note_text,
-                            'reminder_id': reminder_id
+                            'reminder_id': reminder_id,
+                            'language': user_language
                         })
                         
                         self.state['reminders_sent'].append(reminder_id)
+                        self.state['reminder_count'] += 1
                         
                 except Exception as e:
                     print(f"💓 Hiba az emlékeztető feldolgozásában: {e}")
@@ -335,35 +403,32 @@ class Heartbeat:
             return
         
         now = datetime.now()
+        user_language = data.get('language', self.scratchpad.get_state('user_language', 'en'))
         
         # Alap KVK csomag
         packet = {
             'INTENT': 'PROACTIVE',
             'TYPE': data.get('type', 'interest'),
             'TIME': now.strftime("%H:%M"),
-            'DATE': now.strftime("%Y-%m-%d")
+            'DATE': now.strftime("%Y-%m-%d"),
+            'LANGUAGE': user_language
         }
         
         # Üzenet összeállítása típus alapján
         if data.get('type') == 'reminder':
-            packet['MESSAGE'] = f"Emlékeztető: {data.get('note', data.get('topic', ''))}"
+            packet['MESSAGE'] = f"reminder:{data.get('topic', 'event')}:{data.get('note', '')}"
             packet['TOPIC'] = data.get('topic', '')
             packet['REMINDER_ID'] = data.get('reminder_id', '')
             
         else:  # interest
-            topic = data.get('topic', 'dolog')
+            topic = data.get('topic', 'life')
             hours = data.get('idle_hours', 2)
+            idle_formatted = data.get('idle_formatted', f"{hours}h")
             
-            # Különböző megfogalmazások, hogy ne legyen unalmas
-            messages = [
-                f"Már {hours} órája nem beszéltünk. Hogy haladsz a {topic} témával?",
-                f"Figyelj, {hours} órája csend van. Mi a helyzet a {topic}-vel?",
-                f"Az előbb még a {topic}-ről beszéltünk. Történt azóta valami?",
-                f"Csak úgy érdeklődöm, {hours} órája nem szóltál. Minden oké a {topic} körül?"
-            ]
-            packet['MESSAGE'] = random.choice(messages)
+            packet['MESSAGE'] = f"interest:{topic}:{idle_formatted}"
             packet['TOPIC'] = topic
             packet['IDLE_HOURS'] = str(hours)
+            packet['IDLE_FORMATTED'] = idle_formatted
         
         # KVK csomag készítése és elküldése
         if hasattr(self.orchestrator, 'build_kvk_packet'):
@@ -385,20 +450,20 @@ class Heartbeat:
     
     # --- EMLÉKEZTETŐ LÉTREHOZÁS (más modulok hívják) ---
     
-    def create_reminder(self, text: str, source: str = "user"):
+    def create_reminder(self, text: str, source: str = "user", language: str = "en"):
         """
         Emlékeztető létrehozása egy szövegből.
         Kinyeri az időpontot és a témát.
         Példa: "kedden megyek videókártyát venni" -> reminder_20250311_videokartya
         """
-        date = self._extract_date(text)
+        date = self._extract_date(text, language)
         if not date:
             return None
         
         # Téma kinyerése (a dátum utáni rész)
         topic = self._extract_topic(text)
         if not topic:
-            topic = "emlékeztető"
+            topic = "reminder"
         
         # Emlékeztető kulcs: reminder_YYYYMMDD_téma
         date_str = date.strftime("%Y%m%d")
@@ -408,30 +473,33 @@ class Heartbeat:
         self.scratchpad.write_note('heartbeat', key, {
             'text': text,
             'date': date_str,
+            'date_iso': date.isoformat(),
             'topic': topic,
             'source': source,
+            'language': language,
             'created': time.time()
         })
         
         print(f"💓 Emlékeztető létrehozva: {key}")
         return key
     
-    def _extract_date(self, text: str) -> Optional[datetime]:
-        """Dátum kinyerése szövegből"""
+    def _extract_date(self, text: str, language: str = "en"):
+        """Dátum kinyerése szövegből a megadott nyelv alapján"""
         text_lower = text.lower()
+        patterns = self.time_patterns.get(language, self.time_patterns['en'])
         
-        for pattern, handler in self.time_patterns:
+        for pattern, handler in patterns:
             match = re.search(pattern, text_lower)
             if match:
                 return handler(match)
         
         return None
     
-    def _parse_weekday(self, match) -> Optional[datetime]:
-        """Hétnapok feldolgozása"""
+    def _parse_weekday_en(self, match):
+        """Angol hétnapok feldolgozása"""
         day_map = {
-            'hétfőn': 0, 'kedden': 1, 'szerdán': 2, 
-            'csütörtökön': 3, 'pénteken': 4, 'szombaton': 5, 'vasárnap': 6
+            'monday': 0, 'tuesday': 1, 'wednesday': 2, 
+            'thursday': 3, 'friday': 4, 'saturday': 5, 'sunday': 6
         }
         day_name = match.group(1)
         target_weekday = day_map.get(day_name)
@@ -442,33 +510,50 @@ class Heartbeat:
         today = datetime.now()
         current_weekday = today.weekday()
         days_ahead = target_weekday - current_weekday
-        if days_ahead <= 0:  # Ha már volt ezen a héten, jövő hét
+        if days_ahead <= 0:
             days_ahead += 7
             
         return today + timedelta(days=days_ahead)
     
-    def _parse_relative(self, match) -> Optional[datetime]:
-        """Relatív időpontok (ma, holnap)"""
+    def _parse_weekday_hu(self, match):
+        """Magyar hétnapok feldolgozása"""
+        day_map = {
+            'hétfő': 0, 'kedd': 1, 'szerda': 2, 
+            'csütörtök': 3, 'péntek': 4, 'szombat': 5, 'vasárnap': 6
+        }
+        day_name = match.group(1)
+        target_weekday = day_map.get(day_name)
+        
+        if target_weekday is None:
+            return None
+        
+        today = datetime.now()
+        current_weekday = today.weekday()
+        days_ahead = target_weekday - current_weekday
+        if days_ahead <= 0:
+            days_ahead += 7
+            
+        return today + timedelta(days=days_ahead)
+    
+    def _parse_relative(self, match):
+        """Relatív időpontok (ma, holnap, most)"""
         word = match.group(1)
         today = datetime.now()
         
-        if word == 'ma':
+        if word in ['today', 'ma', 'now', 'most']:
             return today
-        elif word == 'holnap':
+        elif word in ['tomorrow', 'holnap']:
             return today + timedelta(days=1)
-        elif word == 'holnapután':
+        elif word in ['holnapután']:
             return today + timedelta(days=2)
-        elif word == 'most':
-            return today
         
         return None
     
-    def _parse_absolute(self, match) -> Optional[datetime]:
-        """Abszolút dátum: 2025. 03. 11"""
+    def _parse_absolute(self, match):
+        """Abszolút dátum: 2025-03-11 vagy 2025/03/11"""
         try:
             date_str = match.group(1)
-            # Többféle formátum
-            for fmt in ["%Y. %m. %d", "%Y.%m.%d", "%Y-%m-%d"]:
+            for fmt in ["%Y-%m-%d", "%Y/%m/%d"]:
                 try:
                     return datetime.strptime(date_str, fmt)
                 except:
@@ -477,17 +562,61 @@ class Heartbeat:
             pass
         return None
     
-    def _parse_short(self, match) -> Optional[datetime]:
+    def _parse_absolute_hu(self, match):
+        """Magyar abszolút dátum: 2025. 03. 11"""
+        try:
+            date_str = match.group(1)
+            # Eltávolítjuk a pontokat és szóközöket
+            cleaned = re.sub(r'[.\s]+', '-', date_str)
+            return datetime.strptime(cleaned, "%Y-%m-%d")
+        except:
+            return None
+    
+    def _parse_short(self, match):
         """Rövid dátum: 03/11"""
         try:
             month, day = match.groups()
             year = datetime.now().year
             date = datetime(year, int(month), int(day))
-            if date < datetime.now():  # Ha már volt idén, jövő év
+            if date < datetime.now():
                 date = datetime(year + 1, int(month), int(day))
             return date
         except:
             return None
+    
+    def _parse_in_duration(self, match):
+        """Angol: in 2 days, in 3 hours"""
+        try:
+            amount = int(match.group(1))
+            unit = match.group(2)
+            today = datetime.now()
+            
+            if unit.startswith('hour'):
+                return today + timedelta(hours=amount)
+            elif unit.startswith('day'):
+                return today + timedelta(days=amount)
+            elif unit.startswith('week'):
+                return today + timedelta(weeks=amount)
+        except:
+            pass
+        return None
+    
+    def _parse_in_duration_hu(self, match):
+        """Magyar: 2 nap múlva, 3 óra múlva"""
+        try:
+            amount = int(match.group(1))
+            unit = match.group(2)
+            today = datetime.now()
+            
+            if unit in ['óra', 'órát']:
+                return today + timedelta(hours=amount)
+            elif unit in ['nap', 'napot']:
+                return today + timedelta(days=amount)
+            elif unit in ['hét', 'hetet']:
+                return today + timedelta(weeks=amount)
+        except:
+            pass
+        return None
     
     def _extract_topic(self, text: str) -> str:
         """Téma kinyerése a szövegből (egyszerű)"""
@@ -495,15 +624,22 @@ class Heartbeat:
         words = text.split()
         topic_words = []
         
+        # Szűrőszavak (magyar és angol)
+        skip_words = [
+            'megyek', 'vásárol', 'csinál', 'hoz', 'visz', 'lesz', 'van',
+            'go', 'buy', 'do', 'bring', 'take', 'will', 'is', 'be'
+        ]
+        
         for word in words:
-            if any(p in word.lower() for p in ['megyek', 'vásárol', 'csinál', 'hoz', 'visz']):
+            word_lower = word.lower()
+            if any(p in word_lower for p in skip_words):
                 continue
-            if len(word) > 3 and word not in ['kedden', 'szerdán', 'csütörtökön', 'pénteken', 'szombaton', 'vasárnap', 'hétfőn']:
-                topic_words.append(word)
+            if len(word) > 3 and word_lower not in skip_words:
+                topic_words.append(word_lower)
         
         if topic_words:
-            return '_'.join(topic_words[:2])  # Max 2 szó
-        return "emlékeztető"
+            return '_'.join(topic_words[:2])
+        return "reminder"
     
     # --- INTERAKCIÓK ---
     
@@ -514,24 +650,24 @@ class Heartbeat:
         self.state['last_interaction'] = now
         self.state['idle_since'] = None
         self.state['idle_seconds'] = 0
+        self.state['idle_formatted'] = '0s'
     
-    # --- LEKÉRDEZÉSEK ---
+    # --- IDŐ SEGÉDFÜGGVÉNYEK ---
     
-    def get_state(self) -> Dict:
-        """Heartbeat állapot lekérése"""
-        return {
-            'beats': self.state['beats'],
-            'uptime': self._format_uptime(self.state['uptime_seconds']),
-            'uptime_seconds': self.state['uptime_seconds'],
-            'idle': self._format_uptime(self.state['idle_seconds']),
-            'idle_seconds': self.state['idle_seconds'],
-            'proactive_count': self.state['proactive_count'],
-            'proactive_today': self.state['proactive_today'],
-            'reminders_sent': len(self.state['reminders_sent']),
-            'running': self.running,
-            'events': self.events,
-            'config': self.config.get('proactive', {})
-        }
+    def _get_time_of_day(self) -> str:
+        """A napszak lekérése (reggel, délelőtt, délután, este, éjjel)"""
+        hour = time.localtime().tm_hour
+        
+        if 5 <= hour < 9:
+            return "morning"
+        elif 9 <= hour < 12:
+            return "late_morning"
+        elif 12 <= hour < 17:
+            return "afternoon"
+        elif 17 <= hour < 21:
+            return "evening"
+        else:
+            return "night"
     
     def _format_uptime(self, seconds: int) -> str:
         """Másodpercek formázása olvashatóvá"""
@@ -545,6 +681,27 @@ class Heartbeat:
             return f"{minutes}m {secs}s"
         else:
             return f"{secs}s"
+    
+    # --- LEKÉRDEZÉSEK ---
+    
+    def get_state(self) -> Dict:
+        """Heartbeat állapot lekérése"""
+        return {
+            'beats': self.state['beats'],
+            'uptime': self.state['uptime_formatted'],
+            'uptime_seconds': self.state['uptime_seconds'],
+            'idle': self.state['idle_formatted'],
+            'idle_seconds': self.state['idle_seconds'],
+            'proactive_count': self.state['proactive_count'],
+            'reminder_count': self.state['reminder_count'],
+            'proactive_today': self.state['proactive_today'],
+            'time_of_day': self.state['time_of_day'],
+            'current_time': self.state['current_time'],
+            'reminders_sent': len(self.state['reminders_sent']),
+            'running': self.running,
+            'events': self.events,
+            'config': self.config.get('proactive', {})
+        }
 
 # Teszt
 if __name__ == "__main__":
@@ -565,12 +722,12 @@ if __name__ == "__main__":
         'interval': 1.0,
         'proactive': {
             'enabled': True,
-            'min_idle_hours': 0.01,  # Teszteléshez nagyon kicsi
+            'min_idle_hours': 0.01,
             'max_idle_hours': 24,
-            'once_per_day': False,     # Teszteléshez többször is
+            'once_per_day': False,
             'reminders': True,
             'check_interval': 5,
-            'chance': 1.0,             # Mindig
+            'chance': 1.0,
             'topics': []
         }
     }
@@ -579,9 +736,16 @@ if __name__ == "__main__":
     hb.start()
     
     # Emlékeztető teszt
-    hb.create_reminder("kedden megyek videókártyát venni")
+    hb.create_reminder("Kedden megyek vásárolni", language="hu")
+    hb.create_reminder("In 2 days buy groceries", language="en")
     
     # Várunk
     time.sleep(10)
+    
+    # Állapot lekérés
+    print("\n--- Heartbeat állapot ---")
+    state = hb.get_state()
+    for k, v in state.items():
+        print(f"{k}: {v}")
     
     hb.stop()

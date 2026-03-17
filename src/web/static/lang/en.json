@@ -1,0 +1,9 @@
+{
+    "ui": {
+        "connected": "Connected",
+        "disconnected": "Disconnected",
+        "dashboard": "Dashboard",
+        "admin": "Admin",
+        "logout": "Logout"
+    }
+}

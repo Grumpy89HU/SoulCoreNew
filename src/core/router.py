@@ -6,14 +6,23 @@ Topológia:
 - ROUTER socket (Kernel) a központban
 - DEALER socket (Slotok) a moduloknál
 - Heartbeat: minden slot 500ms-enként PING
+
+Internal Heartbeat Protocol (IHP):
+- Kernel 500ms-enként Ping csomagot küld minden slotnak
+- Ha egy slot 3 másodpercig nem válaszol, "Frozen" státusz
+- Jester-Doctor riasztást kap
+
+Backpressure Handling:
+- Ha a várakozási sor megtelik, "Várj egy pillanatot" üzenet
 """
 
 import time
 import threading
 import json
 import queue
-from typing import Dict, Any, Callable, Optional
+from typing import Dict, Any, Callable, Optional, List
 from collections import defaultdict
+from datetime import datetime
 
 # ZMQ import (ha nincs telepítve, nem törik el a rendszer)
 try:
@@ -37,6 +46,10 @@ class Router:
     MSG = "MSG"
     CMD = "CMD"
     
+    # Internal Heartbeat Protocol (IHP)
+    HEARTBEAT_INTERVAL = 0.5  # 500 ms
+    HEARTBEAT_TIMEOUT = 3.0    # 3 másodperc
+    
     def __init__(self, scratchpad):
         self.scratchpad = scratchpad
         self.name = "router"
@@ -50,15 +63,30 @@ class Router:
         self.zmq_socket = None
         
         # Regisztrált modulok (slotok)
-        self.modules = {}  # name -> {type, address, last_seen, queue}
+        self.modules = {}  # name -> {type, address, last_seen, status, queue_size}
         
         # Heartbeat tracking
         self.last_heartbeat = {}  # module -> timestamp
-        self.heartbeat_timeout = 3.0  # 3 másodperc
+        self.heartbeat_timeout = self.HEARTBEAT_TIMEOUT
+        self.heartbeat_interval = self.HEARTBEAT_INTERVAL
+        
+        # Frozen modulok (nem válaszolnak)
+        self.frozen_modules = set()  # module name
         
         # Queue fallback (ha nincs ZMQ)
-        self.message_queue = queue.Queue()
+        self.message_queue = queue.Queue(maxsize=1000)
         self.handlers = defaultdict(list)  # message_type -> [callbacks]
+        
+        # Statisztikák
+        self.stats = {
+            'messages_sent': 0,
+            'messages_received': 0,
+            'ping_sent': 0,
+            'pong_received': 0,
+            'timeouts': 0,
+            'queue_full_events': 0,
+            'frozen_events': 0
+        }
         
         print("🔌 Router: Kommunikációs pálya inicializálva.")
         if not ZMQ_AVAILABLE:
@@ -77,7 +105,12 @@ class Router:
         receiver.start()
         self.threads.append(receiver)
         
-        # Heartbeat ellenőrző szál indítása
+        # Heartbeat küldő szál indítása (IHP)
+        hb_sender = threading.Thread(target=self._heartbeat_sender_loop, daemon=True)
+        hb_sender.start()
+        self.threads.append(hb_sender)
+        
+        # Heartbeat ellenőrző szál indítása (frozen detektálás)
         hb_checker = threading.Thread(target=self._heartbeat_check_loop, daemon=True)
         hb_checker.start()
         self.threads.append(hb_checker)
@@ -114,6 +147,12 @@ class Router:
             self.zmq_context = zmq.Context()
             self.zmq_socket = self.zmq_context.socket(zmq.ROUTER)
             self.zmq_socket.bind("tcp://*:5555")  # Alap port
+            
+            # Beállítások a latency csökkentéséhez
+            self.zmq_socket.setsockopt(zmq.LINGER, 0)
+            self.zmq_socket.setsockopt(zmq.SNDHWM, 1000)  # Küldési queue méret
+            self.zmq_socket.setsockopt(zmq.RCVHWM, 1000)  # Fogadási queue méret
+            
             print("🔌 ZMQ ROUTER fut a tcp://*:5555 címen")
         except Exception as e:
             print(f"🔌 ZMQ hiba: {e}")
@@ -143,7 +182,6 @@ class Router:
                             self._receive_zmq()
                     except Exception as e:
                         print(f"🔌 ZMQ poll hiba: {e}")
-                        # Ha hiba van, kapcsoljunk át queue módra
                         poller = None
                 else:
                     # Queue mód
@@ -177,6 +215,12 @@ class Router:
             # Heartbeat külön kezelés (leggyakoribb)
             if msg_str == self.PING:
                 self._handle_ping(identity)
+                self.stats['pong_received'] += 1
+                return
+            elif msg_str == self.PONG:
+                # PONG fogadása (válasz a saját PING-ünkre)
+                self._handle_pong(identity)
+                self.stats['pong_received'] += 1
                 return
             
             # KVK vagy JSON formátum
@@ -188,7 +232,9 @@ class Router:
                 msg = {'type': self.MSG, 'data': msg_str}
             
             msg['_identity'] = identity
+            msg['_received_at'] = time.time()
             self._process_message(msg)
+            self.stats['messages_received'] += 1
             
         except Exception as e:
             print(f"🔌 Üzenet feldolgozási hiba: {e}")
@@ -198,7 +244,7 @@ class Router:
         if not isinstance(msg, dict):
             print(f"🔌 Érvénytelen üzenet típus: {type(msg)}")
             return
-            
+        
         msg_type = msg.get('type', self.MSG)
         
         # Handler-ek hívása
@@ -215,40 +261,130 @@ class Router:
             except Exception as e:
                 print(f"🔌 Handler hiba (*): {e}")
     
-    def _handle_ping(self, identity: bytes):
-        """Ping fogadása és válasz"""
-        module_name = self._get_module_name(identity)
-        self.last_heartbeat[module_name] = time.time()
-        
-        # PONG válasz
-        self._send_to_identity(identity, self.PONG)
+    # --- HEARTBEAT KEZELÉS (Internal Heartbeat Protocol) ---
+    
+    def _heartbeat_sender_loop(self):
+        """
+        Heartbeat küldő ciklus (IHP).
+        500ms-enként PING küldése minden regisztrált modulnak.
+        """
+        while self.running:
+            time.sleep(self.heartbeat_interval)
+            
+            if not self.modules:
+                continue
+            
+            # Minden modulnak küldünk PING-et
+            for module_name, module_info in list(self.modules.items()):
+                if module_info.get('status') == 'frozen':
+                    # Frozen modulnak nem küldünk PING-et
+                    continue
+                
+                self._send_ping(module_name)
+                self.stats['ping_sent'] += 1
     
     def _heartbeat_check_loop(self):
-        """Heartbeat ellenőrző ciklus"""
+        """
+        Heartbeat ellenőrző ciklus.
+        Figyeli, hogy mely modulok nem válaszoltak időben.
+        """
         while self.running:
             time.sleep(1.0)  # másodpercenként
             
             now = time.time()
+            newly_frozen = []
+            
             for module, last_seen in list(self.last_heartbeat.items()):
                 if now - last_seen > self.heartbeat_timeout:
                     # Modul nem válaszol
-                    self._handle_dead_module(module)
+                    if module not in self.frozen_modules:
+                        newly_frozen.append(module)
+                        self.frozen_modules.add(module)
+                        
+                        # Modul státusz frissítése
+                        if module in self.modules:
+                            self.modules[module]['status'] = 'frozen'
+                        
+                        self.stats['frozen_events'] += 1
+                        self.stats['timeouts'] += 1
+                        
+                        # Esemény küldése a rendszernek (Jester-Doctor riasztás)
+                        self._handle_module_frozen(module)
+            
+            # Újraéledt modulok ellenőrzése
+            for module in list(self.frozen_modules):
+                if module in self.last_heartbeat:
+                    last_seen = self.last_heartbeat[module]
+                    if now - last_seen <= self.heartbeat_timeout:
+                        # Újra válaszol
+                        self.frozen_modules.remove(module)
+                        if module in self.modules:
+                            self.modules[module]['status'] = 'active'
+                        
+                        # Esemény küldése a rendszernek
+                        self._handle_module_revived(module)
     
-    def _handle_dead_module(self, module: str):
-        """Nem válaszoló modul kezelése"""
-        print(f"🔌 Modul nem válaszol: {module}")
-        self.last_heartbeat.pop(module, None)
+    def _send_ping(self, module_name: str):
+        """PING küldése egy modulnak"""
+        self.send(module_name, {}, self.PING)
+    
+    def _handle_ping(self, identity: bytes):
+        """Ping fogadása és válasz"""
+        module_name = self._get_module_name(identity)
+        
+        # Utolsó látogatás frissítése
+        self.last_heartbeat[module_name] = time.time()
+        
+        # Ha frozen volt, most újra él
+        if module_name in self.frozen_modules:
+            self.frozen_modules.remove(module_name)
+            if module_name in self.modules:
+                self.modules[module_name]['status'] = 'active'
+        
+        # PONG válasz
+        self._send_to_identity(identity, self.PONG)
+    
+    def _handle_pong(self, identity: bytes):
+        """PONG fogadása (válasz a saját PING-ünkre)"""
+        module_name = self._get_module_name(identity)
+        
+        # Utolsó látogatás frissítése
+        self.last_heartbeat[module_name] = time.time()
+        
+        # Ha frozen volt, most újra él
+        if module_name in self.frozen_modules:
+            self.frozen_modules.remove(module_name)
+            if module_name in self.modules:
+                self.modules[module_name]['status'] = 'active'
+    
+    def _handle_module_frozen(self, module: str):
+        """Modul frozen állapotba került"""
+        print(f"🔌 Modul frozen: {module}")
         
         # Esemény küldése a rendszernek
         self.scratchpad.write(self.name, 
-            {'module': module, 'timeout': self.heartbeat_timeout}, 
-            'module_dead'
+            {'module': module, 'timeout': self.heartbeat_timeout, 'status': 'frozen'}, 
+            'module_frozen'
+        )
+    
+    def _handle_module_revived(self, module: str):
+        """Modul újraéledt"""
+        print(f"🔌 Modul újraéledt: {module}")
+        
+        # Esemény küldése a rendszernek
+        self.scratchpad.write(self.name, 
+            {'module': module, 'status': 'active'}, 
+            'module_revived'
         )
     
     def _get_module_name(self, identity: bytes) -> str:
         """Identity-ből modulnév (egyszerűsítve)"""
         try:
-            return identity.decode('utf-8').split('_')[0]
+            name = identity.decode('utf-8').split('_')[0]
+            # Ha nincs a modulok között, akkor generálunk egy nevet
+            if name not in self.modules:
+                return f"unknown_{hash(identity) % 1000}"
+            return name
         except:
             return f"unknown_{hash(identity) % 1000}"
     
@@ -261,6 +397,7 @@ class Router:
             self.zmq_socket.send(identity, zmq.SNDMORE)
             self.zmq_socket.send(b"", zmq.SNDMORE)  # delimiter
             self.zmq_socket.send(data.encode('utf-8'))
+            self.stats['messages_sent'] += 1
         except Exception as e:
             print(f"🔌 Küldési hiba: {e}")
     
@@ -274,9 +411,22 @@ class Router:
             'type': module_type,
             'address': address,
             'registered': time.time(),
-            'last_seen': time.time()
+            'last_seen': time.time(),
+            'status': 'active',
+            'queue_size': 0
         }
+        self.last_heartbeat[name] = time.time()
         print(f"🔌 Modul regisztrálva: {name} ({module_type})")
+    
+    def unregister_module(self, name: str):
+        """Modul eltávolítása"""
+        if name in self.modules:
+            del self.modules[name]
+        if name in self.last_heartbeat:
+            del self.last_heartbeat[name]
+        if name in self.frozen_modules:
+            self.frozen_modules.remove(name)
+        print(f"🔌 Modul eltávolítva: {name}")
     
     def subscribe(self, msg_type: str, callback: Callable):
         """
@@ -297,17 +447,27 @@ class Router:
         """
         msg['type'] = msg_type
         msg['to'] = to
-        msg['from'] = 'router'
+        msg['from'] = self.name
         msg['timestamp'] = time.time()
         
-        if ZMQ_AVAILABLE and self.zmq_socket:
+        if ZMQ_AVAILABLE and self.zmq_socket and to in self.modules:
             # ZMQ küldés (identity alapján)
             identity = to.encode('utf-8')
-            data = json.dumps(msg) if msg_type != self.MSG else msg.get('data', '')
+            
+            if msg_type == self.MSG and 'data' in msg:
+                data = msg.get('data', '')
+            else:
+                data = json.dumps(msg)
+            
             self._send_to_identity(identity, data)
         else:
             # Queue küldés
-            self.message_queue.put(msg)
+            try:
+                self.message_queue.put(msg, timeout=1.0)
+            except queue.Full:
+                # Backpressure: tele a sor
+                self.stats['queue_full_events'] += 1
+                self._handle_backpressure(to)
     
     def broadcast(self, msg: Dict, msg_type: str = MSG):
         """
@@ -321,7 +481,21 @@ class Router:
         Minden modul pingelése.
         """
         for module in self.modules:
-            self.send(module, {}, self.PING)
+            self._send_ping(module)
+    
+    def _handle_backpressure(self, target: str):
+        """
+        Backpressure kezelés: ha tele a sor, "Várj egy pillanatot" üzenet.
+        """
+        print(f"🔌 Backpressure: {target} felé a sor tele")
+        
+        # Üzenet küldése a felhasználónak (ha van Scribe)
+        self.scratchpad.write(self.name, 
+            {'message': 'Várj egy pillanatot, gondolkodom...', 'target': target},
+            'backpressure'
+        )
+    
+    # --- LEKÉRDEZÉSEK ---
     
     def get_status(self) -> Dict:
         """Router státusz"""
@@ -331,13 +505,25 @@ class Router:
             'zmq_available': ZMQ_AVAILABLE,
             'zmq_connected': self.zmq_socket is not None,
             'modules': len(self.modules),
+            'frozen_modules': list(self.frozen_modules),
+            'active_modules': len(self.modules) - len(self.frozen_modules),
             'handlers': len(self.handlers),
             'queue_size': self.message_queue.qsize() if not ZMQ_AVAILABLE else 0,
+            'queue_maxsize': self.message_queue.maxsize,
+            'stats': dict(self.stats),
             'heartbeats': {
-                module: now - last
+                module: {
+                    'last_seen': last,
+                    'age': now - last,
+                    'status': 'frozen' if module in self.frozen_modules else 'active'
+                }
                 for module, last in self.last_heartbeat.items()
             }
         }
+    
+    def get_module_info(self, module_name: str) -> Optional[Dict]:
+        """Egy modul információinak lekérése"""
+        return self.modules.get(module_name)
 
 # Teszt
 if __name__ == "__main__":
@@ -356,26 +542,30 @@ if __name__ == "__main__":
     
     # Feliratkozás
     def on_message(msg):
-        print(f"📨 Üzenet érkezett: {msg}")
+        print(f"📨 Üzenet érkezett: {msg.get('type')} - {msg.get('data', '')[:50]}")
     
     router.subscribe('*', on_message)
     
     # Küldés teszt
     print("\n--- Küldési teszt ---")
-    router.send('king', {'data': 'INTENT:GREET|USER:GRUMPY'})
+    router.send('king', {'data': 'INTENT:GREET|USER:USER'})
     
     # Ping teszt
     print("\n--- Ping teszt ---")
     router.ping_all()
     
     # Várakozás a feldolgozásra
-    time.sleep(1)
+    time.sleep(2)
     
     # Státusz
     print("\n--- Router státusz ---")
     status = router.get_status()
     for k, v in status.items():
-        print(f"{k}: {v}")
+        if k != 'heartbeats' and k != 'stats':
+            print(f"{k}: {v}")
+    
+    print(f"\nHeartbeats: {len(status['heartbeats'])} modul")
+    print(f"Statisztikák: Ping elküldve: {status['stats']['ping_sent']}")
     
     # Leállítás
     router.stop()

@@ -9,18 +9,30 @@ Funkciók:
 - Képfeltöltés (Eye-Core)
 - Modell paraméterek állítása
 - Beszélgetés előzmények
+- Többnyelvű támogatás (i18n)
+- Többszintű hozzáférési rendszer (admin, user)
 """
 
 import os
 import time
 import json
 import threading
-from pathlib import Path
-from flask import Flask, render_template, send_from_directory, request, jsonify, session
-from flask_socketio import SocketIO, emit, join_room, leave_room
-from datetime import datetime, timedelta
-import hashlib
+import uuid
 import secrets
+from pathlib import Path
+from datetime import datetime, timedelta
+from functools import wraps
+
+from flask import Flask, render_template, send_from_directory, request, jsonify, session, g
+from flask_socketio import SocketIO, emit, join_room, leave_room
+
+# i18n import
+try:
+    from src.i18n.translator import get_translator
+    I18N_AVAILABLE = True
+except ImportError:
+    I18N_AVAILABLE = False
+    print("⚠️ Web: i18n nem elérhető, angol alapértelmezettel futok.")
 
 # Projekt gyökér
 ROOT_DIR = Path(__file__).parent.parent.parent
@@ -33,10 +45,11 @@ class WebApp:
     - Vue.js frontend (single file)
     - REST API az adatbázishoz
     - Admin felület
+    - Többnyelvű támogatás
     """
     
     def __init__(self, modules):
-        self.modules = modules
+        self.modules = modules  # az összes modul (orchestrator, king, stb)
         self.name = "web"
         
         # Flask app
@@ -46,6 +59,11 @@ class WebApp:
         
         # Titkos kulcs session-ökhöz
         self.app.secret_key = os.environ.get('SECRET_KEY', secrets.token_hex(32))
+        
+        # Fordító (alapértelmezett angol)
+        self.translator = None
+        if I18N_AVAILABLE:
+            self.translator = get_translator('en')
         
         # Socket.IO
         self.socketio = SocketIO(self.app, cors_allowed_origins="*", ping_timeout=60, ping_interval=25)
@@ -57,8 +75,11 @@ class WebApp:
         # Aktív kapcsolatok
         self.connected_clients = {}
         
-        # Admin jelszó (később configból)
+        # Admin jelszó (környezeti változóból vagy alapértelmezett)
         self.admin_password = os.environ.get('ADMIN_PASSWORD', 'soulcore2026')
+        
+        # Nyelv beállítása kérésenként
+        self._setup_before_request()
         
         # Útvonalak beállítása
         self._setup_routes()
@@ -67,6 +88,24 @@ class WebApp:
         self._setup_socket_events()
         
         print("🌐 Web: Ablak nyílik.")
+    
+    def _setup_before_request(self):
+        """Kérés előtti nyelvbeállítás"""
+        @self.app.before_request
+        def before_request():
+            # Nyelv beállítása a session-ből vagy header-ből
+            lang = session.get('language', request.headers.get('Accept-Language', 'en')[:2])
+            if lang not in ['en', 'hu']:
+                lang = 'en'
+            g.language = lang
+            if self.translator:
+                self.translator.set_language(lang)
+    
+    def _get_message(self, key: str, **kwargs) -> str:
+        """Üzenet lekérése i18n-ből"""
+        if self.translator and I18N_AVAILABLE:
+            return self.translator.get(key, **kwargs)
+        return key
     
     # ------------------------------------------------------------------------
     # ROUTES - REST API
@@ -80,39 +119,59 @@ class WebApp:
         @self.app.route('/')
         def index():
             """Főoldal"""
-            return render_template('index.html')
+            return render_template('index.html', 
+                                  language=g.get('language', 'en'),
+                                  gettext=self._get_message)
         
         @self.app.route('/admin')
         def admin_panel():
             """Admin panel (külön oldal)"""
-            return render_template('admin.html')
+            if not session.get('admin'):
+                return redirect(url_for('login'))
+            return render_template('admin.html', language=g.get('language', 'en'))
         
-        @self.app.route('/login', methods=['POST'])
+        @self.app.route('/login', methods=['GET', 'POST'])
         def login():
             """Bejelentkezés"""
+            if request.method == 'GET':
+                return render_template('login.html', language=g.get('language', 'en'))
+            
             data = request.get_json() or {}
             password = data.get('password')
             
             if password == self.admin_password:
                 session['admin'] = True
                 session['login_time'] = time.time()
-                return {'success': True, 'message': 'Sikeres bejelentkezés'}
+                return {'success': True, 'message': self._get_message('ui.login_success')}
             
-            return {'success': False, 'message': 'Hibás jelszó'}, 401
+            return {'success': False, 'message': self._get_message('errors.unauthorized')}, 401
         
         @self.app.route('/logout', methods=['POST'])
         def logout():
             """Kijelentkezés"""
             session.pop('admin', None)
-            return {'success': True}
+            return {'success': True, 'message': self._get_message('ui.logout_success')}
         
         @self.app.route('/api/session')
         def get_session():
             """Session állapot lekérése"""
             return {
                 'is_admin': session.get('admin', False),
-                'login_time': session.get('login_time')
+                'login_time': session.get('login_time'),
+                'language': g.get('language', 'en')
             }
+        
+        @self.app.route('/api/language', methods=['POST'])
+        def set_language():
+            """Nyelv beállítása"""
+            data = request.get_json() or {}
+            lang = data.get('language', 'en')
+            if lang in ['en', 'hu']:
+                session['language'] = lang
+                if self.translator:
+                    self.translator.set_language(lang)
+                return {'success': True, 'language': lang}
+            return {'success': False, 'message': 'Invalid language'}, 400
         
         # --- RENDSZER STÁTUSZ ---
         
@@ -134,7 +193,7 @@ class WebApp:
             king = self.modules.get('king')
             if king:
                 return king.get_state()
-            return {'error': 'King not available'}, 404
+            return {'error': self._get_message('errors.model_not_loaded')}, 404
         
         @self.app.route('/api/jester/diagnosis')
         def jester_diagnosis():
@@ -184,7 +243,9 @@ class WebApp:
             limit = request.args.get('limit', 50, type=int)
             offset = request.args.get('offset', 0, type=int)
             
-            convs = db.get_conversations(limit=limit, offset=offset)
+            # Felhasználó szerinti szűrés (ha van user_id a session-ben)
+            user_id = session.get('user_id')
+            convs = db.get_conversations(limit=limit, offset=offset, user_id=user_id)
             return {'conversations': convs, 'total': len(convs)}
         
         @self.app.route('/api/conversations', methods=['POST'])
@@ -195,11 +256,14 @@ class WebApp:
                 return {'error': 'Database not available'}, 500
             
             data = request.get_json() or {}
+            user_id = session.get('user_id')
+            
             conv_id = db.create_conversation(
-                title=data.get('title', f"Beszélgetés {datetime.now().strftime('%Y-%m-%d %H:%M')}"),
+                title=data.get('title', f"Conversation {datetime.now().strftime('%Y-%m-%d %H:%M')}"),
                 model=data.get('model'),
                 system_prompt=data.get('system_prompt'),
-                metadata=data.get('metadata')
+                metadata=data.get('metadata'),
+                user_id=user_id
             )
             
             return {'id': conv_id, 'success': True}
@@ -213,7 +277,7 @@ class WebApp:
             
             conv = db.get_conversation(conv_id)
             if not conv:
-                return {'error': 'Conversation not found'}, 404
+                return {'error': self._get_message('errors.not_found', resource='Conversation')}, 404
             
             return conv
         
@@ -237,7 +301,7 @@ class WebApp:
             
             # Csak admin törölhet
             if not session.get('admin'):
-                return {'error': 'Unauthorized'}, 403
+                return {'error': self._get_message('errors.unauthorized')}, 403
             
             db.delete_conversation(conv_id)
             return {'success': True}
@@ -299,12 +363,12 @@ class WebApp:
                 }
             elif format == 'txt':
                 # Egyszerű szöveges export
-                lines = [f"Beszélgetés: {conv['title']}"]
-                lines.append(f"Idő: {conv['created_at']}")
+                lines = [f"Conversation: {conv['title']}"]
+                lines.append(f"Date: {conv['created_at']}")
                 lines.append("=" * 50)
                 
                 for msg in messages:
-                    role = "Grumpy" if msg['role'] == 'user' else "Kópé"
+                    role = "User" if msg['role'] == 'user' else "Assistant"
                     lines.append(f"[{role}] {msg['content']}")
                     lines.append("-" * 30)
                 
@@ -336,7 +400,7 @@ class WebApp:
             
             # Csak admin szerkeszthet
             if not session.get('admin'):
-                return {'error': 'Unauthorized'}, 403
+                return {'error': self._get_message('errors.unauthorized')}, 403
             
             prompt_id = db.save_prompt(
                 name=data.get('name'),
@@ -357,7 +421,7 @@ class WebApp:
             
             prompt = db.get_prompt(prompt_id=prompt_id)
             if not prompt:
-                return {'error': 'Prompt not found'}, 404
+                return {'error': self._get_message('errors.not_found', resource='Prompt')}, 404
             
             return prompt
         
@@ -370,7 +434,7 @@ class WebApp:
             
             # Csak admin törölhet
             if not session.get('admin'):
-                return {'error': 'Unauthorized'}, 403
+                return {'error': self._get_message('errors.unauthorized')}, 403
             
             try:
                 db.delete_prompt(prompt_id)
@@ -378,33 +442,58 @@ class WebApp:
             except ValueError as e:
                 return {'error': str(e)}, 400
         
-        @self.app.route('/api/prompts/default/<category>', methods=['GET'])
-        def get_default_prompt(category):
-            """Alapértelmezett prompt lekérése kategória alapján"""
+        # --- SZEMÉLYISÉGEK API ---
+        
+        @self.app.route('/api/personalities', methods=['GET'])
+        def get_personalities():
+            """Személyiségek listázása"""
+            db = self.modules.get('database')
+            if not db:
+                return {'error': 'Database not available'}, 500
+            return {'personalities': db.get_personalities()}
+        
+        @self.app.route('/api/personalities', methods=['POST'])
+        def create_personality():
+            """Új személyiség létrehozása"""
             db = self.modules.get('database')
             if not db:
                 return {'error': 'Database not available'}, 500
             
-            prompts = db.get_prompts(category=category)
-            default = next((p for p in prompts if p['is_default']), None)
+            if not session.get('admin'):
+                return {'error': self._get_message('errors.unauthorized')}, 403
             
-            if default:
-                return default
+            data = request.get_json() or {}
+            pers_id = db.save_personality(
+                name=data.get('name'),
+                content=data.get('content'),
+                activate=data.get('activate', False)
+            )
+            return {'id': pers_id, 'success': True}
+        
+        @self.app.route('/api/personalities/<int:pers_id>/activate', methods=['POST'])
+        def activate_personality(pers_id):
+            """Személyiség aktiválása"""
+            db = self.modules.get('database')
+            if not db:
+                return {'error': 'Database not available'}, 500
             
-            # Ha nincs, az elsőt adjuk
-            return prompts[0] if prompts else {'content': '', 'name': 'Üres'}
+            if not session.get('admin'):
+                return {'error': self._get_message('errors.unauthorized')}, 403
+            
+            db.activate_personality(pers_id)
+            return {'success': True}
         
         # --- BEÁLLÍTÁSOK API ---
         
         @self.app.route('/api/settings', methods=['GET'])
         def get_settings():
-            """Beállítások lekérése"""
+            """Beállítások lekérése (rendszer)"""
             db = self.modules.get('database')
             if not db:
                 return {'error': 'Database not available'}, 500
             
             category = request.args.get('category')
-            settings = db.get_all_settings(category=category)
+            settings = db.get_all_system_settings(category=category)
             return settings
         
         @self.app.route('/api/settings/<key>', methods=['GET'])
@@ -414,7 +503,7 @@ class WebApp:
             if not db:
                 return {'error': 'Database not available'}, 500
             
-            value = db.get_setting(key)
+            value = db.get_system_setting(key)
             return {'key': key, 'value': value}
         
         @self.app.route('/api/settings/<key>', methods=['POST', 'PUT'])
@@ -426,10 +515,10 @@ class WebApp:
             
             # Csak admin módosíthat
             if not session.get('admin'):
-                return {'error': 'Unauthorized'}, 403
+                return {'error': self._get_message('errors.unauthorized')}, 403
             
             data = request.get_json() or {}
-            db.set_setting(
+            db.set_system_setting(
                 key=key,
                 value=data.get('value'),
                 value_type=data.get('type'),
@@ -438,43 +527,6 @@ class WebApp:
             )
             
             return {'success': True}
-        
-        @self.app.route('/api/settings/import', methods=['POST'])
-        def import_settings():
-            """Beállítások importálása JSON-ből"""
-            db = self.modules.get('database')
-            if not db:
-                return {'error': 'Database not available'}, 500
-            
-            if not session.get('admin'):
-                return {'error': 'Unauthorized'}, 403
-            
-            data = request.get_json() or {}
-            settings = data.get('settings', {})
-            
-            for key, value in settings.items():
-                if isinstance(value, dict):
-                    db.set_setting(
-                        key=key,
-                        value=value.get('value'),
-                        value_type=value.get('type'),
-                        category=value.get('category', 'imported'),
-                        description=value.get('description', '')
-                    )
-                else:
-                    db.set_setting(key=key, value=value)
-            
-            return {'success': True, 'count': len(settings)}
-        
-        @self.app.route('/api/settings/export', methods=['GET'])
-        def export_settings():
-            """Beállítások exportálása"""
-            db = self.modules.get('database')
-            if not db:
-                return {'error': 'Database not available'}, 500
-            
-            settings = db.get_all_settings()
-            return {'settings': settings, 'exported_at': time.time()}
         
         # --- MODELLEK API ---
         
@@ -507,14 +559,14 @@ class WebApp:
                 return {'error': 'Database not available'}, 500
             
             if not session.get('admin'):
-                return {'error': 'Unauthorized'}, 403
+                return {'error': self._get_message('errors.unauthorized')}, 403
             
             data = request.get_json() or {}
             
             # Ellenőrizzük, hogy létezik-e a fájl
             model_path = data.get('path')
             if not os.path.exists(model_path):
-                return {'error': f'File not found: {model_path}'}, 400
+                return {'error': self._get_message('errors.file_not_found', path=model_path)}, 400
             
             # Fájlméret lekérése
             size = os.path.getsize(model_path)
@@ -540,19 +592,12 @@ class WebApp:
                 return {'error': 'Database not available'}, 500
             
             if not session.get('admin'):
-                return {'error': 'Unauthorized'}, 403
+                return {'error': self._get_message('errors.unauthorized')}, 403
             
             # Modell lekérése
             model = db.get_model(model_id=model_id)
             if not model:
-                return {'error': 'Model not found'}, 404
-            
-            # King újratöltése az új modellel
-            king = self.modules.get('king')
-            if king:
-                # Itt történik a modell váltás
-                # Ez bonyolultabb, később
-                pass
+                return {'error': self._get_message('errors.not_found', resource='Model')}, 404
             
             db.set_active_model(model_id)
             return {'success': True, 'model': model['name']}
@@ -565,33 +610,10 @@ class WebApp:
                 return {'error': 'Database not available'}, 500
             
             if not session.get('admin'):
-                return {'error': 'Unauthorized'}, 403
+                return {'error': self._get_message('errors.unauthorized')}, 403
             
             db.delete_model(model_id)
             return {'success': True}
-        
-        @self.app.route('/api/models/scan', methods=['POST'])
-        def scan_models():
-            """Modell mappa átvizsgálása"""
-            if not session.get('admin'):
-                return {'error': 'Unauthorized'}, 403
-            
-            data = request.get_json() or {}
-            folder = data.get('folder', 'models')
-            
-            if not os.path.exists(folder):
-                return {'error': f'Folder not found: {folder}'}, 400
-            
-            # GGUF fájlok keresése
-            models_found = []
-            for file in Path(folder).glob('**/*.gguf'):
-                models_found.append({
-                    'path': str(file),
-                    'name': file.stem,
-                    'size': f"{file.stat().st_size / 1024 / 1024 / 1024:.1f} GB"
-                })
-            
-            return {'models': models_found, 'count': len(models_found)}
         
         # --- MODUL VEZÉRLÉS (ADMIN) ---
         
@@ -599,11 +621,11 @@ class WebApp:
         def control_module(module_name, action):
             """Modul vezérlése (start/stop/restart)"""
             if not session.get('admin'):
-                return {'error': 'Unauthorized'}, 403
+                return {'error': self._get_message('errors.unauthorized')}, 403
             
             module = self.modules.get(module_name)
             if not module:
-                return {'error': f'Module {module_name} not found'}, 404
+                return {'error': self._get_message('errors.not_found', resource=f'Module {module_name}')}, 404
             
             if action == 'start' and hasattr(module, 'start'):
                 module.start()
@@ -635,7 +657,7 @@ class WebApp:
             source = data.get('source', 'upload')
             
             if not image_data:
-                return {'error': 'No image data'}, 400
+                return {'error': self._get_message('errors.missing_parameter', param='image')}, 400
             
             result = eye.process_image(image_data, source=source)
             return result
@@ -646,7 +668,7 @@ class WebApp:
         def execute_code():
             """Kód futtatása sandboxban"""
             if not session.get('admin'):
-                return {'error': 'Unauthorized'}, 403
+                return {'error': self._get_message('errors.unauthorized')}, 403
             
             sandbox = self.modules.get('sandbox')
             if not sandbox:
@@ -657,7 +679,7 @@ class WebApp:
             context = data.get('context', {})
             
             if not code:
-                return {'error': 'No code provided'}, 400
+                return {'error': self._get_message('errors.missing_parameter', param='code')}, 400
             
             result = sandbox.execute_for_king(code, context)
             return {'result': result}
@@ -701,14 +723,16 @@ class WebApp:
             self.connected_clients[client_id] = {
                 'connected_at': time.time(),
                 'ip': request.remote_addr,
-                'user_agent': request.headers.get('User-Agent', 'unknown')
+                'user_agent': request.headers.get('User-Agent', 'unknown'),
+                'language': session.get('language', 'en')
             }
             
             print(f"🌐 Web: Kliens csatlakozott ({client_id[:8]}...)")
             emit('connected', {
                 'status': 'ok',
                 'time': time.time(),
-                'client_id': client_id
+                'client_id': client_id,
+                'language': session.get('language', 'en')
             })
             
             # Küldjük a jelenlegi állapotot
@@ -735,13 +759,14 @@ class WebApp:
             print(f"🌐 Web: User üzenet ({client_id[:8]}...): {text[:50]}...")
             
             # 1. KVK csomag készítése
-            kvk = f"INTENT:UNKNOWN|USER:GRUMPY|MESSAGE:{text}"
+            user_name = self.modules.get('scratchpad', {}).get_state('user_name', 'User')
+            kvk = f"INTENT:UNKNOWN|USER:{user_name}|MESSAGE:{text}"
             
             # 2. Orchestrator feldolgozása
             orch = self.modules.get('orchestrator')
             if orch:
                 state = orch.process_raw_packet(kvk)
-                if state:
+                if state and isinstance(state, dict) and 'trace_id' in state:
                     # 3. Heartbeat értesítése (interakció történt)
                     hb = self.modules.get('heartbeat')
                     if hb:
@@ -768,7 +793,7 @@ class WebApp:
                             },
                             'payload': {
                                 'intent': {
-                                    'class': state['packet'].get('INTENT', 'unknown'),
+                                    'class': state.get('packet', {}).get('INTENT', 'unknown'),  # <-- JAVÍTVA: state.get('packet', {})
                                     'target': 'king'
                                 },
                                 'entities': [],
@@ -804,12 +829,20 @@ class WebApp:
                                     emit('jester_note', {
                                         'note': report.get('payload', {}).get('summary', '')
                                     })
+                else:
+                    # Hibás state objektum
+                    print(f"🌐 Web: Hibás orchestrator válasz: {state}")
+                    emit('king_response', {
+                        'response': "Hiba történt az üzenet feldolgozása közben.",
+                        'trace_id': None,
+                        'mood': 'error'
+                    })
         
         @self.socketio.on('image_upload')
         def handle_image_upload(data):
             """Kép feltöltés"""
             image = data.get('image')
-            filename = data.get('filename', 'kép')
+            filename = data.get('filename', 'image')
             client_id = request.sid
             
             print(f"🌐 Web: Kép feltöltés ({client_id[:8]}...): {filename}")
@@ -824,7 +857,7 @@ class WebApp:
                 })
             else:
                 emit('vision_result', {
-                    'description': 'Eye-Core nem elérhető',
+                    'description': 'Eye-Core not available',
                     'success': False
                 })
         
@@ -845,11 +878,13 @@ class WebApp:
                 recent = blackbox.get_conversation(limit=20)
             
             # Felhasználónév
-            user_name = self.modules.get('scratchpad', {}).get_state('user_name', 'Grumpy')
+            user_name = self.modules.get('scratchpad', {}).get_state('user_name', 'User')
+            user_language = self.modules.get('scratchpad', {}).get_state('user_language', 'en')
             
             emit('initial_state', {
                 'messages': recent,
                 'userName': user_name,
+                'userLanguage': user_language,
                 'client_id': client_id,
                 'server_time': time.time()
             })
@@ -861,7 +896,8 @@ class WebApp:
             """Beszélgetések listájának lekérése"""
             db = self.modules.get('database')
             if db:
-                convs = db.get_conversations(limit=50)
+                user_id = session.get('user_id')
+                convs = db.get_conversations(limit=50, user_id=user_id)
                 emit('conversations_list', {'conversations': convs})
         
         @self.socketio.on('create_conversation')
@@ -869,17 +905,18 @@ class WebApp:
             """Új beszélgetés létrehozása"""
             db = self.modules.get('database')
             if db:
+                user_id = session.get('user_id')
                 conv_id = db.create_conversation(
                     title=data.get('title'),
                     model=data.get('model'),
-                    system_prompt=data.get('system_prompt')
+                    system_prompt=data.get('system_prompt'),
+                    user_id=user_id
                 )
                 emit('conversation_created', {'id': conv_id})
                 
-                # Frissítjük a listát mindenkinek
-                self.socketio.emit('conversations_list', {
-                    'conversations': db.get_conversations(limit=50)
-                })
+                # Frissítjük a listát
+                convs = db.get_conversations(limit=50, user_id=user_id)
+                self.socketio.emit('conversations_list', {'conversations': convs})
         
         @self.socketio.on('load_conversation')
         def handle_load_conversation(data):
@@ -909,15 +946,18 @@ class WebApp:
         @self.socketio.on('delete_conversation')
         def handle_delete_conversation(data):
             """Beszélgetés törlése"""
+            if not session.get('admin'):
+                return
+            
             conv_id = data.get('id')
             db = self.modules.get('database')
             
             if db and conv_id:
                 db.delete_conversation(conv_id)
                 # Frissítjük a listát
-                emit('conversations_list', {
-                    'conversations': db.get_conversations(limit=50)
-                })
+                user_id = session.get('user_id')
+                convs = db.get_conversations(limit=50, user_id=user_id)
+                emit('conversations_list', {'conversations': convs})
         
         @self.socketio.on('get_prompts')
         def handle_get_prompts():
@@ -930,6 +970,9 @@ class WebApp:
         @self.socketio.on('save_prompt')
         def handle_save_prompt(data):
             """Prompt mentése"""
+            if not session.get('admin'):
+                return
+            
             db = self.modules.get('database')
             if db:
                 prompt_id = db.save_prompt(
@@ -948,15 +991,18 @@ class WebApp:
             """Beállítások lekérése"""
             db = self.modules.get('database')
             if db:
-                settings = db.get_all_settings()
+                settings = db.get_all_system_settings()
                 emit('settings', settings)
         
         @self.socketio.on('update_setting')
         def handle_update_setting(data):
             """Beállítás módosítása"""
+            if not session.get('admin'):
+                return
+            
             db = self.modules.get('database')
             if db:
-                db.set_setting(
+                db.set_system_setting(
                     key=data.get('key'),
                     value=data.get('value'),
                     value_type=data.get('type'),
@@ -976,16 +1022,25 @@ class WebApp:
         @self.socketio.on('activate_model')
         def handle_activate_model(data):
             """Modell aktiválása"""
+            if not session.get('admin'):
+                return
+            
             model_id = data.get('id')
             db = self.modules.get('database')
             if db:
                 db.set_active_model(model_id)
-                # Itt kellene a King-et is újratölteni
                 emit('model_activated', {'id': model_id})
         
         @self.socketio.on('control_module')
         def handle_control_module(data):
             """Modul vezérlése (admin)"""
+            if not session.get('admin'):
+                emit('module_control_result', {
+                    'success': False,
+                    'message': self._get_message('errors.unauthorized')
+                })
+                return
+            
             module_name = data.get('module')
             action = data.get('action')
             
@@ -993,7 +1048,7 @@ class WebApp:
             if not module:
                 emit('module_control_result', {
                     'success': False,
-                    'message': f'Module {module_name} not found'
+                    'message': self._get_message('errors.not_found', resource=f'Module {module_name}')
                 })
                 return
             
@@ -1039,12 +1094,21 @@ class WebApp:
             """Admin bejelentkezés"""
             password = data.get('password')
             if password == self.admin_password:
-                # Socket.IO session-be is elmentjük
+                session['admin'] = True
                 emit('admin_login_result', {'success': True})
-                # Küldünk egy eseményt, hogy admin státusz frissült
                 self._broadcast_status()
             else:
-                emit('admin_login_result', {'success': False, 'message': 'Hibás jelszó'})
+                emit('admin_login_result', {'success': False, 'message': self._get_message('errors.unauthorized')})
+        
+        @self.socketio.on('set_language')
+        def handle_set_language(data):
+            """Nyelv beállítása"""
+            lang = data.get('language')
+            if lang in ['en', 'hu']:
+                session['language'] = lang
+                if self.translator:
+                    self.translator.set_language(lang)
+                emit('language_changed', {'language': lang})
     
     # ------------------------------------------------------------------------
     # STÁTUSZ KEZELÉS
@@ -1091,8 +1155,7 @@ class WebApp:
                 'gpu': gpu_status,
                 'memory': {'percent': memory_percent},
                 'modules': module_statuses,
-                'clients': len(self.connected_clients),
-                'is_admin': session.get('admin', False)  # Ezt nem broadcastoljuk, csak az adott kliensnek
+                'clients': len(self.connected_clients)
             }
             
             self.socketio.emit('status_update', status)
