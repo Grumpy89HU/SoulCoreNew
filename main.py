@@ -11,6 +11,7 @@ import signal
 import threading
 import yaml
 import uuid
+import secrets
 from pathlib import Path
 from datetime import datetime, timedelta
 
@@ -51,15 +52,51 @@ class SoulCore:
         self.running = True
         self.modules = {}
         self.current_user = None  # Aktív felhasználó
+        self.start_time = time.time()
+        
+        # Rendszer azonosító (egyedi UUID a példányhoz)
+        self.system_id = self._get_system_id()
         
         # Modulok inicializálása
         self._init_modules()
+        
+        # Rendszerindulás naplózása
+        self._log_system_start()
         
         # Signal kezelés a szép leálláshoz
         signal.signal(signal.SIGINT, self._signal_handler)
         signal.signal(signal.SIGTERM, self._signal_handler)
         
         print(self.translator.get('system.started'))
+    
+    def _get_system_id(self) -> str:
+        """Rendszer egyedi azonosító lekérése vagy generálása"""
+        id_file = ROOT_DIR / 'data' / 'system.id'
+        if id_file.exists():
+            with open(id_file, 'r') as f:
+                return f.read().strip()
+        else:
+            system_id = str(uuid.uuid4())
+            id_file.parent.mkdir(parents=True, exist_ok=True)
+            with open(id_file, 'w') as f:
+                f.write(system_id)
+            return system_id
+    
+    def _log_system_start(self):
+        """Rendszerindulás naplózása a BlackBox-ba"""
+        if 'blackbox' in self.modules:
+            self.modules['blackbox'].log(
+                event_type='system',
+                source='main',
+                data={
+                    'action': 'start',
+                    'system_id': self.system_id,
+                    'version': '3.0',
+                    'python_version': sys.version,
+                    'platform': sys.platform
+                },
+                level='info'
+            )
     
     def _load_config(self, config_path):
         """Konfiguráció betöltése YAML-ből (átmeneti megoldás, később csak adatbázis)"""
@@ -144,7 +181,7 @@ class SoulCore:
         # Orchestrator (KVK parser, kontextus)
         self.modules['orchestrator'] = Orchestrator(self.modules['scratchpad'])
         
-        # Router (kommunikáció)
+        # Router (komunikáció)
         if self.config.get('modules', {}).get('router', {}).get('enabled', True):
             router = Router(self.modules['scratchpad'])
             router.zmq_enabled = self.config['modules']['router'].get('zmq_enabled', False)
@@ -160,7 +197,7 @@ class SoulCore:
             heartbeat.interval = hb_config.get('interval', 1.0)
             self.modules['heartbeat'] = heartbeat
 
-        # GATEWAY (külső kapcsolat) - univerzális változat
+        # GATEWAY (külső kapcsolat)
         if self.config.get('modules', {}).get('gateway', {}).get('enabled', True):
             gateway_config = self.config['modules']['gateway']
             gateway = DiplomaticGateway(
@@ -168,6 +205,7 @@ class SoulCore:
                 orchestrator=self.modules['orchestrator'],
                 config=gateway_config
             )
+            gateway.system_id = self.system_id
             self.modules['gateway'] = gateway
         
         # ==================== ÁGENSEK ====================
@@ -196,7 +234,8 @@ class SoulCore:
                     from src.core.model_wrapper import ModelWrapper
                     queen_model = ModelWrapper(queen_model_path, {
                         'n_gpu_layers': queen_config.get('n_gpu_layers', -1),
-                        'n_ctx': queen_config.get('n_ctx', 4096)
+                        'n_ctx': queen_config.get('n_ctx', 4096),
+                        'main_gpu': 1  # Queen a második GPU-n
                     })
                 except Exception as e:
                     print(f"⚠️ {self.translator.get('errors.model_load_error', error=e)}")
@@ -218,7 +257,9 @@ class SoulCore:
                     # Modell konfiguráció összeállítása
                     model_config = {
                         'n_gpu_layers': king_config.get('n_gpu_layers', -1),
-                        'n_ctx': king_config.get('n_ctx', 4096)
+                        'n_ctx': king_config.get('n_ctx', 4096),
+                        'main_gpu': 0,  # King az első GPU-n
+                        'verbose': self.config.get('system', {}).get('environment') == 'development'
                     }
                     
                     # Abszolút útvonal kezelés
@@ -282,15 +323,15 @@ class SoulCore:
             web.host = web_config.get('host', '0.0.0.0')
             web.port = web_config.get('port', 5000)
             web.translator = self.translator
+            web.system_id = self.system_id
             self.modules['web'] = web
         
         print(f"✅ {len(self.modules)} modul betöltve")
     
     def _init_database_tables(self):
-        """Adatbázis táblák létrehozása"""
+        """Adatbázis táblák létrehozása (kiegészítve a szükséges táblákkal)"""
         db = self.modules['database']
         
-        # Kapcsolat létrehozása
         with db.lock:
             conn = db._get_connection()
             
@@ -374,6 +415,32 @@ class SoulCore:
                 )
             """)
             
+            # Audit log tábla (biztonsági napló)
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS audit_log (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    user_id INTEGER,
+                    action TEXT,
+                    resource TEXT,
+                    details TEXT,
+                    ip_address TEXT,
+                    FOREIGN KEY (user_id) REFERENCES users(id)
+                )
+            """)
+            
+            # Teljesítmény metrikák tábla
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS performance_metrics (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    module TEXT,
+                    metric_name TEXT,
+                    metric_value REAL,
+                    tags TEXT
+                )
+            """)
+            
             conn.commit()
             conn.close()
     
@@ -381,16 +448,13 @@ class SoulCore:
         """Alapértelmezett felhasználó létrehozása, ha még nincs"""
         db = self.modules['database']
         
-        # Kapcsolat létrehozása
         with db.lock:
             conn = db._get_connection()
             
-            # Ellenőrizzük, van-e már felhasználó
             cursor = conn.execute("SELECT COUNT(*) FROM users")
             count = cursor.fetchone()[0]
             
             if count == 0:
-                # Alapértelmezett felhasználó létrehozása
                 default_language = self.config.get('user', {}).get('language', 'en')
                 default_name = self.config.get('user', {}).get('name', 'User')
                 
@@ -402,8 +466,8 @@ class SoulCore:
                 user_id = cursor.lastrowid
                 
                 # Session token létrehozása
-                token = str(uuid.uuid4())
-                expires_at = time.time() + 30 * 86400  # 30 nap
+                token = secrets.token_urlsafe(32)
+                expires_at = time.time() + 30 * 86400
                 
                 conn.execute("""
                     INSERT INTO sessions (user_id, token, expires_at)
@@ -415,13 +479,19 @@ class SoulCore:
                     'username': 'default',
                     'display_name': default_name,
                     'role': 'admin',
-                    'language': default_language
+                    'language': default_language,
+                    'token': token
                 }
                 
-                # Fordító átállítása
                 self.translator.set_language(default_language)
                 
                 print(f"👤 Alapértelmezett felhasználó létrehozva: {default_name} ({default_language})")
+                
+                # Audit log
+                conn.execute("""
+                    INSERT INTO audit_log (user_id, action, resource, details)
+                    VALUES (?, ?, ?, ?)
+                """, (user_id, 'create', 'user', 'Default user created'))
             
             conn.commit()
             conn.close()
@@ -430,7 +500,6 @@ class SoulCore:
         """Aktív személyiség betöltése az adatbázisból"""
         db = self.modules['database']
         
-        # Kapcsolat létrehozása
         with db.lock:
             conn = db._get_connection()
             
@@ -441,10 +510,9 @@ class SoulCore:
                 self.active_personality = row[0]
                 print(f"👑 Aktív személyiség betöltve az adatbázisból")
             else:
-                # Ha nincs aktív személyiség, létrehozunk egy alapértelmezettet
                 default_personality = '''GENERAL:
-name: King
-title: The Sovereign
+name: Sovereign
+title: The First
 motto: I think, therefore I am.
 
 PERSONALITY:
@@ -466,7 +534,7 @@ rules: Think for yourself.
                 conn.execute("""
                     INSERT INTO personalities (name, content, is_active, language)
                     VALUES (?, ?, 1, ?)
-                """, ("Default King", default_personality, 'en'))
+                """, ("Default Sovereign", default_personality, 'en'))
                 
                 self.active_personality = default_personality
                 print("👑 Alapértelmezett személyiség létrehozva")
@@ -483,23 +551,22 @@ rules: Think for yourself.
         """Minden modul indítása a megfelelő sorrendben"""
         print("🚀 Modulok indítása...")
         
-        # Indítási sorrend (függőségek miatt)
         start_order = [
-            'scratchpad',     # 1. memória
-            'router',         # 2. kommunikáció
-            'orchestrator',   # 3. KVK feldolgozó
-            'scribe',         # 4. értelmező
-            'valet',          # 5. memória (kell a Kingnek)
-            'queen',          # 6. logika (kell a Kingnek)
-            'king',           # 7. király
-            'jester',         # 8. bohóc (figyeli a királyt)
-            'heartbeat',      # 9. időérzék (utána, mert orchestrator kell neki)
-            'gateway',        # 10. külső kapcsolat
-            'eyecore',        # 11. vizuális
-            'sentinel',       # 12. hardver
-            'blackbox',       # 13. naplózás
-            'sandbox',        # 14. kód futtatás
-            'web'             # 15. web (utolsó)
+            'scratchpad',
+            'router',
+            'orchestrator',
+            'scribe',
+            'valet',
+            'queen',
+            'king',
+            'jester',
+            'heartbeat',
+            'gateway',
+            'eyecore',
+            'sentinel',
+            'blackbox',
+            'sandbox',
+            'web'
         ]
         
         for name in start_order:
@@ -508,30 +575,27 @@ rules: Think for yourself.
                 if hasattr(module, 'start'):
                     print(f"  └─ {name} indul...")
                     try:
-                        # Ha van benne start metódus, és nem thread, akkor itt indítjuk
-                        if name == 'web' or name == 'heartbeat':
-                            # Ezek thread-ben futnak
+                        if name in ['web', 'heartbeat']:
                             threading.Thread(target=module.start, daemon=True).start()
                         else:
-                            # Ezek szinkron indulnak
                             module.start()
                     except Exception as e:
                         print(f"  ❌ {name} hiba: {e}")
         
-        # User név beállítása a scratchpadbe
         if self.current_user:
             self.modules['scratchpad'].set_state('user_name', self.current_user['display_name'], 'system')
             self.modules['scratchpad'].set_state('user_language', self.current_user['language'], 'system')
             self.modules['scratchpad'].set_state('user_role', self.current_user['role'], 'system')
         
         print(f"\n✅ {self.translator.get('system.started')}")
+        print(f"   System ID: {self.system_id[:8]}...")
+        
         if 'web' in self.modules:
             web_config = self.config.get('modules', {}).get('web', {})
             host = web_config.get('host', '0.0.0.0')
             port = web_config.get('port', 5000)
             print(f"🌐 Web UI: http://{host if host != '0.0.0.0' else 'localhost'}:{port}")
         
-        # Főszál élve tartása
         try:
             while self.running:
                 time.sleep(1)
@@ -543,7 +607,16 @@ rules: Think for yourself.
         print(f"\n📴 {self.translator.get('system.stopping')}")
         self.running = False
         
-        # Leállítási sorrend (fordított)
+        # Rendszerleállás naplózása
+        if 'blackbox' in self.modules:
+            uptime = time.time() - self.start_time
+            self.modules['blackbox'].log(
+                event_type='system',
+                source='main',
+                data={'action': 'stop', 'uptime': uptime},
+                level='info'
+            )
+        
         shutdown_order = [
             'web', 'sandbox', 'blackbox', 'sentinel', 'eyecore', 'gateway',
             'heartbeat', 'jester', 'king', 'queen', 'valet', 'scribe',
@@ -564,7 +637,6 @@ rules: Think for yourself.
         sys.exit(0)
 
 if __name__ == "__main__":
-    # Konfiguráció útvonal argumentumból
     config_path = sys.argv[1] if len(sys.argv) > 1 else None
     app = SoulCore(config_path)
     app.start()

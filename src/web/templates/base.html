@@ -5,6 +5,10 @@
     <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=yes">
     <title>SoulCore 3.0 - {% block title %}{{ gettext('ui.dashboard') }}{% endblock %}</title>
     
+    <!-- Favicon -->
+    <link rel="icon" type="image/svg+xml" href="{{ url_for('static', filename='favicon.svg') }}">
+    <link rel="alternate icon" href="{{ url_for('static', filename='favicon.ico') }}">
+    
     <!-- CSS -->
     <link rel="stylesheet" href="{{ url_for('static', filename='css/main.css') }}">
     <link rel="stylesheet" href="{{ url_for('static', filename='css/layout.css') }}">
@@ -24,49 +28,189 @@
 </head>
 <body>
     <div id="app">
-		{% raw %}
-        <!-- Fejléc (most már itt van, nem külön include) -->
-        <div class="header">
-            <div class="title">
-                <span>✦</span> SOULCORE 3.0 <span>✦</span>
+        {% raw %}
+        <!-- ======================================================================== -->
+        <!-- ÉRTESÍTÉSEK -->
+        <!-- ======================================================================== -->
+        <div class="notifications-container">
+            <div v-for="notification in notifications" 
+                 :key="notification.id" 
+                 class="notification" 
+                 :class="notification.type"
+                 @click="removeNotification(notification.id)">
+                <span class="notification-icon">{{ getNotificationIcon(notification.type) }}</span>
+                <div class="notification-content">
+                    <div class="notification-title" v-if="notification.title">{{ notification.title }}</div>
+                    <div class="notification-message">{{ notification.message }}</div>
+                </div>
+                <button class="notification-close" @click.stop="removeNotification(notification.id)">✕</button>
             </div>
-            <div class="status-badge">
-                <div class="badge" :class="{'heartbeat': heartbeatRunning, 'paused': !heartbeatRunning}">
-                    <span>💓</span> <span v-text="formatUptime(heartbeat.uptime_seconds)"></span>
+        </div>
+        
+        <!-- ======================================================================== -->
+        <!-- MODÁLOK (közös) -->
+        <!-- ======================================================================== -->
+        
+        <!-- Bejelentkezés modal -->
+        <div class="modal" v-if="showLoginModal" @click.self="showLoginModal = false">
+            <div class="modal-content small">
+                <div class="modal-header">
+                    <h3>{{ gettext('admin.login') }}</h3>
+                    <button class="close-btn" @click="showLoginModal = false">✕</button>
                 </div>
-                <div class="badge" :class="kingState.status == 'ready' ? 'heartbeat' : 'paused'">
-                    <span>👑</span> <span v-text="kingState.status || '???'"></span>
+                <div class="modal-body">
+                    <div class="form-group">
+                        <label>{{ gettext('admin.password') }}</label>
+                        <input type="password" v-model="loginPassword" class="form-input" @keyup.enter="adminLogin">
+                    </div>
+                    <div v-if="loginError" class="login-error">{{ loginError }}</div>
                 </div>
-                <div class="badge">
-                    <select v-model="language" @change="changeLanguage" class="language-select">
-                        <option value="en">English</option>
-                        <option value="hu">Magyar</option>
-                    </select>
+                <div class="modal-footer">
+                    <button class="btn-secondary" @click="showLoginModal = false">{{ gettext('ui.cancel') }}</button>
+                    <button class="btn-primary" @click="adminLogin" :disabled="!loginPassword">
+                        {{ gettext('admin.login') }}
+                    </button>
                 </div>
+            </div>
+        </div>
+        
+        <!-- Megerősítő modal -->
+        <div class="modal" v-if="showConfirmModal" @click.self="showConfirmModal = false">
+            <div class="modal-content small">
+                <div class="modal-header">
+                    <h3>{{ confirmTitle }}</h3>
+                    <button class="close-btn" @click="showConfirmModal = false">✕</button>
+                </div>
+                <div class="modal-body">
+                    <p>{{ confirmMessage }}</p>
+                </div>
+                <div class="modal-footer">
+                    <button class="btn-secondary" @click="showConfirmModal = false">{{ gettext('ui.cancel') }}</button>
+                    <button class="btn-primary" @click="confirmAction">{{ gettext('ui.confirm') }}</button>
+                </div>
+            </div>
+        </div>
+        
+        <!-- Névjegy modal -->
+        <div class="modal" v-if="showAboutModal" @click.self="showAboutModal = false">
+            <div class="modal-content">
+                <div class="modal-header">
+                    <h3>{{ gettext('ui.about') }}</h3>
+                    <button class="close-btn" @click="showAboutModal = false">✕</button>
+                </div>
+                <div class="modal-body">
+                    <div class="about-content">
+                        <div class="about-logo">⚡</div>
+                        <h2>SoulCore 3.0</h2>
+                        <p class="about-version">{{ gettext('ui.version') }} 3.0.0</p>
+                        <p class="about-description">{{ gettext('ui.about_description') }}</p>
+                        <div class="about-links">
+                            <a href="https://soulcore.hu" target="_blank" rel="noopener">soulcore.hu</a>
+                            <a href="https://github.com/Grumpy89HU/SoulCoreNew" target="_blank" rel="noopener">GitHub</a>
+                        </div>
+                    </div>
+                </div>
+                <div class="modal-footer">
+                    <button class="btn-primary" @click="showAboutModal = false">{{ gettext('ui.close') }}</button>
+                </div>
+            </div>
+        </div>
+        
+        <!-- ======================================================================== -->
+        <!-- FEJLÉC -->
+        <!-- ======================================================================== -->
+        <div class="header">
+            <div class="header-left">
+                <button class="menu-toggle" @click="toggleMobileMenu" v-if="isMobile">
+                    <span>☰</span>
+                </button>
+                <div class="title">
+                    <span>✦</span> SOULCORE 3.0 <span>✦</span>
+                </div>
+            </div>
+            
+            <div class="header-right">
+                <div class="status-badge">
+                    <div class="badge" :class="{'heartbeat': heartbeatRunning, 'paused': !heartbeatRunning}">
+                        <span>💓</span>
+                        <span v-text="formatUptime(heartbeat.uptime_seconds)"></span>
+                    </div>
+                    <div class="badge" :class="kingState.status == 'ready' ? 'heartbeat' : 'paused'">
+                        <span>👑</span>
+                        <span v-text="kingState.status || '???'"></span>
+                    </div>
+                    <div class="badge">
+                        <select v-model="language" @change="changeLanguage" class="language-select">
+                            <option value="en">English</option>
+                            <option value="hu">Magyar</option>
+                            <option value="de">Deutsch</option>
+                            <option value="fr">Français</option>
+                        </select>
+                    </div>
+                </div>
+                
+                <div class="user-menu" v-if="isAdmin">
+                    <button class="user-menu-btn" @click="showUserMenu = !showUserMenu">
+                        👤 {{ userName }}
+                    </button>
+                    <div class="user-menu-dropdown" v-if="showUserMenu" v-click-outside="hideUserMenu">
+                        <a href="/admin" class="dropdown-item">⚙️ {{ gettext('admin.title') }}</a>
+                        <a href="#" @click.prevent="logout" class="dropdown-item">🚪 {{ gettext('ui.logout') }}</a>
+                    </div>
+                </div>
+                
+                <button class="icon-btn" @click="showAboutModal = true" title="{{ gettext('ui.about') }}">
+                    ℹ️
+                </button>
             </div>
         </div>
         {% endraw %}
         
-        <!-- Fő tartalom - EZ MÁR KÍVÜL VAN A raw BLOKKON -->
+        <!-- ======================================================================== -->
+        <!-- FŐ TARTALOM - EZ MARAD A raw BLOKKON KÍVÜL (Jinja2) -->
+        <!-- ======================================================================== -->
         <div class="main">
+            <!-- Panel toggle gombok (mobil) - ezek már raw blokkban vannak fent -->
+            <button class="panel-toggle left-toggle" @click="toggleLeftPanel" v-if="isMobile">
+                ◀
+            </button>
+            <button class="panel-toggle right-toggle" @click="toggleRightPanel" v-if="isMobile">
+                ▶
+            </button>
+            
             {% block content %}{% endblock %}
         </div>
         
         {% raw %}
-        <!-- Lábléc -->
+        <!-- ======================================================================== -->
+        <!-- LÁBLÉC -->
+        <!-- ======================================================================== -->
         <div class="footer">
-            <span>⚡ SoulCore 3.0</span>
-            <div class="connection-status">
-                <span class="status-dot" :class="{ connected: connected, disconnected: !connected }"></span>
-				<span v-if="connected" v-text="gettext('ui.connected')"></span>
-				<span v-else style="color: var(--error-color);" v-text="gettext('ui.disconnected')"></span>
+            <div class="footer-left">
+                <span class="version">v3.0.0</span>
+                <span class="system-id" v-if="systemId">ID: {{ systemId }}</span>
             </div>
-            <span v-text="currentTime"></span>
+            
+            <div class="footer-center">
+                <div class="connection-status">
+                    <span class="status-dot" :class="{ connected: connected, disconnected: !connected }"></span>
+                    <span v-if="connected" v-text="gettext('ui.connected')"></span>
+                    <span v-else style="color: var(--error-color);" v-text="gettext('ui.disconnected')"></span>
+                </div>
+            </div>
+            
+            <div class="footer-right">
+                <span v-text="currentTime"></span>
+            </div>
         </div>
-		{% endraw %}
+        {% endraw %}
     </div>
     
-    <!-- JavaScript modulok -->
+    <!-- ======================================================================== -->
+    <!-- JAVASCRIPT MODULOK (ezek kívül vannak a raw blokkon) -->
+    <!-- ======================================================================== -->
+    
+    <!-- Alap modulok -->
     <script src="{{ url_for('static', filename='js/api.js') }}"></script>
     <script src="{{ url_for('static', filename='js/store.js') }}"></script>
     <script src="{{ url_for('static', filename='js/socket.js') }}"></script>
@@ -78,13 +222,41 @@
     <script src="{{ url_for('static', filename='js/components/ModelSelector.js') }}"></script>
     <script src="{{ url_for('static', filename='js/components/PromptEditor.js') }}"></script>
     <script src="{{ url_for('static', filename='js/components/SettingsPanel.js') }}"></script>
+    <script src="{{ url_for('static', filename='js/components/PersonalityManager.js') }}"></script>
+    <script src="{{ url_for('static', filename='js/components/AuditLog.js') }}"></script>
+    <script src="{{ url_for('static', filename='js/components/SystemMetrics.js') }}"></script>
     <script src="{{ url_for('static', filename='js/components/ConversationList.js') }}"></script>
     <script src="{{ url_for('static', filename='js/components/ChatBox.js') }}"></script>
     <script src="{{ url_for('static', filename='js/components/TelemetryPanel.js') }}"></script>
     <script src="{{ url_for('static', filename='js/components/AdminPanel.js') }}"></script>
     
+    <!-- Egyéb Vue komponensek -->
+    <script src="{{ url_for('static', filename='js/components/UserMenu.js') }}"></script>
+    
     <!-- Fő alkalmazás -->
     <script src="{{ url_for('static', filename='js/main.js') }}"></script>
+    
+    <!-- Click outside direktíva -->
+    <script>
+        const vClickOutside = {
+            beforeMount: (el, binding) => {
+                el.clickOutsideEvent = (event) => {
+                    if (!(el === event.target || el.contains(event.target))) {
+                        binding.value(event);
+                    }
+                };
+                document.addEventListener('click', el.clickOutsideEvent);
+            },
+            unmounted: (el) => {
+                document.removeEventListener('click', el.clickOutsideEvent);
+            }
+        };
+        
+        // Direktíva regisztrálása
+        if (Vue) {
+            Vue.directive('click-outside', vClickOutside);
+        }
+    </script>
     
     {% block scripts %}{% endblock %}
 </body>

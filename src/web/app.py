@@ -11,6 +11,9 @@ Funkciók:
 - Beszélgetés előzmények
 - Többnyelvű támogatás (i18n)
 - Többszintű hozzáférési rendszer (admin, user)
+- Audit log
+- Teljesítmény metrikák
+- Rate limiting
 """
 
 import os
@@ -19,11 +22,14 @@ import json
 import threading
 import uuid
 import secrets
+import hashlib
 from pathlib import Path
 from datetime import datetime, timedelta
 from functools import wraps
+from collections import defaultdict
+from typing import Dict 
 
-from flask import Flask, render_template, send_from_directory, request, jsonify, session, g
+from flask import Flask, render_template, send_from_directory, request, jsonify, session, g, redirect, url_for
 from flask_socketio import SocketIO, emit, join_room, leave_room
 
 # i18n import
@@ -46,11 +52,13 @@ class WebApp:
     - REST API az adatbázishoz
     - Admin felület
     - Többnyelvű támogatás
+    - Rate limiting és biztonság
     """
     
     def __init__(self, modules):
         self.modules = modules  # az összes modul (orchestrator, king, stb)
         self.name = "web"
+        self.system_id = getattr(self.modules.get('main', None), 'system_id', 'unknown')
         
         # Flask app
         self.app = Flask(__name__, 
@@ -78,6 +86,14 @@ class WebApp:
         # Admin jelszó (környezeti változóból vagy alapértelmezett)
         self.admin_password = os.environ.get('ADMIN_PASSWORD', 'soulcore2026')
         
+        # Rate limiting
+        self.rate_limits = defaultdict(list)  # IP -> [timestampek]
+        self.rate_limit_requests = 100  # Maximum 100 kérés
+        self.rate_limit_window = 60  # 60 másodperc alatt
+        
+        # Session timeout
+        self.session_timeout = 30 * 60  # 30 perc
+        
         # Nyelv beállítása kérésenként
         self._setup_before_request()
         
@@ -90,10 +106,36 @@ class WebApp:
         print("🌐 Web: Ablak nyílik.")
     
     def _setup_before_request(self):
-        """Kérés előtti nyelvbeállítás"""
+        """Kérés előtti nyelvbeállítás és rate limiting"""
         @self.app.before_request
         def before_request():
-            # Nyelv beállítása a session-ből vagy header-ből
+            # Rate limiting
+            client_ip = request.remote_addr
+            now = time.time()
+            
+            # Régi bejegyzések törlése
+            self.rate_limits[client_ip] = [
+                t for t in self.rate_limits[client_ip]
+                if now - t < self.rate_limit_window
+            ]
+            
+            # Limit ellenőrzés
+            if len(self.rate_limits[client_ip]) >= self.rate_limit_requests:
+                return jsonify({
+                    'error': 'Rate limit exceeded. Please slow down.'
+                }), 429
+            
+            self.rate_limits[client_ip].append(now)
+            
+            # Session timeout ellenőrzés
+            if session.get('user_id'):
+                last_active = session.get('last_active', 0)
+                if now - last_active > self.session_timeout:
+                    session.clear()
+                else:
+                    session['last_active'] = now
+            
+            # Nyelv beállítása
             lang = session.get('language', request.headers.get('Accept-Language', 'en')[:2])
             if lang not in ['en', 'hu']:
                 lang = 'en'
@@ -106,6 +148,46 @@ class WebApp:
         if self.translator and I18N_AVAILABLE:
             return self.translator.get(key, **kwargs)
         return key
+    
+    def _audit_log(self, action: str, resource: str = None, details: Dict = None):
+        """Audit log bejegyzés"""
+        try:
+            db = self.modules.get('database')
+            if db:
+                with db.lock:
+                    conn = db._get_connection()
+                    conn.execute("""
+                        INSERT INTO audit_log (user_id, action, resource, details, ip_address)
+                        VALUES (?, ?, ?, ?, ?)
+                    """, (
+                        session.get('user_id'),
+                        action,
+                        resource,
+                        json.dumps(details) if details else None,
+                        request.remote_addr
+                    ))
+                    conn.commit()
+                    conn.close()
+        except Exception as e:
+            print(f"🌐 Web: Audit log hiba: {e}")
+    
+    def _login_required(self, f):
+        """Dekorátor a bejelentkezés ellenőrzéséhez"""
+        @wraps(f)
+        def decorated_function(*args, **kwargs):
+            if not session.get('user_id'):
+                return jsonify({'error': self._get_message('errors.unauthorized')}), 401
+            return f(*args, **kwargs)
+        return decorated_function
+    
+    def _admin_required(self, f):
+        """Dekorátor az admin jogosultság ellenőrzéséhez"""
+        @wraps(f)
+        def decorated_function(*args, **kwargs):
+            if not session.get('admin'):
+                return jsonify({'error': self._get_message('errors.unauthorized')}), 403
+            return f(*args, **kwargs)
+        return decorated_function
     
     # ------------------------------------------------------------------------
     # ROUTES - REST API
@@ -124,10 +206,9 @@ class WebApp:
                                   gettext=self._get_message)
         
         @self.app.route('/admin')
+        @self._admin_required
         def admin_panel():
             """Admin panel (külön oldal)"""
-            if not session.get('admin'):
-                return redirect(url_for('login'))
             return render_template('admin.html', language=g.get('language', 'en'))
         
         @self.app.route('/login', methods=['GET', 'POST'])
@@ -142,14 +223,18 @@ class WebApp:
             if password == self.admin_password:
                 session['admin'] = True
                 session['login_time'] = time.time()
+                session['user_id'] = 1  # Alapértelmezett user ID
+                self._audit_log('login', 'user', {'method': 'password'})
                 return {'success': True, 'message': self._get_message('ui.login_success')}
             
+            self._audit_log('login_failed', 'user', {'ip': request.remote_addr})
             return {'success': False, 'message': self._get_message('errors.unauthorized')}, 401
         
         @self.app.route('/logout', methods=['POST'])
         def logout():
             """Kijelentkezés"""
-            session.pop('admin', None)
+            self._audit_log('logout', 'user', {'user_id': session.get('user_id')})
+            session.clear()
             return {'success': True, 'message': self._get_message('ui.logout_success')}
         
         @self.app.route('/api/session')
@@ -158,6 +243,7 @@ class WebApp:
             return {
                 'is_admin': session.get('admin', False),
                 'login_time': session.get('login_time'),
+                'user_id': session.get('user_id'),
                 'language': g.get('language', 'en')
             }
         
@@ -178,13 +264,16 @@ class WebApp:
         @self.app.route('/api/status')
         def status():
             """Rendszer státusz (REST)"""
+            heartbeat = self.modules.get('heartbeat', {})
             return {
                 'status': 'running',
                 'modules': list(self.modules.keys()),
                 'time': time.time(),
-                'uptime': self.modules.get('heartbeat', {}).get_state().get('uptime_seconds', 0),
+                'uptime': heartbeat.get_state().get('uptime_seconds', 0) if heartbeat else 0,
                 'version': '3.0',
-                'name': 'SoulCore'
+                'name': 'SoulCore',
+                'system_id': self.system_id[:8] if self.system_id else 'unknown',
+                'clients': len(self.connected_clients)
             }
         
         @self.app.route('/api/king/state')
@@ -194,6 +283,14 @@ class WebApp:
             if king:
                 return king.get_state()
             return {'error': self._get_message('errors.model_not_loaded')}, 404
+        
+        @self.app.route('/api/king/metrics')
+        def king_metrics():
+            """Király metrikák"""
+            king = self.modules.get('king')
+            if king and hasattr(king, 'get_metrics'):
+                return king.get_metrics()
+            return {'error': 'King metrics not available'}, 404
         
         @self.app.route('/api/jester/diagnosis')
         def jester_diagnosis():
@@ -211,7 +308,8 @@ class WebApp:
                 return {
                     'gpus': sentinel.get_gpu_status(),
                     'slots': sentinel.get_slots(),
-                    'state': sentinel.get_state()
+                    'state': sentinel.get_state(),
+                    'throttle_factor': sentinel.get_throttle_factor()
                 }
             return {'error': 'Sentinel not available'}, 404
         
@@ -231,9 +329,33 @@ class WebApp:
                 return {'trace': blackbox.get_trace(trace_id)}
             return {'error': 'BlackBox not available'}, 404
         
+        @self.app.route('/api/blackbox/search')
+        def blackbox_search():
+            """Keresés a naplókban"""
+            blackbox = self.modules.get('blackbox')
+            if not blackbox:
+                return {'error': 'BlackBox not available'}, 404
+            
+            query = request.args.get('q', '')
+            limit = request.args.get('limit', 50, type=int)
+            
+            # Összes esemény lekérése (nincs limit paraméter)
+            all_events = blackbox.replay()  # <-- nincs limit paraméter
+            
+            # Keresés a szövegben
+            results = []
+            for e in all_events:
+                if query.lower() in str(e.get('content', '')).lower():
+                    results.append(e)
+                if len(results) >= limit:
+                    break
+            
+            return {'results': results}
+        
         # --- BESZÉLGETÉSEK API ---
         
         @self.app.route('/api/conversations', methods=['GET'])
+        @self._login_required
         def get_conversations():
             """Beszélgetések listázása"""
             db = self.modules.get('database')
@@ -243,12 +365,12 @@ class WebApp:
             limit = request.args.get('limit', 50, type=int)
             offset = request.args.get('offset', 0, type=int)
             
-            # Felhasználó szerinti szűrés (ha van user_id a session-ben)
             user_id = session.get('user_id')
             convs = db.get_conversations(limit=limit, offset=offset, user_id=user_id)
             return {'conversations': convs, 'total': len(convs)}
         
         @self.app.route('/api/conversations', methods=['POST'])
+        @self._login_required
         def create_conversation():
             """Új beszélgetés létrehozása"""
             db = self.modules.get('database')
@@ -266,9 +388,11 @@ class WebApp:
                 user_id=user_id
             )
             
+            self._audit_log('create_conversation', 'conversation', {'id': conv_id})
             return {'id': conv_id, 'success': True}
         
         @self.app.route('/api/conversations/<int:conv_id>', methods=['GET'])
+        @self._login_required
         def get_conversation(conv_id):
             """Egy beszélgetés adatai"""
             db = self.modules.get('database')
@@ -279,9 +403,14 @@ class WebApp:
             if not conv:
                 return {'error': self._get_message('errors.not_found', resource='Conversation')}, 404
             
+            # Ellenőrizzük, hogy a felhasználó tulajdona-e
+            if conv.get('user_id') != session.get('user_id') and not session.get('admin'):
+                return {'error': self._get_message('errors.unauthorized')}, 403
+            
             return conv
         
         @self.app.route('/api/conversations/<int:conv_id>', methods=['PUT'])
+        @self._login_required
         def update_conversation(conv_id):
             """Beszélgetés frissítése"""
             db = self.modules.get('database')
@@ -290,23 +419,23 @@ class WebApp:
             
             data = request.get_json() or {}
             db.update_conversation(conv_id, **data)
+            self._audit_log('update_conversation', 'conversation', {'id': conv_id})
             return {'success': True}
         
         @self.app.route('/api/conversations/<int:conv_id>', methods=['DELETE'])
+        @self._admin_required
         def delete_conversation(conv_id):
             """Beszélgetés törlése"""
             db = self.modules.get('database')
             if not db:
                 return {'error': 'Database not available'}, 500
             
-            # Csak admin törölhet
-            if not session.get('admin'):
-                return {'error': self._get_message('errors.unauthorized')}, 403
-            
             db.delete_conversation(conv_id)
+            self._audit_log('delete_conversation', 'conversation', {'id': conv_id})
             return {'success': True}
         
         @self.app.route('/api/conversations/<int:conv_id>/messages', methods=['GET'])
+        @self._login_required
         def get_messages(conv_id):
             """Üzenetek lekérése"""
             db = self.modules.get('database')
@@ -318,7 +447,6 @@ class WebApp:
             
             messages = db.get_messages(conv_id, limit=limit)
             
-            # Ha van before, csak az az előtti üzenetek
             if before:
                 messages = [m for m in messages if m['timestamp'] < before]
                 messages = messages[-limit:]
@@ -326,6 +454,7 @@ class WebApp:
             return {'messages': messages, 'count': len(messages)}
         
         @self.app.route('/api/conversations/<int:conv_id>/messages', methods=['POST'])
+        @self._login_required
         def add_message(conv_id):
             """Üzenet hozzáadása"""
             db = self.modules.get('database')
@@ -344,6 +473,7 @@ class WebApp:
             return {'id': msg_id, 'success': True}
         
         @self.app.route('/api/conversations/<int:conv_id>/export', methods=['GET'])
+        @self._login_required
         def export_conversation(conv_id):
             """Beszélgetés exportálása"""
             db = self.modules.get('database')
@@ -362,7 +492,6 @@ class WebApp:
                     'exported_at': time.time()
                 }
             elif format == 'txt':
-                # Egyszerű szöveges export
                 lines = [f"Conversation: {conv['title']}"]
                 lines.append(f"Date: {conv['created_at']}")
                 lines.append("=" * 50)
@@ -390,6 +519,7 @@ class WebApp:
             return {'prompts': prompts}
         
         @self.app.route('/api/prompts', methods=['POST'])
+        @self._admin_required
         def save_prompt():
             """Prompt mentése"""
             db = self.modules.get('database')
@@ -397,10 +527,6 @@ class WebApp:
                 return {'error': 'Database not available'}, 500
             
             data = request.get_json() or {}
-            
-            # Csak admin szerkeszthet
-            if not session.get('admin'):
-                return {'error': self._get_message('errors.unauthorized')}, 403
             
             prompt_id = db.save_prompt(
                 name=data.get('name'),
@@ -410,6 +536,7 @@ class WebApp:
                 is_default=data.get('is_default', False)
             )
             
+            self._audit_log('save_prompt', 'prompt', {'id': prompt_id})
             return {'id': prompt_id, 'success': True}
         
         @self.app.route('/api/prompts/<int:prompt_id>', methods=['GET'])
@@ -426,18 +553,16 @@ class WebApp:
             return prompt
         
         @self.app.route('/api/prompts/<int:prompt_id>', methods=['DELETE'])
+        @self._admin_required
         def delete_prompt(prompt_id):
             """Prompt törlése"""
             db = self.modules.get('database')
             if not db:
                 return {'error': 'Database not available'}, 500
             
-            # Csak admin törölhet
-            if not session.get('admin'):
-                return {'error': self._get_message('errors.unauthorized')}, 403
-            
             try:
                 db.delete_prompt(prompt_id)
+                self._audit_log('delete_prompt', 'prompt', {'id': prompt_id})
                 return {'success': True}
             except ValueError as e:
                 return {'error': str(e)}, 400
@@ -453,14 +578,12 @@ class WebApp:
             return {'personalities': db.get_personalities()}
         
         @self.app.route('/api/personalities', methods=['POST'])
+        @self._admin_required
         def create_personality():
             """Új személyiség létrehozása"""
             db = self.modules.get('database')
             if not db:
                 return {'error': 'Database not available'}, 500
-            
-            if not session.get('admin'):
-                return {'error': self._get_message('errors.unauthorized')}, 403
             
             data = request.get_json() or {}
             pers_id = db.save_personality(
@@ -468,19 +591,20 @@ class WebApp:
                 content=data.get('content'),
                 activate=data.get('activate', False)
             )
+            
+            self._audit_log('create_personality', 'personality', {'id': pers_id})
             return {'id': pers_id, 'success': True}
         
         @self.app.route('/api/personalities/<int:pers_id>/activate', methods=['POST'])
+        @self._admin_required
         def activate_personality(pers_id):
             """Személyiség aktiválása"""
             db = self.modules.get('database')
             if not db:
                 return {'error': 'Database not available'}, 500
             
-            if not session.get('admin'):
-                return {'error': self._get_message('errors.unauthorized')}, 403
-            
             db.activate_personality(pers_id)
+            self._audit_log('activate_personality', 'personality', {'id': pers_id})
             return {'success': True}
         
         # --- BEÁLLÍTÁSOK API ---
@@ -507,15 +631,12 @@ class WebApp:
             return {'key': key, 'value': value}
         
         @self.app.route('/api/settings/<key>', methods=['POST', 'PUT'])
+        @self._admin_required
         def set_setting(key):
             """Beállítás módosítása"""
             db = self.modules.get('database')
             if not db:
                 return {'error': 'Database not available'}, 500
-            
-            # Csak admin módosíthat
-            if not session.get('admin'):
-                return {'error': self._get_message('errors.unauthorized')}, 403
             
             data = request.get_json() or {}
             db.set_system_setting(
@@ -526,6 +647,7 @@ class WebApp:
                 description=data.get('description', '')
             )
             
+            self._audit_log('update_setting', 'setting', {'key': key})
             return {'success': True}
         
         # --- MODELLEK API ---
@@ -540,7 +662,6 @@ class WebApp:
             active_only = request.args.get('active_only', 'true').lower() == 'true'
             models = db.get_models(active_only=active_only)
             
-            # Aktuális modell lekérése a King-től
             king = self.modules.get('king')
             current_model = None
             if king and hasattr(king, 'model') and king.model:
@@ -552,23 +673,19 @@ class WebApp:
             }
         
         @self.app.route('/api/models', methods=['POST'])
+        @self._admin_required
         def add_model():
             """Modell hozzáadása"""
             db = self.modules.get('database')
             if not db:
                 return {'error': 'Database not available'}, 500
             
-            if not session.get('admin'):
-                return {'error': self._get_message('errors.unauthorized')}, 403
-            
             data = request.get_json() or {}
             
-            # Ellenőrizzük, hogy létezik-e a fájl
             model_path = data.get('path')
             if not os.path.exists(model_path):
                 return {'error': self._get_message('errors.file_not_found', path=model_path)}, 400
             
-            # Fájlméret lekérése
             size = os.path.getsize(model_path)
             size_str = f"{size / 1024 / 1024 / 1024:.1f} GB" if size > 1024**3 else f"{size / 1024 / 1024:.1f} MB"
             
@@ -582,56 +699,54 @@ class WebApp:
                 description=data.get('description', '')
             )
             
+            self._audit_log('add_model', 'model', {'id': model_id})
             return {'id': model_id, 'success': True}
         
         @self.app.route('/api/models/<int:model_id>/activate', methods=['POST'])
+        @self._admin_required
         def activate_model(model_id):
             """Aktív modell beállítása"""
             db = self.modules.get('database')
             if not db:
                 return {'error': 'Database not available'}, 500
             
-            if not session.get('admin'):
-                return {'error': self._get_message('errors.unauthorized')}, 403
-            
-            # Modell lekérése
             model = db.get_model(model_id=model_id)
             if not model:
                 return {'error': self._get_message('errors.not_found', resource='Model')}, 404
             
             db.set_active_model(model_id)
+            self._audit_log('activate_model', 'model', {'id': model_id})
             return {'success': True, 'model': model['name']}
         
         @self.app.route('/api/models/<int:model_id>', methods=['DELETE'])
+        @self._admin_required
         def delete_model(model_id):
             """Modell törlése"""
             db = self.modules.get('database')
             if not db:
                 return {'error': 'Database not available'}, 500
             
-            if not session.get('admin'):
-                return {'error': self._get_message('errors.unauthorized')}, 403
-            
             db.delete_model(model_id)
+            self._audit_log('delete_model', 'model', {'id': model_id})
             return {'success': True}
         
         # --- MODUL VEZÉRLÉS (ADMIN) ---
         
         @self.app.route('/api/modules/<module_name>/<action>', methods=['POST'])
+        @self._admin_required
         def control_module(module_name, action):
             """Modul vezérlése (start/stop/restart)"""
-            if not session.get('admin'):
-                return {'error': self._get_message('errors.unauthorized')}, 403
-            
             module = self.modules.get(module_name)
             if not module:
                 return {'error': self._get_message('errors.not_found', resource=f'Module {module_name}')}, 404
             
             if action == 'start' and hasattr(module, 'start'):
                 module.start()
+                self._audit_log('module_start', 'module', {'name': module_name})
                 return {'success': True, 'message': f'{module_name} started'}
             elif action == 'stop' and hasattr(module, 'stop'):
                 module.stop()
+                self._audit_log('module_stop', 'module', {'name': module_name})
                 return {'success': True, 'message': f'{module_name} stopped'}
             elif action == 'restart':
                 if hasattr(module, 'stop'):
@@ -639,6 +754,7 @@ class WebApp:
                 time.sleep(1)
                 if hasattr(module, 'start'):
                     module.start()
+                self._audit_log('module_restart', 'module', {'name': module_name})
                 return {'success': True, 'message': f'{module_name} restarted'}
             
             return {'error': f'Action {action} not supported'}, 400
@@ -646,6 +762,7 @@ class WebApp:
         # --- KÉP FELTÖLTÉS (EYE-CORE) ---
         
         @self.app.route('/api/vision/process', methods=['POST'])
+        @self._login_required
         def process_image():
             """Kép feldolgozása"""
             eye = self.modules.get('eyecore')
@@ -665,11 +782,9 @@ class WebApp:
         # --- TOOL/SANDBOX ---
         
         @self.app.route('/api/tools/execute', methods=['POST'])
+        @self._admin_required
         def execute_code():
             """Kód futtatása sandboxban"""
-            if not session.get('admin'):
-                return {'error': self._get_message('errors.unauthorized')}, 403
-            
             sandbox = self.modules.get('sandbox')
             if not sandbox:
                 return {'error': 'Sandbox not available'}, 404
@@ -682,16 +797,74 @@ class WebApp:
                 return {'error': self._get_message('errors.missing_parameter', param='code')}, 400
             
             result = sandbox.execute_for_king(code, context)
+            self._audit_log('execute_code', 'sandbox', {'code_length': len(code)})
             return {'result': result}
         
-        # --- EGÉSZSÉGÜGYI ELLENŐRZÉS (HEALTH CHECK) ---
+        # --- AUDIT LOG API ---
+        
+        @self.app.route('/api/audit', methods=['GET'])
+        @self._admin_required
+        def get_audit_log():
+            """Audit log lekérése"""
+            db = self.modules.get('database')
+            if not db:
+                return {'error': 'Database not available'}, 500
+            
+            limit = request.args.get('limit', 100, type=int)
+            
+            with db.lock:
+                conn = db._get_connection()
+                cursor = conn.execute("""
+                    SELECT * FROM audit_log 
+                    ORDER BY timestamp DESC 
+                    LIMIT ?
+                """, (limit,))
+                logs = [dict(row) for row in cursor.fetchall()]
+                conn.close()
+            
+            return {'audit_log': logs}
+        
+        # --- PERFORMANCE METRICS API ---
+        
+        @self.app.route('/api/metrics', methods=['GET'])
+        @self._admin_required
+        def get_metrics():
+            """Teljesítmény metrikák lekérése"""
+            db = self.modules.get('database')
+            if not db:
+                return {'error': 'Database not available'}, 500
+            
+            period = request.args.get('period', 'hour')
+            now = time.time()
+            
+            if period == 'hour':
+                since = now - 3600
+            elif period == 'day':
+                since = now - 86400
+            elif period == 'week':
+                since = now - 604800
+            else:
+                since = now - 3600
+            
+            with db.lock:
+                conn = db._get_connection()
+                cursor = conn.execute("""
+                    SELECT * FROM performance_metrics 
+                    WHERE timestamp > ? 
+                    ORDER BY timestamp DESC
+                """, (since,))
+                metrics = [dict(row) for row in cursor.fetchall()]
+                conn.close()
+            
+            return {'metrics': metrics, 'period': period}
+        
+        # --- EGÉSZSÉGÜGYI ELLENŐRZÉS ---
         
         @self.app.route('/health')
         def health_check():
             """Egészségügyi ellenőrzés (monitoring)"""
             status = {'status': 'healthy', 'timestamp': time.time()}
             
-            # Modulok ellenőrzése
             for name, module in self.modules.items():
                 if hasattr(module, 'get_state'):
                     try:
@@ -702,7 +875,7 @@ class WebApp:
             
             return status
         
-        # --- STATikus FÁJLOK ---
+        # --- STATIKUS FÁJLOK ---
         
         @self.app.route('/static/<path:filename>')
         def static_files(filename):
@@ -735,7 +908,6 @@ class WebApp:
                 'language': session.get('language', 'en')
             })
             
-            # Küldjük a jelenlegi állapotot
             self._broadcast_status()
         
         @self.socketio.on('disconnect')
@@ -758,33 +930,26 @@ class WebApp:
             
             print(f"🌐 Web: User üzenet ({client_id[:8]}...): {text[:50]}...")
             
-            # 1. KVK csomag készítése
             user_name = self.modules.get('scratchpad', {}).get_state('user_name', 'User')
             kvk = f"INTENT:UNKNOWN|USER:{user_name}|MESSAGE:{text}"
             
-            # 2. Orchestrator feldolgozása
             orch = self.modules.get('orchestrator')
             if orch:
                 state = orch.process_raw_packet(kvk)
                 if state and isinstance(state, dict) and 'trace_id' in state:
-                    # 3. Heartbeat értesítése (interakció történt)
                     hb = self.modules.get('heartbeat')
                     if hb:
                         hb.register_interaction()
                     
-                    # 4. Mentés adatbázisba (ha van konverzió)
                     if conv_id:
                         db = self.modules.get('database')
                         if db:
                             db.add_message(conv_id, 'user', text)
                     
-                    # 5. King válaszának kérése
                     king = self.modules.get('king')
                     if king:
-                        # Kontextus építés
                         model_input = orch.build_model_input(state)
                         
-                        # Intent csomag a Kingnek
                         intent_packet = {
                             'header': {
                                 'trace_id': state['trace_id'],
@@ -793,7 +958,7 @@ class WebApp:
                             },
                             'payload': {
                                 'intent': {
-                                    'class': state.get('packet', {}).get('INTENT', 'unknown'),  # <-- JAVÍTVA: state.get('packet', {})
+                                    'class': state.get('packet', {}).get('INTENT', 'unknown'),
                                     'target': 'king'
                                 },
                                 'entities': [],
@@ -801,27 +966,23 @@ class WebApp:
                             }
                         }
                         
-                        # King feldolgozás
                         response = king.process(intent_packet)
                         
                         if response:
                             response_text = response.get('payload', {}).get('response', '')
                             
-                            # Válasz vissza a kliensnek
                             emit('king_response', {
                                 'response': response_text,
                                 'trace_id': state['trace_id'],
                                 'mood': king.get_mood() if hasattr(king, 'get_mood') else 'neutral'
                             })
                             
-                            # Mentés adatbázisba
                             if conv_id:
                                 db = self.modules.get('database')
                                 if db:
                                     tokens = response.get('state', {}).get('tokens_used', 0)
                                     db.add_message(conv_id, 'assistant', response_text, tokens)
                             
-                            # Jester ellenőrzés
                             jester = self.modules.get('jester')
                             if jester and hasattr(jester, 'check_king'):
                                 report = jester.check_king(king.get_state())
@@ -830,10 +991,9 @@ class WebApp:
                                         'note': report.get('payload', {}).get('summary', '')
                                     })
                 else:
-                    # Hibás state objektum
                     print(f"🌐 Web: Hibás orchestrator válasz: {state}")
                     emit('king_response', {
-                        'response': "Hiba történt az üzenet feldolgozása közben.",
+                        'response': self._get_message('errors.processing_error'),
                         'trace_id': None,
                         'mood': 'error'
                     })
@@ -871,13 +1031,11 @@ class WebApp:
             """Teljes kezdeti állapot lekérése"""
             client_id = request.sid
             
-            # Utolsó néhány üzenet a BlackBox-ból
             blackbox = self.modules.get('blackbox')
             recent = []
             if blackbox:
                 recent = blackbox.get_conversation(limit=20)
             
-            # Felhasználónév
             user_name = self.modules.get('scratchpad', {}).get_state('user_name', 'User')
             user_language = self.modules.get('scratchpad', {}).get_state('user_language', 'en')
             
@@ -914,7 +1072,6 @@ class WebApp:
                 )
                 emit('conversation_created', {'id': conv_id})
                 
-                # Frissítjük a listát
                 convs = db.get_conversations(limit=50, user_id=user_id)
                 self.socketio.emit('conversations_list', {'conversations': convs})
         
@@ -954,7 +1111,6 @@ class WebApp:
             
             if db and conv_id:
                 db.delete_conversation(conv_id)
-                # Frissítjük a listát
                 user_id = session.get('user_id')
                 convs = db.get_conversations(limit=50, user_id=user_id)
                 emit('conversations_list', {'conversations': convs})
@@ -983,7 +1139,6 @@ class WebApp:
                     is_default=data.get('is_default', False)
                 )
                 emit('prompt_saved', {'id': prompt_id})
-                # Frissítjük a listát
                 handle_get_prompts()
         
         @self.socketio.on('get_settings')
@@ -1008,7 +1163,6 @@ class WebApp:
                     value_type=data.get('type'),
                     category=data.get('category', 'general')
                 )
-                # Visszaküldjük a frissített beállításokat
                 handle_get_settings()
         
         @self.socketio.on('get_models')
@@ -1055,38 +1209,22 @@ class WebApp:
             try:
                 if action == 'start' and hasattr(module, 'start'):
                     module.start()
-                    emit('module_control_result', {
-                        'success': True,
-                        'message': f'{module_name} started'
-                    })
+                    emit('module_control_result', {'success': True, 'message': f'{module_name} started'})
                 elif action == 'stop' and hasattr(module, 'stop'):
                     module.stop()
-                    emit('module_control_result', {
-                        'success': True,
-                        'message': f'{module_name} stopped'
-                    })
+                    emit('module_control_result', {'success': True, 'message': f'{module_name} stopped'})
                 elif action == 'restart':
                     if hasattr(module, 'stop'):
                         module.stop()
                     time.sleep(1)
                     if hasattr(module, 'start'):
                         module.start()
-                    emit('module_control_result', {
-                        'success': True,
-                        'message': f'{module_name} restarted'
-                    })
+                    emit('module_control_result', {'success': True, 'message': f'{module_name} restarted'})
                 else:
-                    emit('module_control_result', {
-                        'success': False,
-                        'message': f'Action {action} not supported'
-                    })
+                    emit('module_control_result', {'success': False, 'message': f'Action {action} not supported'})
             except Exception as e:
-                emit('module_control_result', {
-                    'success': False,
-                    'message': str(e)
-                })
+                emit('module_control_result', {'success': False, 'message': str(e)})
             
-            # Státusz frissítés
             self._broadcast_status()
         
         @self.socketio.on('admin_login')
@@ -1095,7 +1233,9 @@ class WebApp:
             password = data.get('password')
             if password == self.admin_password:
                 session['admin'] = True
+                session['user_id'] = 1
                 emit('admin_login_result', {'success': True})
+                self._audit_log('socket_admin_login', 'user', {'method': 'socket'})
                 self._broadcast_status()
             else:
                 emit('admin_login_result', {'success': False, 'message': self._get_message('errors.unauthorized')})
@@ -1117,26 +1257,21 @@ class WebApp:
     def _broadcast_status(self):
         """Rendszer státusz broadcastolása minden kliensnek"""
         try:
-            # GPU státusz
             sentinel = self.modules.get('sentinel')
             gpu_status = sentinel.get_gpu_status() if sentinel else []
             
-            # King státusz
             king = self.modules.get('king')
             king_state = king.get_state() if king else {}
             
-            # Heartbeat
             hb = self.modules.get('heartbeat')
             hb_state = hb.get_state() if hb else {}
             
-            # Memória használat (scratchpad)
             sp = self.modules.get('scratchpad')
             memory_percent = 0
             if sp:
                 summary = sp.get_summary()
                 memory_percent = min(100, (summary.get('entry_count', 0) / 1000) * 100)
             
-            # Modul státuszok
             module_statuses = {}
             for name, module in self.modules.items():
                 if hasattr(module, 'get_state'):
@@ -1185,13 +1320,10 @@ class WebApp:
     def stop(self):
         """Web szerver leállítása"""
         self.running = False
-        # Flask leállítása nem triviális, de daemon threadként fut
         if self.scratchpad:
             self.scratchpad.set_state('web_status', 'stopped', self.name)
         
-        # Socket.IO leállítása
         self.socketio.stop()
-        
         print("🌐 Web: Ablak becsukódik.")
     
     # ------------------------------------------------------------------------

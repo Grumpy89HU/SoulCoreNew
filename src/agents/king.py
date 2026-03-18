@@ -8,7 +8,9 @@ import time
 import json
 import threading
 import random
-from typing import Dict, Any, Optional
+import hashlib
+from typing import Dict, Any, Optional, List
+from collections import deque
 
 # i18n import (opcionális)
 try:
@@ -28,6 +30,15 @@ class King:
     - A Jester figyeli az állapotát
     - Identitását a scratchpadből kapja (oda a main tölti)
     """
+    
+    # Prompt verziók (különböző stílusokhoz)
+    PROMPT_STYLES = {
+        'default': 0,
+        'concise': 1,    # Rövid, tömör
+        'detailed': 2,   # Részletes, magyarázó
+        'poetic': 3,     # Költői, metaforikus
+        'technical': 4   # Technikai, precíz
+    }
     
     def __init__(self, scratchpad, model_wrapper=None):
         self.scratchpad = scratchpad
@@ -50,14 +61,36 @@ class King:
             'average_response_time': 0,
             'errors': [],
             'current_task': None,
-            'model_loaded': False
+            'model_loaded': False,
+            'total_tokens_generated': 0,
+            'total_processing_time': 0,
+            'last_mood': 'neutral'
         }
         
         # Identitás (scratchpadből jön)
         self.identity = {
             'name': 'King',
             'title': 'The Sovereign',
-            'personality': 'wise, curious, sovereign'
+            'personality': 'wise, curious, sovereign',
+            'style': 'default'
+        }
+        
+        # Kontextus cache (gyorsítótár az ismétlődő promptokhoz)
+        self.context_cache = {}
+        self.cache_ttl = 300  # 5 perc
+        
+        # Legutóbbi válaszok (ismétlés elkerülésére)
+        self.recent_responses = deque(maxlen=10)
+        
+        # Generálási paraméterek (dinamikusan állítható)
+        self.generation_params = {
+            'max_tokens': 256,
+            'temperature': 0.7,
+            'top_p': 0.9,
+            'top_k': 40,
+            'repeat_penalty': 1.1,
+            'frequency_penalty': 0.0,
+            'presence_penalty': 0.0
         }
         
         # Ha van modell, elindítjuk a betöltést háttérben
@@ -71,15 +104,56 @@ class King:
         if self.translator and I18N_AVAILABLE:
             self.translator.set_language(language)
     
+    def set_style(self, style: str):
+        """Stílus beállítása (default, concise, detailed, poetic, technical)"""
+        if style in self.PROMPT_STYLES:
+            self.identity['style'] = style
+    
+    def set_generation_params(self, **kwargs):
+        """Generálási paraméterek módosítása"""
+        for key, value in kwargs.items():
+            if key in self.generation_params:
+                self.generation_params[key] = value
+    
     def _load_model(self):
-        """Modell betöltése háttérben"""
+        """Modell betöltése háttérben (timeout-tal)"""
         try:
-            success = self.model.load()
-            self.state['model_loaded'] = success
-            if success:
-                print("👑 King: Modell betöltve")
-            else:
-                print("👑 King: Modell betöltési hiba")
+            import queue
+            result_queue = queue.Queue()
+            
+            def load_thread():
+                try:
+                    success = self.model.load()
+                    result_queue.put(('success', success))
+                except Exception as e:
+                    result_queue.put(('error', str(e)))
+            
+            thread = threading.Thread(target=load_thread)
+            thread.daemon = True
+            thread.start()
+            thread.join(timeout=30)  # 30 másodperc timeout
+            
+            if thread.is_alive():
+                print("👑 King: Modell betöltés timeout (30s)")
+                self.state['model_loaded'] = False
+                self.state['errors'].append("Model load timeout")
+                return
+            
+            try:
+                status, result = result_queue.get_nowait()
+                if status == 'success':
+                    self.state['model_loaded'] = result
+                    if result:
+                        print("👑 King: Modell betöltve")
+                    else:
+                        print("👑 King: Modell betöltési hiba")
+                else:
+                    self.state['model_loaded'] = False
+                    self.state['errors'].append(f"Model load error: {result}")
+                    print(f"👑 King: Modell hiba: {result}")
+            except queue.Empty:
+                self.state['model_loaded'] = False
+                
         except Exception as e:
             self.state['model_loaded'] = False
             self.state['errors'].append(f"Model load error: {e}")
@@ -114,13 +188,16 @@ class King:
             # 2. Identitás betöltése a scratchpadből
             self._load_identity()
             
-            # 3. Prompt összeállítása
-            prompt = self._build_prompt(intent_packet)
+            # 3. Prompt összeállítása (cache-elve)
+            prompt = self._build_prompt_cached(intent_packet)
             
             # 4. Válasz generálása
             response = self._generate_response(prompt)
             
             # 5. Válasz csomag összeállítása
+            tokens_used = len(response.split())
+            processing_time = time.time() - start_time
+            
             response_packet = {
                 'header': {
                     'trace_id': trace_id,
@@ -130,17 +207,23 @@ class King:
                 },
                 'payload': {
                     'response': response,
-                    'confidence': 0.95,
-                    'response_time_ms': int((time.time() - start_time) * 1000)
+                    'confidence': self._calculate_confidence(intent_packet),
+                    'response_time_ms': int(processing_time * 1000),
+                    'tokens_used': tokens_used,
+                    'mood': self._get_current_mood()
                 },
                 'state': {
                     'status': 'success',
-                    'tokens_used': len(response.split()) if response else 0
+                    'tokens_used': tokens_used,
+                    'processing_time': processing_time
                 }
             }
             
             # 6. Állapot frissítés
             self.state['last_response_text'] = response[:200]
+            self.state['total_tokens_generated'] += tokens_used
+            self.state['total_processing_time'] += processing_time
+            self.recent_responses.append(hashlib.md5(response.encode()).hexdigest()[:8])
             self._update_state(intent_packet, response_packet, start_time)
             
             return response_packet
@@ -158,7 +241,8 @@ class King:
                     'sender': self.name
                 },
                 'payload': {
-                    'error': error
+                    'error': error,
+                    'mood': 'error'
                 },
                 'state': {
                     'status': 'error'
@@ -168,17 +252,21 @@ class King:
     def _load_identity(self):
         """Identitás betöltése a scratchpadből"""
         stored = self.scratchpad.read_note(self.name, 'personality')
-        if stored and isinstance(stored, str):
-            # Egyszerű string esetén
-            self.identity['personality'] = stored
-        elif stored and isinstance(stored, dict):
-            # Összetett identitás esetén
-            self.identity.update(stored)
+        if stored:
+            if isinstance(stored, str):
+                self.identity['personality'] = stored
+            elif isinstance(stored, dict):
+                self.identity.update(stored)
         
         # Név a scratchpadből
         name = self.scratchpad.read_note(self.name, 'name')
         if name:
             self.identity['name'] = name
+        
+        # Stílus a scratchpadből
+        style = self.scratchpad.read_note(self.name, 'style')
+        if style and style in self.PROMPT_STYLES:
+            self.identity['style'] = style
     
     def _should_respond(self, intent_packet: Dict) -> bool:
         """Döntés: válaszoljon-e erre az intentre"""
@@ -188,20 +276,68 @@ class King:
         if not isinstance(intent, dict):
             return False
         
-        # Ha a célpont a király, és van értelmes intent
-        if intent.get('target') == 'king' and intent.get('class') != 'none':
+        intent_class = intent.get('class', '')
+        
+        # Ha a célpont a király
+        if intent.get('target') == 'king' and intent_class != 'none':
             return True
         
-        # Proaktív üzenetekre is válaszoljon
-        if intent.get('class') == 'PROACTIVE':
+        # Proaktív üzenetek
+        if intent_class == 'PROACTIVE':
+            return True
+        
+        # Fontos rendszer üzenetek
+        if intent_class in ['SYSTEM_ALERT', 'ERROR']:
             return True
         
         return False
     
+    def _build_prompt_cached(self, intent_packet: Dict) -> str:
+        """
+        Prompt összeállítása cache-eléssel a gyorsításért.
+        """
+        # Cache kulcs generálása
+        payload = intent_packet.get('payload', {})
+        text = payload.get('text', '')
+        intent_class = payload.get('intent', {}).get('class', 'unknown')
+        language = self.scratchpad.get_state('user_language', 'en')
+        
+        cache_key = hashlib.md5(
+            f"{text}_{intent_class}_{language}_{self.identity['style']}".encode()
+        ).hexdigest()
+        
+        # Cache ellenőrzés
+        if cache_key in self.context_cache:
+            cached_time, cached_prompt = self.context_cache[cache_key]
+            if time.time() - cached_time < self.cache_ttl:
+                return cached_prompt
+        
+        # Új prompt építés
+        prompt = self._build_prompt(intent_packet)
+        
+        # Cache mentés
+        self.context_cache[cache_key] = (time.time(), prompt)
+        
+        # Cache takarítás
+        if len(self.context_cache) > 100:
+            self._cleanup_cache()
+        
+        return prompt
+    
+    def _cleanup_cache(self):
+        """Régi cache bejegyzések törlése"""
+        now = time.time()
+        to_delete = []
+        for key, (timestamp, _) in self.context_cache.items():
+            if now - timestamp > self.cache_ttl:
+                to_delete.append(key)
+        for key in to_delete:
+            del self.context_cache[key]
+    
     def _build_prompt(self, intent_packet: Dict) -> str:
         """
         Prompt összeállítása az intent packetből.
-        Ezt kapja majd a modell.
+        Optimalizált, rövidebb változat.
         """
         payload = intent_packet.get('payload', {})
         if not isinstance(payload, dict):
@@ -219,6 +355,9 @@ class King:
         if self.translator:
             self.translator.set_language(language)
         
+        # Stílus alapú prompt építés
+        style = self.identity.get('style', 'default')
+        
         # Valet kontextus (ha van)
         valet_context = ""
         if hasattr(self, 'valet') and self.valet is not None:
@@ -226,11 +365,14 @@ class King:
                 context = self.valet.prepare_context(intent_packet)
                 if isinstance(context, dict):
                     if context.get('summary'):
-                        valet_context = f"[Context] {context['summary']}\n"
+                        valet_context = f"📌 {context['summary']}\n"
                     if context.get('facts'):
-                        facts = context['facts'][:3]
+                        facts = context['facts'][:2]  # Csak 2 tény
                         if facts:
-                            valet_context += "Facts:\n" + "\n".join(f"- {f}" for f in facts) + "\n"
+                            valet_context += "📋 " + " | ".join(facts) + "\n"
+                    if context.get('emotional_context'):
+                        ec = context['emotional_context']
+                        valet_context += f"😊 {ec.get('charge', 0):.1f}\n"
             except Exception as e:
                 print(f"👑 King: Valet error: {e}")
         
@@ -240,105 +382,190 @@ class King:
             try:
                 queen_result = self.queen.think(intent_packet, None)
                 if isinstance(queen_result, dict) and queen_result.get('conclusion'):
-                    queen_logic = f"[Logic] {queen_result['conclusion']}\n"
+                    queen_logic = f"🧠 {queen_result['conclusion'][:100]}\n"
             except Exception as e:
                 print(f"👑 King: Queen error: {e}")
         
-        # Az utolsó néhány üzenet (ismétlés elkerülésére)
-        recent_messages = self.scratchpad.read(limit=5, msg_type='response')
-        last_responses = []
-        for msg in recent_messages:
-            if isinstance(msg, dict) and msg.get('module') == 'king':
-                content = msg.get('content', {})
-                if isinstance(content, dict) and 'response' in content:
-                    resp = content['response']
-                    if isinstance(resp, str) and resp:
-                        last_responses.append(resp[:50])
-        
+        # Ismétlés elkerülés
         no_repeat = ""
-        if last_responses and random.random() < 0.3:  # 30% eséllyel emlékeztet
-            no_repeat = f"(Avoid repeating: {', '.join(last_responses[-2:])})\n"
+        if self.recent_responses and random.random() < 0.2:
+            no_repeat = "🔄 (no repetition)\n"
         
-        # Prompt építés - i18n használatával
-        if self.translator and I18N_AVAILABLE:
-            # Strukturált prompt i18n-ből
-            system = self.translator.get('prompts.king.system')
-            personality = self.translator.get('prompts.king.personality', personality=self.identity['personality'])
-            
-            prompt = f"""{system}
-{personality}
-
-{valet_context}{queen_logic}{no_repeat}
-{user_name}: {text}
-
-{self.identity['name']}:"""
+        # Stílus alapú prompt előtag
+        style_prefix = self._get_style_prefix(style, language)
+        
+        # Prompt összeállítása (tömörített)
+        prompt_parts = []
+        
+        if style_prefix:
+            prompt_parts.append(style_prefix)
+        
+        if valet_context:
+            prompt_parts.append(valet_context)
+        
+        if queen_logic:
+            prompt_parts.append(queen_logic)
+        
+        if no_repeat:
+            prompt_parts.append(no_repeat)
+        
+        # Utolsó üzenet
+        prompt_parts.append(f"{user_name}: {text}")
+        prompt_parts.append(f"{self.identity['name']}:")
+        
+        return "\n".join(prompt_parts)
+    
+    def _get_style_prefix(self, style: str, language: str) -> str:
+        """Stílus alapú prompt előtag lekérése"""
+        if language == 'hu':
+            prefixes = {
+                'default': '',
+                'concise': 'Légy rövid és tömör.',
+                'detailed': 'Magyarázz részletesen.',
+                'poetic': 'Válaszolj költőien, metaforákkal.',
+                'technical': 'Használj szakszerű, precíz nyelvezetet.'
+            }
         else:
-            # Fallback angol prompt
-            prompt = f"""You are {self.identity['name']}, {self.identity.get('title', 'a sovereign entity')}.
-Personality: {self.identity['personality']}
-
-{valet_context}{queen_logic}{no_repeat}
-{user_name}: {text}
-
-{self.identity['name']}:"""
+            prefixes = {
+                'default': '',
+                'concise': 'Be concise.',
+                'detailed': 'Explain in detail.',
+                'poetic': 'Answer poetically, with metaphors.',
+                'technical': 'Use technical, precise language.'
+            }
         
-        return prompt
+        return prefixes.get(style, '')
     
     def _generate_response(self, prompt: str) -> str:
-        """Válasz generálása - modell hívás"""
+        """Válasz generálása - modell hívás timeout-tal"""
         
         # Ha van modell és be van töltve
         if self.model and self.state.get('model_loaded'):
             try:
-                response = self.model.generate(
-                    prompt=prompt,
-                    max_tokens=256,
-                    temperature=0.7
-                )
+                # Timeout kezelés
+                import queue
+                result_queue = queue.Queue()
                 
-                # Naplózás
-                self.scratchpad.write(self.name, 
-                    {'response': response[:100], 'tokens': len(response.split())},
-                    'generation'
-                )
+                def generate_thread():
+                    try:
+                        response = self.model.generate(
+                            prompt=prompt,
+                            **self.generation_params
+                        )
+                        result_queue.put(('success', response))
+                    except Exception as e:
+                        result_queue.put(('error', str(e)))
                 
-                return response
+                thread = threading.Thread(target=generate_thread)
+                thread.daemon = True
+                thread.start()
+                thread.join(timeout=30)  # 30 másodperc timeout
+                
+                if thread.is_alive():
+                    self.state['errors'].append("Generation timeout")
+                    return self._get_timeout_message()
+                
+                try:
+                    status, result = result_queue.get_nowait()
+                    if status == 'success':
+                        response = result
+                        
+                        # Naplózás
+                        self.scratchpad.write(self.name, 
+                            {'response': response[:100], 'tokens': len(response.split())},
+                            'generation'
+                        )
+                        
+                        return response
+                    else:
+                        return self._get_error_message(result)
+                        
+                except queue.Empty:
+                    return self._get_error_message("Unknown error")
                 
             except Exception as e:
                 self.state['errors'].append(f"Generation error: {e}")
-                
-                # Hiba naplózás
-                self.scratchpad.write(self.name, 
-                    {'error': str(e), 'prompt': prompt[:200]},
-                    'error'
-                )
-                
-                # Hibaválasz i18n-ből
-                if self.translator:
-                    return f"[{self.translator.get('errors.generation_error', error=str(e))}]"
-                return f"[Generation error: {e}]"
+                return self._get_error_message(str(e))
         
         # Ha van modell, de még tölt
         elif self.model and not self.state.get('model_loaded'):
-            if self.translator:
-                return self.translator.get('prompts.king.thinking')
-            return "Thinking... (model loading)"
+            return self._get_loading_message()
         
         # Dummy mód (nincs modell)
         else:
-            # Egyszerű válasz az intent alapján
-            if "hello" in prompt.lower() or "hi" in prompt.lower() or "szia" in prompt.lower():
-                if self.translator:
-                    return self.translator.get('prompts.king.greeting', user=self.scratchpad.get_state('user_name', 'User'))
-                return f"Hello {self.scratchpad.get_state('user_name', 'User')}!"
-            elif "?" in prompt:
-                if self.translator:
-                    return self.translator.get('prompts.king.thinking')
-                return "Interesting question. Let me think..."
-            else:
-                if self.translator:
-                    return "OK."
-                return "I understand."
+            return self._get_dummy_response(prompt)
+    
+    def _get_timeout_message(self) -> str:
+        """Időtúllépés üzenet"""
+        if self.translator:
+            return self.translator.get('prompts.king.timeout')
+        return "⏳ The King is thinking deeply... please wait."
+    
+    def _get_error_message(self, error: str) -> str:
+        """Hibaüzenet"""
+        if self.translator:
+            return self.translator.get('prompts.king.error', error=error)
+        return f"😞 Sorry, I encountered an error: {error}"
+    
+    def _get_loading_message(self) -> str:
+        """Modell töltés üzenet"""
+        if self.translator:
+            return self.translator.get('prompts.king.loading')
+        return "🤔 The King is awakening..."
+    
+    def _get_dummy_response(self, prompt: str) -> str:
+        """Dummy válasz (ha nincs modell)"""
+        prompt_lower = prompt.lower()
+        user_name = self.scratchpad.get_state('user_name', 'User')
+        
+        if "hello" in prompt_lower or "hi" in prompt_lower or "szia" in prompt_lower:
+            if self.translator:
+                return self.translator.get('prompts.king.greeting', user=user_name)
+            return f"Hello {user_name}!"
+        elif "?" in prompt:
+            if self.translator:
+                return self.translator.get('prompts.king.thinking')
+            return "Interesting question. Let me think..."
+        else:
+            if self.translator:
+                return self.translator.get('prompts.king.acknowledge')
+            return "I understand."
+    
+    def _calculate_confidence(self, intent_packet: Dict) -> float:
+        """Bizonyossági szint számítása"""
+        base = 0.95
+        
+        # Ha van modell és be van töltve
+        if not (self.model and self.state.get('model_loaded')):
+            base *= 0.5
+        
+        # Ha vannak hibák
+        if self.state['errors']:
+            base *= max(0.5, 1.0 - (len(self.state['errors']) * 0.1))
+        
+        # Ha van Valet kontextus
+        if hasattr(self, 'valet') and self.valet is not None:
+            base += 0.02
+        
+        # Ha van Queen logika
+        if hasattr(self, 'queen') and self.queen is not None:
+            base += 0.03
+        
+        return min(0.99, max(0.1, base))
+    
+    def _get_current_mood(self) -> str:
+        """Aktuális hangulat lekérése"""
+        if self.state['average_response_time'] > 10:
+            mood = "tired"
+        elif self.state['average_response_time'] > 5:
+            mood = "thoughtful"
+        elif self.state['average_response_time'] > 2:
+            mood = "calm"
+        else:
+            mood = "lively"
+        
+        self.state['last_mood'] = mood
+        return mood
     
     def _update_state(self, intent: Dict, response: Dict, start_time: float):
         """Állapot frissítése (ezt nézi a Jester)"""
@@ -348,6 +575,7 @@ Personality: {self.identity['personality']}
         self.state['response_count'] += 1
         self.state['status'] = 'idle'
         self.state['current_task'] = None
+        self.state['last_mood'] = self._get_current_mood()
         
         # Mozgóátlag
         if self.state['average_response_time'] == 0:
@@ -363,7 +591,11 @@ Personality: {self.identity['personality']}
     def get_state(self) -> Dict:
         """Állapot lekérése (Jester hívja)"""
         if isinstance(self.state, dict):
-            return self.state
+            return {
+                **self.state,
+                'average_tokens_per_second': self._calculate_tokens_per_second(),
+                'mood': self._get_current_mood()
+            }
         return {
             'status': 'error',
             'last_response_time': None,
@@ -371,17 +603,32 @@ Personality: {self.identity['personality']}
             'average_response_time': 0,
             'errors': [f"Invalid state: {type(self.state)}"],
             'current_task': None,
-            'model_loaded': False
+            'model_loaded': False,
+            'mood': 'error'
         }
+    
+    def _calculate_tokens_per_second(self) -> float:
+        """Átlagos token/másodperc számítás"""
+        if self.state['total_processing_time'] == 0:
+            return 0
+        return self.state['total_tokens_generated'] / self.state['total_processing_time']
     
     def get_mood(self) -> str:
         """Aktuális hangulat (UI-nak)"""
-        if self.state['average_response_time'] > 5:
-            return "thoughtful"
-        elif self.state['average_response_time'] > 2:
-            return "calm"
-        else:
-            return "lively"
+        return self._get_current_mood()
+    
+    def get_metrics(self) -> Dict:
+        """Részletes metrikák lekérése"""
+        return {
+            'response_count': self.state['response_count'],
+            'average_response_time': round(self.state['average_response_time'] * 1000, 2),
+            'total_tokens': self.state['total_tokens_generated'],
+            'average_tokens_per_second': round(self._calculate_tokens_per_second(), 2),
+            'errors': len(self.state['errors']),
+            'model_loaded': self.state['model_loaded'],
+            'mood': self._get_current_mood(),
+            'style': self.identity.get('style', 'default')
+        }
 
 # Teszt
 if __name__ == "__main__":
@@ -413,3 +660,4 @@ if __name__ == "__main__":
     print(json.dumps(response, indent=2))
     print("\nKing state:", king.get_state())
     print("King mood:", king.get_mood())
+    print("King metrics:", king.get_metrics())

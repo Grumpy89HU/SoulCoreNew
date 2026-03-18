@@ -420,8 +420,8 @@ class BlackBox:
     # --- VISSZAJÁTSZÁS ---
     
     def replay(self, start_time: float = None, end_time: float = None, 
-               trace_id: str = None, event_type: str = None, 
-               source: str = None, speed: float = 1.0) -> List[Dict]:
+           trace_id: str = None, event_type: str = None, 
+           source: str = None, speed: float = 1.0, limit: int = None) -> List[Dict]:
         """
         Események visszajátszása.
         
@@ -432,6 +432,7 @@ class BlackBox:
             event_type: esemény típus
             source: forrás modul
             speed: visszajátszási sebesség
+            limit: maximum találatok száma
             
         Returns:
             List[Dict]: események listája
@@ -440,16 +441,12 @@ class BlackBox:
             events = []
             
             if trace_id:
-                # Trace ID alapján
                 events = self.index_by_trace.get(trace_id, [])
             elif event_type:
-                # Típus alapján
                 events = self.index_by_type.get(event_type, [])
             elif source:
-                # Forrás alapján
                 events = self.index_by_module.get(source, [])
             else:
-                # Idő alapján
                 events = list(self.index_by_time)
             
             # Időszűrés
@@ -463,6 +460,10 @@ class BlackBox:
                         continue
                     filtered.append(e)
                 events = filtered
+            
+            # Limit
+            if limit:
+                events = events[:limit]
             
             # Sebesség beállítása
             if speed != 1.0 and self.config['enable_playback']:

@@ -1,20 +1,36 @@
 {% extends "base.html" %}
 
-{% block title %}Főoldal{% endblock %}
+{% block title %}{{ gettext('ui.dashboard') }}{% endblock %}
 
 {% block content %}
 {% raw %}
+<!-- Panel állapotok (mobil nézethez) - ez a rész felesleges, mert a store-ban van -->
+<!-- <div class="panel-states" style="display: none;">
+    <span v-if="leftPanelVisible" id="left-panel-visible"></span>
+    <span v-if="rightPanelVisible" id="right-panel-visible"></span>
+</div> -->
+
 <!-- Bal panel: Beszélgetések + Telemetria -->
-<div class="left-panel">
+<div class="left-panel" :class="{ 'mobile-visible': leftPanelVisible, 'collapsed': !leftPanelVisible && isMobile }">
     <div class="panel-header">
-        <span>📋 BESZÉLGETÉSEK</span>
-        <button class="new-conv-btn" @click="createNewConversation">+ Új</button>
+        <div class="header-title">
+            <span class="header-icon">📋</span>
+            <span>{{ gettext('conversations.title') }}</span>
+        </div>
+        <button class="new-conv-btn" @click="createNewConversation" :disabled="!connected">
+            <span>+</span> <span class="btn-text">{{ gettext('conversations.new') }}</span>
+        </button>
     </div>
     <div class="panel-content">
         <conversation-list></conversation-list>
     </div>
     
-    <div class="panel-header">🔍 TELEMETRIA</div>
+    <div class="panel-header">
+        <div class="header-title">
+            <span class="header-icon">🔍</span>
+            <span>{{ gettext('telemetry.title') }}</span>
+        </div>
+    </div>
     <div class="panel-content">
         <telemetry-panel></telemetry-panel>
     </div>
@@ -26,60 +42,112 @@
 </div>
 
 <!-- Jobb panel: Admin -->
-<div class="right-panel">
+<div class="right-panel" :class="{ 'mobile-visible': rightPanelVisible, 'collapsed': !rightPanelVisible && isMobile }">
     <admin-panel></admin-panel>
 </div>
 
-<!-- Lábléc -->
-<div class="footer">
-    <span>⚡ SoulCore 3.0</span>
-    <div class="connection-status">
-        <span class="status-dot" :class="{ connected: connected, disconnected: !connected }"></span>
-        <span v-if="connected">Kapcsolódva</span>
-        <span v-else style="color: var(--error-color);">Kapcsolat bontva</span>
-    </div>
-    <span>{{ currentTime }}</span>
+<!-- Mobil alsó navigáció -->
+<div class="mobile-nav" v-if="isMobile">
+    <button class="mobile-nav-btn" :class="{ active: leftPanelVisible }" @click="toggleLeftPanel">
+        <span>📋</span>
+        <span>{{ gettext('conversations.title') }}</span>
+    </button>
+    <button class="mobile-nav-btn" :class="{ active: !leftPanelVisible && !rightPanelVisible }" @click="showChatOnly">
+        <span>💬</span>
+        <span>{{ gettext('chat.title') }}</span>
+    </button>
+    <button class="mobile-nav-btn" :class="{ active: rightPanelVisible }" @click="toggleRightPanel">
+        <span>⚙️</span>
+        <span>{{ gettext('admin.title') }}</span>
+    </button>
 </div>
 
-<!-- Modálok -->
-<div class="modal" v-if="showLoginModal">
-    <div class="modal-content">
-        <div class="modal-header">
-            <h3>Admin bejelentkezés</h3>
-            <button class="close-btn" @click="showLoginModal = false">✕</button>
-        </div>
-        
-        <div class="modal-body">
-            <div class="form-group">
-                <label>Jelszó</label>
-                <input type="password" v-model="loginPassword" class="form-input" @keyup.enter="adminLogin">
-            </div>
-            <div v-if="loginError" class="login-error">{{ loginError }}</div>
-        </div>
-        
-        <div class="modal-footer">
-            <button class="btn-secondary" @click="showLoginModal = false">Mégse</button>
-            <button class="btn-primary" @click="adminLogin" :disabled="!loginPassword">Belépés</button>
-        </div>
-    </div>
-</div>
-
-<div class="modal" v-if="showConfirmModal">
-    <div class="modal-content">
-        <div class="modal-header">
-            <h3>{{ confirmTitle }}</h3>
-            <button class="close-btn" @click="showConfirmModal = false">✕</button>
-        </div>
-        
-        <div class="modal-body">
-            <p>{{ confirmMessage }}</p>
-        </div>
-        
-        <div class="modal-footer">
-            <button class="btn-secondary" @click="showConfirmModal = false">Mégse</button>
-            <button class="btn-primary" @click="confirmAction">Megerősítés</button>
-        </div>
-    </div>
-</div>
+<!-- Átfedés mobil nézetben (ha egy panel nyitva van) -->
+<div class="panel-overlay" v-if="isMobile && (leftPanelVisible || rightPanelVisible)" @click="closeAllPanels"></div>
 {% endraw %}
+{% endblock %}
+
+{% block scripts %}
+{{ super() }}
+<script>
+// Mobil nézet specifikus logika (kiegészítés a main.js-hez)
+(function() {
+    // Mobil detektálás
+    const isMobile = () => window.innerWidth <= 768;
+    
+    // Panel állapotok inicializálása (ha még nincs a store-ban)
+    if (window.store) {
+        // Ha nincs ui objektum, létrehozzuk
+        if (!window.store.state.ui) {
+            window.store.state.ui = Vue.reactive({
+                leftPanelVisible: !isMobile(),
+                rightPanelVisible: !isMobile(),
+                isMobile: isMobile()
+            });
+        }
+        
+        // Metódusok hozzáadása a store-hoz (ha még nincsenek)
+        if (!window.store.toggleLeftPanel) {
+            window.store.toggleLeftPanel = () => {
+                if (window.store.state.ui) {
+                    window.store.state.ui.leftPanelVisible = !window.store.state.ui.leftPanelVisible;
+                    // Ha bal panel nyílik, jobb panel bezár
+                    if (window.store.state.ui.leftPanelVisible) {
+                        window.store.state.ui.rightPanelVisible = false;
+                    }
+                }
+            };
+        }
+        
+        if (!window.store.toggleRightPanel) {
+            window.store.toggleRightPanel = () => {
+                if (window.store.state.ui) {
+                    window.store.state.ui.rightPanelVisible = !window.store.state.ui.rightPanelVisible;
+                    // Ha jobb panel nyílik, bal panel bezár
+                    if (window.store.state.ui.rightPanelVisible) {
+                        window.store.state.ui.leftPanelVisible = false;
+                    }
+                }
+            };
+        }
+        
+        if (!window.store.showChatOnly) {
+            window.store.showChatOnly = () => {
+                if (window.store.state.ui) {
+                    window.store.state.ui.leftPanelVisible = false;
+                    window.store.state.ui.rightPanelVisible = false;
+                }
+            };
+        }
+        
+        if (!window.store.closeAllPanels) {
+            window.store.closeAllPanels = () => {
+                if (window.store.state.ui) {
+                    window.store.state.ui.leftPanelVisible = false;
+                    window.store.state.ui.rightPanelVisible = false;
+                }
+            };
+        }
+    }
+    
+    // Átméretezés figyelése
+    window.addEventListener('resize', () => {
+        if (window.store && window.store.state.ui) {
+            const mobile = window.innerWidth <= 768;
+            window.store.state.ui.isMobile = mobile;
+            
+            // Asztali nézetben alapból nyitva a panelek
+            if (!mobile) {
+                window.store.state.ui.leftPanelVisible = true;
+                window.store.state.ui.rightPanelVisible = true;
+            }
+        }
+    });
+    
+    // Kezdeti állapot beállítása
+    if (window.store && window.store.state.ui) {
+        window.store.state.ui.isMobile = isMobile();
+    }
+})();
+</script>
 {% endblock %}
