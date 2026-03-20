@@ -136,9 +136,15 @@ window.store = {
     // ========================================================================
     
     setAuth(user) {
-        this.state.authenticated = true;
-        this.state.user = user;
-    },
+		if (!user) return;
+		this.state.authenticated = true;
+		this.state.user = {
+			id: user.id,
+			username: user.username,
+			role: user.role,
+			email: user.email
+		};
+	},
     
     clearAuth() {
         this.state.authenticated = false;

@@ -11,7 +11,7 @@ if (!window.getNotificationIcon) {
 }
 
 // Vue alkalmazás létrehozása
-const { createApp, ref, computed, onMounted, nextTick, watch } = Vue;
+const { createApp, ref, computed, onMounted, onUnmounted, nextTick, watch } = Vue;
 
 const App = {
     setup() {
@@ -59,16 +59,18 @@ const App = {
         const hideUserMenu = () => { showUserMenu.value = false; };
         const removeNotification = (id) => window.store.removeNotification(id);
         
-        // Idő frissítése
-        setInterval(() => {
-            currentTime.value = new Date().toLocaleTimeString();
-        }, 1000);
+        // ====================================================================
+        // ÉLETCIKLUS - IDŐZÍTŐ CLEANUP-PAL
+        // ====================================================================
         
-        // ====================================================================
-        // ÉLETCIKLUS
-        // ====================================================================
+        let timeInterval = null;
         
         onMounted(async () => {
+            // Idő frissítése
+            timeInterval = setInterval(() => {
+                currentTime.value = new Date().toLocaleTimeString();
+            }, 1000);
+            
             try {
                 await window.api.getCurrentUser();
                 
@@ -77,6 +79,13 @@ const App = {
                 }
             } catch (error) {
                 console.error('Init error:', error);
+            }
+        });
+        
+        onUnmounted(() => {
+            if (timeInterval) {
+                clearInterval(timeInterval);
+                timeInterval = null;
             }
         });
         
@@ -231,50 +240,44 @@ const app = createApp(App);
 app.directive('click-outside', vClickOutside);
 
 // ========================================================================
-// KOMPONENSEK REGISZTRÁLÁSA (TELJES LISTA)
+// KOMPONENSEK REGISZTRÁLÁSA (BIZTONSÁGOS)
 // ========================================================================
 
-// Alap komponensek (bal panel, chat)
-app.component('conversation-list', window.ConversationList);
-app.component('chat-box', window.ChatBox);
-app.component('telemetry-panel', window.TelemetryPanel);
+const safeRegister = (name, component) => {
+    if (component && typeof component === 'object') {
+        app.component(name, component);
+        console.log(`✅ ${name} regisztrálva`);
+    } else {
+        console.warn(`⚠️ ${name} nem elérhető, dummy komponens`);
+        app.component(name, {
+            template: `<div class="component-placeholder">${name} (betöltés...)</div>`
+        });
+    }
+};
 
-// Modul vezérlés és modellek
-app.component('module-control', window.ModuleControl);
-app.component('model-selector', window.ModelSelector);
+// Alap komponensek
+safeRegister('conversation-list', window.ConversationList);
+safeRegister('chat-box', window.ChatBox);
+safeRegister('telemetry-panel', window.TelemetryPanel);
+safeRegister('module-control', window.ModuleControl);
+safeRegister('model-selector', window.ModelSelector);
+safeRegister('prompt-editor', window.PromptEditor);
+safeRegister('personality-manager', window.PersonalityManager);
+safeRegister('settings-panel', window.SettingsPanel);
+safeRegister('admin-panel', window.AdminPanel);
+safeRegister('login-form', window.LoginForm);
+safeRegister('register-form', window.RegisterForm);
 
-// Prompt és személyiség
-app.component('prompt-editor', window.PromptEditor);
-app.component('personality-manager', window.PersonalityManager);
+// További komponensek (ha hiányoznak, dummy)
+safeRegister('audit-log', window.AuditLog);
+safeRegister('metrics-panel', window.MetricsPanel);
+safeRegister('trace-panel', window.TracePanel);
+safeRegister('vision-upload', window.VisionUpload);
+safeRegister('sandbox-editor', window.SandboxEditor);
+safeRegister('gateway-panel', window.GatewayPanel);
+safeRegister('embedding-panel', window.EmbeddingPanel);
+safeRegister('audio-panel', window.AudioPanel);
 
-// Embedding és Hang (új)
-app.component('embedding-panel', window.EmbeddingPanel);
-app.component('audio-panel', window.AudioPanel);
-
-// Vision, Sandbox, Gateway (új)
-app.component('vision-upload', window.VisionUpload);
-app.component('sandbox-editor', window.SandboxEditor);
-app.component('gateway-panel', window.GatewayPanel);
-
-// Audit, Metrikák, Trace (új)
-app.component('audit-log', window.AuditLog);
-app.component('metrics-panel', window.MetricsPanel);
-app.component('trace-panel', window.TracePanel);
-
-// Beállítások és Admin
-app.component('settings-panel', window.SettingsPanel);
-app.component('admin-panel', window.AdminPanel);
-
-// Auth
-app.component('login-form', window.LoginForm);
-app.component('register-form', window.RegisterForm);
-
-console.log('✅ Vue alkalmazás elindult - Minden komponens regisztrálva:');
-console.log('   - Alap: ConversationList, ChatBox, TelemetryPanel');
-console.log('   - Modul: ModuleControl, ModelSelector');
-console.log('   - Tartalom: PromptEditor, PersonalityManager');
-console.log('   - Új: EmbeddingPanel, AudioPanel, VisionUpload, SandboxEditor, GatewayPanel');
-console.log('   - Admin: AuditLog, MetricsPanel, TracePanel, SettingsPanel, AdminPanel');
-console.log('   - Auth: LoginForm, RegisterForm');
+console.log('✅ Vue alkalmazás elindult');
 
 app.mount('#app');

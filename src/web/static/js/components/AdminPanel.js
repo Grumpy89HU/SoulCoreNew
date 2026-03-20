@@ -18,7 +18,7 @@ window.AdminPanel = {
                 </div>
             </div>
             
-            <!-- Admin kategória fülek (Open WebUI stílus) -->
+            <!-- Admin kategória fülek -->
             <div class="admin-tabs">
                 <button v-for="tab in tabList" :key="tab.id" 
                         class="admin-tab" :class="{ active: activeTab === tab.id }"
@@ -30,94 +30,53 @@ window.AdminPanel = {
             
             <!-- Tartalom -->
             <div class="admin-content">
-                <!-- Modulok -->
                 <div v-show="activeTab === 'modules'" class="tab-content">
                     <module-control></module-control>
                 </div>
-                
-                <!-- Modellek -->
                 <div v-show="activeTab === 'models'" class="tab-content">
                     <model-selector></model-selector>
                 </div>
-                
-                <!-- Promptok -->
                 <div v-show="activeTab === 'prompts'" class="tab-content">
                     <prompt-editor></prompt-editor>
                 </div>
-                
-                <!-- Személyiségek -->
                 <div v-show="activeTab === 'personalities'" class="tab-content">
                     <personality-manager></personality-manager>
                 </div>
-                
-                <!-- Embedding/Reranker -->
                 <div v-show="activeTab === 'embedding'" class="tab-content">
                     <embedding-panel></embedding-panel>
                 </div>
-                
-                <!-- Hang (ASR/TTS) -->
                 <div v-show="activeTab === 'audio'" class="tab-content">
                     <audio-panel></audio-panel>
                 </div>
-                
-                <!-- Vision -->
                 <div v-show="activeTab === 'vision'" class="tab-content">
                     <vision-upload></vision-upload>
                 </div>
-                
-                <!-- Sandbox -->
                 <div v-show="activeTab === 'sandbox'" class="tab-content">
                     <sandbox-editor></sandbox-editor>
                 </div>
-                
-                <!-- Gateway -->
                 <div v-show="activeTab === 'gateway'" class="tab-content">
                     <gateway-panel></gateway-panel>
                 </div>
-                
-                <!-- Audit log -->
                 <div v-show="activeTab === 'audit'" class="tab-content">
                     <audit-log></audit-log>
                 </div>
-                
-                <!-- Metrikák -->
                 <div v-show="activeTab === 'metrics'" class="tab-content">
                     <metrics-panel></metrics-panel>
                 </div>
-                
-                <!-- Trace -->
                 <div v-show="activeTab === 'traces'" class="tab-content">
                     <trace-panel></trace-panel>
                 </div>
-                
-                <!-- Beállítások -->
                 <div v-show="activeTab === 'settings'" class="tab-content">
                     <settings-panel></settings-panel>
                 </div>
-                
-                <!-- Rendszer információ -->
                 <div v-show="activeTab === 'info'" class="tab-content">
                     <div class="system-info">
                         <div class="info-card">
                             <h4>{{ t('admin.system_info') }}</h4>
-                            <div class="info-row">
-                                <span class="info-label">{{ t('admin.version') }}:</span>
-                                <span class="info-value">SoulCore 3.0</span>
-                            </div>
-                            <div class="info-row">
-                                <span class="info-label">{{ t('admin.system_id') }}:</span>
-                                <span class="info-value"><code>{{ systemId }}</code></span>
-                            </div>
-                            <div class="info-row">
-                                <span class="info-label">{{ t('admin.uptime') }}:</span>
-                                <span class="info-value">{{ formatUptime(heartbeat?.uptime_seconds || 0) }}</span>
-                            </div>
-                            <div class="info-row">
-                                <span class="info-label">{{ t('admin.connected_clients') }}:</span>
-                                <span class="info-value">{{ clientCount }}</span>
-                            </div>
+                            <div class="info-row"><span class="info-label">{{ t('admin.version') }}:</span><span>SoulCore 3.0</span></div>
+                            <div class="info-row"><span class="info-label">{{ t('admin.system_id') }}:</span><code>{{ systemId }}</code></div>
+                            <div class="info-row"><span class="info-label">{{ t('admin.uptime') }}:</span><span>{{ formatUptime(heartbeat?.uptime_seconds || 0) }}</span></div>
                         </div>
-                        
                         <div class="info-card">
                             <h4>{{ t('admin.modules_status') }}</h4>
                             <div class="modules-status-grid">
@@ -127,7 +86,6 @@ window.AdminPanel = {
                                 </div>
                             </div>
                         </div>
-                        
                         <div class="info-card">
                             <h4>{{ t('admin.resources') }}</h4>
                             <div class="resource-item">
@@ -156,37 +114,35 @@ window.AdminPanel = {
                 </div>
             </div>
             
-            <!-- Admin footer -->
             <div class="admin-footer">
                 <div class="admin-info">
                     <span class="admin-badge">{{ t('admin.admin_access') }}</span>
-                    <button class="logout-btn" @click="logout">
-                        🚪 {{ t('ui.logout') }}
-                    </button>
+                    <button class="logout-btn" @click="logout">🚪 {{ t('ui.logout') }}</button>
                 </div>
             </div>
         </div>
     `,
     
     setup() {
-        // ====================================================================
-        // REAKTÍV ÁLLAPOTOK
-        // ====================================================================
-        
         const systemId = Vue.computed(() => window.store.systemId);
         const heartbeat = Vue.computed(() => window.store.heartbeat);
-        const modules = Vue.computed(() => window.store.modules);
-        const gpuStatus = Vue.computed(() => window.store.gpuStatus);
+        const modules = Vue.computed(() => window.store.modules || {});
+        const gpuStatus = Vue.computed(() => window.store.gpuStatus || []);
         
         const activeTab = Vue.ref('modules');
         const clientCount = Vue.ref(0);
         const cpuUsage = Vue.ref(Math.floor(Math.random() * 40) + 20);
         const ramUsage = Vue.ref(Math.floor(Math.random() * 50) + 30);
         
-        // ====================================================================
-        // TABS (14 fül - NE HASZNÁLJUNK t() függvényt a setup elején!)
-        // ====================================================================
+        const t = (key, params = {}) => window.gettext(key, params);
+        const formatUptime = (s) => window.formatUptime(s);
+        const formatModuleName = (n) => {
+            if (!n) return '';
+            return String(n).split('_').map(w => w.charAt(0).toUpperCase() + w.slice(1)).join(' ');
+        };
+        const formatStatus = (s) => window.formatStatus(s);
         
+        // TABS - fix szövegek, nem t()!
         const tabList = [
             { id: 'modules', name: 'Modulok', icon: '🔧' },
             { id: 'models', name: 'Modellek', icon: '🤖' },
@@ -203,32 +159,6 @@ window.AdminPanel = {
             { id: 'settings', name: 'Beállítások', icon: '⚙️' },
             { id: 'info', name: 'Rendszerinfo', icon: 'ℹ️' }
         ];
-        
-        // ====================================================================
-        // SEGÉDFÜGGVÉNYEK
-        // ====================================================================
-        
-        const t = (key, params = {}) => {
-            return window.gettext ? window.gettext(key, params) : key;
-        };
-        
-        const formatUptime = (s) => {
-            return window.formatUptime ? window.formatUptime(s) : s + 's';
-        };
-        
-        const formatModuleName = (name) => {
-            if (!name) return '';
-            if (typeof name !== 'string') return String(name);
-            return name.split('_').map(w => w.charAt(0).toUpperCase() + w.slice(1)).join(' ');
-        };
-        
-        const formatStatus = (status) => {
-            return window.formatStatus ? window.formatStatus(status) : status;
-        };
-        
-        // ====================================================================
-        // METÓDUSOK
-        // ====================================================================
         
         const refreshSystemData = async () => {
             try {
@@ -250,10 +180,6 @@ window.AdminPanel = {
             }
         };
         
-        // ====================================================================
-        // ÉLETCIKLUS
-        // ====================================================================
-        
         let resourceInterval = null;
         
         Vue.onMounted(() => {
@@ -264,10 +190,6 @@ window.AdminPanel = {
         Vue.onUnmounted(() => {
             if (resourceInterval) clearInterval(resourceInterval);
         });
-        
-        // ====================================================================
-        // RETURN
-        // ====================================================================
         
         return {
             systemId,

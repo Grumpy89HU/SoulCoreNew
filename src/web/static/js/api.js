@@ -59,14 +59,17 @@ window.api = {
     },
     
     async getCurrentUser() {
-        try {
-            const data = await this.fetch('/api/auth/me');
-            if (data.authenticated) window.store.setAuth(data);
-            return data;
-        } catch {
-            return { authenticated: false };
-        }
-    },
+		try {
+			const data = await this.fetch('/api/auth/me');
+			if (data.authenticated && data.id) {
+				window.store.setAuth(data);
+			}
+			return data;
+		} catch (error) {
+			console.error('Error getting current user:', error);
+			return { authenticated: false };
+		}
+	},
     
     // ========================================================================
     // RENDSZER
