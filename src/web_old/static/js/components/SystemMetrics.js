@@ -1,19 +1,24 @@
+// ==============================================
 // Rendszer metrikák megjelenítő komponens
+// ==============================================
+
 window.SystemMetrics = {
+    name: 'SystemMetrics',
+    
     template: `
         <div class="system-metrics">
             <!-- Fejléc időtáv választóval -->
             <div class="metrics-header">
                 <div class="header-title">
-                    <h3>{{ gettext('metrics.title') }}</h3>
+                    <h3>{{ t('metrics.title') }}</h3>
                 </div>
                 
                 <div class="header-actions">
                     <select v-model="timeRange" class="range-select" @change="loadMetrics">
-                        <option value="hour">{{ gettext('metrics.last_hour') }}</option>
-                        <option value="day">{{ gettext('metrics.last_day') }}</option>
-                        <option value="week">{{ gettext('metrics.last_week') }}</option>
-                        <option value="month">{{ gettext('metrics.last_month') }}</option>
+                        <option value="hour">{{ t('metrics.last_hour') }}</option>
+                        <option value="day">{{ t('metrics.last_day') }}</option>
+                        <option value="week">{{ t('metrics.last_week') }}</option>
+                        <option value="month">{{ t('metrics.last_month') }}</option>
                     </select>
                     
                     <button class="refresh-btn" @click="loadMetrics" :disabled="loading">
@@ -25,7 +30,7 @@ window.SystemMetrics = {
             <!-- Betöltés jelző -->
             <div v-if="loading" class="loading-spinner">
                 <div class="spinner"></div>
-                <span>{{ gettext('metrics.loading') }}</span>
+                <span>{{ t('metrics.loading') }}</span>
             </div>
             
             <div v-else class="metrics-content">
@@ -35,7 +40,7 @@ window.SystemMetrics = {
                         <div class="card-icon">💬</div>
                         <div class="card-content">
                             <span class="card-value">{{ formatNumber(summary.total_messages) }}</span>
-                            <span class="card-label">{{ gettext('metrics.total_messages') }}</span>
+                            <span class="card-label">{{ t('metrics.total_messages') }}</span>
                         </div>
                     </div>
                     
@@ -43,7 +48,7 @@ window.SystemMetrics = {
                         <div class="card-icon">🔤</div>
                         <div class="card-content">
                             <span class="card-value">{{ formatNumber(summary.total_tokens) }}</span>
-                            <span class="card-label">{{ gettext('metrics.total_tokens') }}</span>
+                            <span class="card-label">{{ t('metrics.total_tokens') }}</span>
                         </div>
                     </div>
                     
@@ -51,7 +56,7 @@ window.SystemMetrics = {
                         <div class="card-icon">⚡</div>
                         <div class="card-content">
                             <span class="card-value">{{ formatNumber(summary.avg_response_time) }}ms</span>
-                            <span class="card-label">{{ gettext('metrics.avg_response') }}</span>
+                            <span class="card-label">{{ t('metrics.avg_response') }}</span>
                         </div>
                     </div>
                     
@@ -59,7 +64,7 @@ window.SystemMetrics = {
                         <div class="card-icon">👥</div>
                         <div class="card-content">
                             <span class="card-value">{{ formatNumber(summary.active_users) }}</span>
-                            <span class="card-label">{{ gettext('metrics.active_users') }}</span>
+                            <span class="card-label">{{ t('metrics.active_users') }}</span>
                         </div>
                     </div>
                 </div>
@@ -69,11 +74,11 @@ window.SystemMetrics = {
                     <!-- Token használat idővonal -->
                     <div class="chart-card">
                         <div class="chart-header">
-                            <h4>{{ gettext('metrics.token_usage') }}</h4>
+                            <h4>{{ t('metrics.token_usage') }}</h4>
                             <div class="chart-legend">
                                 <span class="legend-item">
                                     <span class="legend-color" style="background: #7aa2f7;"></span>
-                                    {{ gettext('metrics.tokens') }}
+                                    {{ t('metrics.tokens') }}
                                 </span>
                             </div>
                         </div>
@@ -85,11 +90,11 @@ window.SystemMetrics = {
                     <!-- Válaszidők -->
                     <div class="chart-card">
                         <div class="chart-header">
-                            <h4>{{ gettext('metrics.response_times') }}</h4>
+                            <h4>{{ t('metrics.response_times') }}</h4>
                             <div class="chart-legend">
                                 <span class="legend-item">
                                     <span class="legend-color" style="background: #9ece6a;"></span>
-                                    {{ gettext('metrics.avg_time') }}
+                                    {{ t('metrics.avg_time') }}
                                 </span>
                             </div>
                         </div>
@@ -101,7 +106,7 @@ window.SystemMetrics = {
                     <!-- Aktív beszélgetések -->
                     <div class="chart-card">
                         <div class="chart-header">
-                            <h4>{{ gettext('metrics.active_conversations') }}</h4>
+                            <h4>{{ t('metrics.active_conversations') }}</h4>
                         </div>
                         <div class="chart-container">
                             <canvas ref="conversationChart"></canvas>
@@ -111,15 +116,15 @@ window.SystemMetrics = {
                     <!-- GPU használat (ha van) -->
                     <div class="chart-card" v-if="hasGPU">
                         <div class="chart-header">
-                            <h4>{{ gettext('metrics.gpu_usage') }}</h4>
+                            <h4>{{ t('metrics.gpu_usage') }}</h4>
                             <div class="chart-legend">
                                 <span class="legend-item">
                                     <span class="legend-color" style="background: #f7768e;"></span>
-                                    {{ gettext('metrics.gpu_0') }}
+                                    {{ t('metrics.gpu_0') }}
                                 </span>
                                 <span class="legend-item" v-if="gpuCount > 1">
                                     <span class="legend-color" style="background: #bb9af7;"></span>
-                                    {{ gettext('metrics.gpu_1') }}
+                                    {{ t('metrics.gpu_1') }}
                                 </span>
                             </div>
                         </div>
@@ -133,14 +138,14 @@ window.SystemMetrics = {
                 <div class="details-section">
                     <!-- Legaktívabb felhasználók -->
                     <div class="details-card">
-                        <h4>{{ gettext('metrics.top_users') }}</h4>
+                        <h4>{{ t('metrics.top_users') }}</h4>
                         <table class="metrics-table">
                             <thead>
                                 <tr>
-                                    <th>{{ gettext('metrics.user') }}</th>
-                                    <th>{{ gettext('metrics.messages') }}</th>
-                                    <th>{{ gettext('metrics.tokens') }}</th>
-                                    <th>{{ gettext('metrics.avg_time') }}</th>
+                                    <th>{{ t('metrics.user') }}</th>
+                                    <th>{{ t('metrics.messages') }}</th>
+                                    <th>{{ t('metrics.tokens') }}</th>
+                                    <th>{{ t('metrics.avg_time') }}</th>
                                 </tr>
                             </thead>
                             <tbody>
@@ -156,13 +161,13 @@ window.SystemMetrics = {
                     
                     <!-- Leggyakoribb intentek -->
                     <div class="details-card">
-                        <h4>{{ gettext('metrics.top_intents') }}</h4>
+                        <h4>{{ t('metrics.top_intents') }}</h4>
                         <table class="metrics-table">
                             <thead>
                                 <tr>
-                                    <th>{{ gettext('metrics.intent') }}</th>
-                                    <th>{{ gettext('metrics.count') }}</th>
-                                    <th>{{ gettext('metrics.percentage') }}</th>
+                                    <th>{{ t('metrics.intent') }}</th>
+                                    <th>{{ t('metrics.count') }}</th>
+                                    <th>{{ t('metrics.percentage') }}</th>
                                 </tr>
                             </thead>
                             <tbody>
@@ -177,7 +182,7 @@ window.SystemMetrics = {
                     
                     <!-- Rendszer erőforrások -->
                     <div class="details-card">
-                        <h4>{{ gettext('metrics.system_resources') }}</h4>
+                        <h4>{{ t('metrics.system_resources') }}</h4>
                         <div class="resource-list">
                             <div class="resource-item">
                                 <span class="resource-label">CPU:</span>
@@ -223,6 +228,17 @@ window.SystemMetrics = {
     `,
     
     setup() {
+        // ====================================================================
+        // BIZTONSÁGOS GETTEXT
+        // ====================================================================
+        
+        const t = (key, params = {}) => {
+            if (window.gettext) {
+                return window.gettext(key, params);
+            }
+            return key;
+        };
+        
         // ====================================================================
         // REAKTÍV ÁLLAPOTOK
         // ====================================================================
@@ -272,24 +288,30 @@ window.SystemMetrics = {
         // SEGÉDFÜGGVÉNYEK
         // ====================================================================
         
-        const gettext = (key, params = {}) => {
-            return window.gettext ? window.gettext(key, params) : key;
-        };
-        
         const formatNumber = (num) => {
             if (num === undefined || num === null) return '0';
+            if (typeof window.formatNumber === 'function') {
+                return window.formatNumber(num);
+            }
             return num.toLocaleString();
         };
         
         const formatTime = (timestamp) => {
-            const date = new Date(timestamp);
+            if (typeof window.formatTime === 'function') {
+                return window.formatTime(timestamp);
+            }
             
-            if (timeRange.value === 'hour') {
-                return date.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
-            } else if (timeRange.value === 'day') {
-                return date.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
-            } else {
-                return date.toLocaleDateString([], { month: 'short', day: 'numeric' });
+            try {
+                const date = new Date(timestamp);
+                if (timeRange.value === 'hour') {
+                    return date.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+                } else if (timeRange.value === 'day') {
+                    return date.toLocaleTimeString([], { hour: '2-digit', minute: '2-digit' });
+                } else {
+                    return date.toLocaleDateString([], { month: 'short', day: 'numeric' });
+                }
+            } catch (e) {
+                return timestamp;
             }
         };
         
@@ -298,6 +320,49 @@ window.SystemMetrics = {
         // ====================================================================
         
         const initCharts = () => {
+            // Ellenőrizzük, hogy a Chart.js elérhető-e
+            if (typeof Chart === 'undefined') {
+                console.warn('⚠️ SystemMetrics: Chart.js nem elérhető');
+                return;
+            }
+            
+            const chartOptions = {
+                responsive: true,
+                maintainAspectRatio: false,
+                plugins: {
+                    legend: {
+                        display: false
+                    },
+                    tooltip: {
+                        mode: 'index',
+                        intersect: false,
+                        backgroundColor: '#1a1e24',
+                        titleColor: '#e0e0e0',
+                        bodyColor: '#e0e0e0',
+                        borderColor: '#2a2f38',
+                        borderWidth: 1
+                    }
+                },
+                scales: {
+                    x: {
+                        grid: {
+                            color: '#2a2f38'
+                        },
+                        ticks: {
+                            color: '#888'
+                        }
+                    },
+                    y: {
+                        grid: {
+                            color: '#2a2f38'
+                        },
+                        ticks: {
+                            color: '#888'
+                        }
+                    }
+                }
+            };
+            
             // Token használat chart
             if (tokenChart.value) {
                 charts.token = new Chart(tokenChart.value, {
@@ -305,7 +370,7 @@ window.SystemMetrics = {
                     data: {
                         labels: timeSeriesData.value.timestamps.map(ts => formatTime(ts)),
                         datasets: [{
-                            label: gettext('metrics.tokens'),
+                            label: t('metrics.tokens'),
                             data: timeSeriesData.value.tokens,
                             borderColor: '#7aa2f7',
                             backgroundColor: 'rgba(122, 162, 247, 0.1)',
@@ -324,7 +389,7 @@ window.SystemMetrics = {
                     data: {
                         labels: timeSeriesData.value.timestamps.map(ts => formatTime(ts)),
                         datasets: [{
-                            label: gettext('metrics.avg_time'),
+                            label: t('metrics.avg_time'),
                             data: timeSeriesData.value.responses,
                             borderColor: '#9ece6a',
                             backgroundColor: 'rgba(158, 206, 106, 0.1)',
@@ -343,7 +408,7 @@ window.SystemMetrics = {
                     data: {
                         labels: timeSeriesData.value.timestamps.map(ts => formatTime(ts)),
                         datasets: [{
-                            label: gettext('metrics.conversations'),
+                            label: t('metrics.conversations'),
                             data: timeSeriesData.value.conversations,
                             backgroundColor: '#e5c890',
                             borderRadius: 4
@@ -369,7 +434,7 @@ window.SystemMetrics = {
                 
                 if (gpuCount.value >= 1) {
                     datasets.push({
-                        label: gettext('metrics.gpu_0'),
+                        label: t('metrics.gpu_0'),
                         data: timeSeriesData.value.gpu.map(d => d[0] || 0),
                         borderColor: '#f7768e',
                         backgroundColor: 'rgba(247, 118, 142, 0.1)',
@@ -379,7 +444,7 @@ window.SystemMetrics = {
                 
                 if (gpuCount.value >= 2) {
                     datasets.push({
-                        label: gettext('metrics.gpu_1'),
+                        label: t('metrics.gpu_1'),
                         data: timeSeriesData.value.gpu.map(d => d[1] || 0),
                         borderColor: '#bb9af7',
                         backgroundColor: 'rgba(187, 154, 247, 0.1)',
@@ -411,64 +476,31 @@ window.SystemMetrics = {
             hasCharts.value = true;
         };
         
-        const chartOptions = {
-            responsive: true,
-            maintainAspectRatio: false,
-            plugins: {
-                legend: {
-                    display: false
-                },
-                tooltip: {
-                    mode: 'index',
-                    intersect: false,
-                    backgroundColor: '#1a1e24',
-                    titleColor: '#e0e0e0',
-                    bodyColor: '#e0e0e0',
-                    borderColor: '#2a2f38',
-                    borderWidth: 1
-                }
-            },
-            scales: {
-                x: {
-                    grid: {
-                        color: '#2a2f38'
-                    },
-                    ticks: {
-                        color: '#888'
-                    }
-                },
-                y: {
-                    grid: {
-                        color: '#2a2f38'
-                    },
-                    ticks: {
-                        color: '#888'
-                    }
-                }
-            }
-        };
-        
         const updateCharts = () => {
+            if (!hasCharts.value || typeof Chart === 'undefined') return;
+            
+            const labels = timeSeriesData.value.timestamps.map(ts => formatTime(ts));
+            
             if (charts.token) {
-                charts.token.data.labels = timeSeriesData.value.timestamps.map(ts => formatTime(ts));
+                charts.token.data.labels = labels;
                 charts.token.data.datasets[0].data = timeSeriesData.value.tokens;
                 charts.token.update();
             }
             
             if (charts.response) {
-                charts.response.data.labels = timeSeriesData.value.timestamps.map(ts => formatTime(ts));
+                charts.response.data.labels = labels;
                 charts.response.data.datasets[0].data = timeSeriesData.value.responses;
                 charts.response.update();
             }
             
             if (charts.conversation) {
-                charts.conversation.data.labels = timeSeriesData.value.timestamps.map(ts => formatTime(ts));
+                charts.conversation.data.labels = labels;
                 charts.conversation.data.datasets[0].data = timeSeriesData.value.conversations;
                 charts.conversation.update();
             }
             
             if (charts.gpu && hasGPU.value) {
-                charts.gpu.data.labels = timeSeriesData.value.timestamps.map(ts => formatTime(ts));
+                charts.gpu.data.labels = labels;
                 
                 if (gpuCount.value >= 1) {
                     charts.gpu.data.datasets[0].data = timeSeriesData.value.gpu.map(d => d[0] || 0);
@@ -491,7 +523,11 @@ window.SystemMetrics = {
             
             try {
                 if (window.api) {
-                    const data = await window.api.getMetrics(timeRange.value);
+                    // JAVÍTVA: object formában adjuk át a paramétereket
+                    const data = await window.api.getMetrics({ 
+                        period: timeRange.value, 
+                        limit: 100 
+                    });
                     processMetricsData(data);
                 } else {
                     // Demo adatok
@@ -506,7 +542,7 @@ window.SystemMetrics = {
                 
                 // Chartok frissítése
                 Vue.nextTick(() => {
-                    if (!hasCharts.value) {
+                    if (!hasCharts.value && typeof Chart !== 'undefined') {
                         initCharts();
                     } else {
                         updateCharts();
@@ -515,6 +551,9 @@ window.SystemMetrics = {
                 
             } catch (error) {
                 console.error('Error loading metrics:', error);
+                if (window.showNotification) {
+                    window.showNotification(t('metrics.load_error'), 'error');
+                }
             } finally {
                 loading.value = false;
             }
@@ -543,7 +582,10 @@ window.SystemMetrics = {
         };
         
         const processMetricsData = (data) => {
-            if (!data) return;
+            if (!data) {
+                generateDemoData();
+                return;
+            }
             
             // Összesített adatok
             summary.value = {
@@ -628,11 +670,11 @@ window.SystemMetrics = {
             const total = Math.floor(Math.random() * 1000) + 500;
             
             for (let i = 0; i < count; i++) {
-                const count = Math.floor(Math.random() * 300) + 50;
+                const cnt = Math.floor(Math.random() * 300) + 50;
                 intents.push({
                     name: names[i] || `intent_${i + 1}`,
-                    count: count,
-                    percentage: Math.round((count / total) * 100)
+                    count: cnt,
+                    percentage: Math.round((cnt / total) * 100)
                 });
             }
             
@@ -703,7 +745,7 @@ window.SystemMetrics = {
                 
             } else if (format === 'png') {
                 // Itt lehetne screenshotot készíteni a chartokról
-                alert(gettext('metrics.png_export_not_implemented'));
+                alert(t('metrics.png_export_not_implemented'));
             }
         };
         
@@ -730,6 +772,10 @@ window.SystemMetrics = {
             });
         });
         
+        // ====================================================================
+        // RETURN
+        // ====================================================================
+        
         return {
             // Állapotok
             loading,
@@ -749,8 +795,10 @@ window.SystemMetrics = {
             conversationChart,
             gpuChart,
             
+            // Fordítás
+            t,
+            
             // Metódusok
-            gettext,
             formatNumber,
             loadMetrics,
             exportMetrics

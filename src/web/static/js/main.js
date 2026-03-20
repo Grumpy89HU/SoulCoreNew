@@ -1,443 +1,496 @@
-// Fő Vue alkalmazás
-const { createApp } = Vue;
+// ==============================================
+// SOULCORE 3.0 - Fő Vue alkalmazás
+// ==============================================
 
-console.log('🚀 SoulCore Frontend indítása...');
-console.log('📊 Vue verzió:', Vue.version);
-console.log('📦 Store létezik:', !!window.store);
-console.log('🔌 SocketManager létezik:', !!window.socketManager);
-console.log('🧩 Komponensek:', {
-    ConversationList: !!window.ConversationList,
-    ChatBox: !!window.ChatBox,
-    TelemetryPanel: !!window.TelemetryPanel,
-    AdminPanel: !!window.AdminPanel,
-    ModuleControl: !!window.ModuleControl,
-    ModelSelector: !!window.ModelSelector,
-    PromptEditor: !!window.PromptEditor,
-    SettingsPanel: !!window.SettingsPanel
-});
+// ========================================================================
+// GLOBÁLIS SEGÉDFÜGGVÉNYEK
+// ========================================================================
 
-// Globális segédfüggvények a template-ekhez
-window.gettext = (key, params) => {
-    if (window.i18n) {
-        return window.i18n.get(key, params);
-    }
-    return key;
+window.getNotificationIcon = function(type) {
+    const icons = {
+        'success': '✅',
+        'error': '❌',
+        'warning': '⚠️',
+        'info': 'ℹ️'
+    };
+    return icons[type] || '📢';
 };
 
-window.changeLanguage = (lang) => {
-    if (window.i18n) {
-        window.i18n.load(lang);
-        if (window.store) {
-            window.store.setUserLanguage(lang);
+window.formatUptime = function(seconds) {
+    if (seconds === undefined || seconds === null) return '0s';
+    const h = Math.floor(seconds / 3600);
+    const m = Math.floor((seconds % 3600) / 60);
+    const s = Math.floor(seconds % 60);
+    const parts = [];
+    if (h > 0) parts.push(`${h}h`);
+    if (m > 0) parts.push(`${m}m`);
+    if (s > 0 || parts.length === 0) parts.push(`${s}s`);
+    return parts.join(' ');
+};
+
+window.truncate = function(text, len = 100) {
+    if (!text) return '';
+    return text.length > len ? text.substring(0, len) + '...' : text;
+};
+
+// ========================================================================
+// STORE - globális állapot
+// ========================================================================
+
+// Store létrehozása
+window.store = {
+    state: Vue.reactive({
+        authenticated: true,
+        user: { id: 1, username: 'admin', role: 'admin', email: 'admin@localhost' },
+        connected: true,
+        systemId: 'soulcore-' + Math.random().toString(36).substr(2, 8),
+        conversations: [
+            { id: 1, title: 'Első beszélgetés', last_message: 'Helló!', updated_at: Date.now() - 3600000, message_count: 3 },
+            { id: 2, title: 'Második beszélgetés', last_message: 'Hogy vagy?', updated_at: Date.now() - 7200000, message_count: 2 }
+        ],
+        currentConversationId: 1,
+        messages: {
+            1: [
+                { id: 1, role: 'user', content: 'Helló!', timestamp: Date.now() - 7200000 },
+                { id: 2, role: 'assistant', content: 'Szia! Hogy segíthetek?', timestamp: Date.now() - 7190000 },
+                { id: 3, role: 'user', content: 'Mi újság?', timestamp: Date.now() - 7180000 },
+                { id: 4, role: 'assistant', content: 'Minden rendben, te hogy vagy?', timestamp: Date.now() - 7170000 }
+            ],
+            2: []
+        },
+        models: [],
+        prompts: [],
+        modules: {
+            'orchestrator': 'running',
+            'king': 'ready',
+            'queen': 'ready',
+            'jester': 'running',
+            'scribe': 'running',
+            'valet': 'ready',
+            'sentinel': 'running',
+            'heartbeat': 'running'
+        },
+        kingState: { status: 'ready', mood: 'neutral', model_loaded: true },
+        heartbeat: { uptime_seconds: 124, running: true, beats: 42 },
+        notifications: [],
+        ui: {
+            leftPanelVisible: true,
+            rightPanelVisible: true,
+            isMobile: window.innerWidth <= 768
+        }
+    }),
+    
+    // GETTEREK
+    get authenticated() { return this.state.authenticated },
+    get user() { return this.state.user },
+    get connected() { return this.state.connected },
+    get systemId() { return this.state.systemId },
+    get conversations() { return this.state.conversations },
+    get currentConversationId() { return this.state.currentConversationId },
+    get messages() { 
+        const id = this.state.currentConversationId;
+        return id ? (this.state.messages[id] || []) : [];
+    },
+    get modules() { return this.state.modules },
+    get kingState() { return this.state.kingState },
+    get heartbeat() { return this.state.heartbeat },
+    get notifications() { return this.state.ui.notifications },
+    get leftPanelVisible() { return this.state.ui.leftPanelVisible },
+    get rightPanelVisible() { return this.state.ui.rightPanelVisible },
+    get isMobile() { return this.state.ui.isMobile },
+    
+    // METÓDUSOK
+    setConversations(val) { this.state.conversations = val },
+    setCurrentConversationId(id) { this.state.currentConversationId = id },
+    setMessages(id, msgs) { this.state.messages[id] = msgs },
+    addMessage(id, msg) {
+        if (!this.state.messages[id]) this.state.messages[id] = [];
+        this.state.messages[id].push(msg);
+    },
+    removeConversation(id) {
+        this.state.conversations = this.state.conversations.filter(c => c.id !== id);
+        if (this.state.currentConversationId === id) this.state.currentConversationId = null;
+    },
+    toggleLeftPanel() { 
+        this.state.ui.leftPanelVisible = !this.state.ui.leftPanelVisible;
+        if (this.state.ui.isMobile && this.state.ui.leftPanelVisible) {
+            this.state.ui.rightPanelVisible = false;
+        }
+    },
+    toggleRightPanel() { 
+        this.state.ui.rightPanelVisible = !this.state.ui.rightPanelVisible;
+        if (this.state.ui.isMobile && this.state.ui.rightPanelVisible) {
+            this.state.ui.leftPanelVisible = false;
+        }
+    },
+    closeAllPanels() { 
+        this.state.ui.leftPanelVisible = false; 
+        this.state.ui.rightPanelVisible = false;
+    },
+    addNotification(type, message, title = null) {
+        const id = Date.now() + Math.random();
+        this.state.ui.notifications.push({ id, type, message, title });
+        setTimeout(() => {
+            this.state.ui.notifications = this.state.ui.notifications.filter(n => n.id !== id);
+        }, 5000);
+    },
+    removeNotification(id) {
+        this.state.ui.notifications = this.state.ui.notifications.filter(n => n.id !== id);
+    },
+    handleResize() {
+        this.state.ui.isMobile = window.innerWidth <= 768;
+        if (!this.state.ui.isMobile) {
+            this.state.ui.leftPanelVisible = true;
+            this.state.ui.rightPanelVisible = true;
         }
     }
 };
 
-// Gyökér komponens definiálása a szükséges adatokkal
-const App = {
-    setup() {
-        // ====================================================================
-        // REAKTÍV ÁLLAPOTOK
-        // ====================================================================
-        
-        // Alap állapotok
-        const heartbeatRunning = Vue.ref(true);
-        const currentTime = Vue.ref(new Date().toLocaleTimeString());
-        const pageTitle = Vue.ref('SoulCore');
-        const isLoading = Vue.ref(false);
-        
-        // Modálok
-        const showLoginModal = Vue.ref(false);
-        const showConfirmModal = Vue.ref(false);
-        const showSettingsModal = Vue.ref(false);
-        const showAboutModal = Vue.ref(false);
-        
-        // Login
-        const loginPassword = Vue.ref('');
-        const loginError = Vue.ref('');
-        
-        // Confirm modal
-        const confirmTitle = Vue.ref('');
-        const confirmMessage = Vue.ref('');
-        let confirmCallback = null;
-        
-        // Settings
-        const activeSettingsTab = Vue.ref('general');
-        
-        // Nyelv
-        const language = Vue.ref(window.i18n?.language || window.store?.userLanguage || 'en');
-        
-        // Notifications (helyi, mert a store-ban is van)
-        const notifications = Vue.ref([]);
-        
-        // ====================================================================
-        // COMPUTED PROPERTIES (store-ból)
-        // ====================================================================
-        
-        const connected = Vue.computed(() => window.store?.connected || false);
-        const isAdmin = Vue.computed(() => window.store?.isAdmin || false);
-        const userName = Vue.computed(() => window.store?.userName || 'User');
-        const userLanguage = Vue.computed(() => window.store?.userLanguage || 'en');
-        
-        const heartbeat = Vue.computed(() => window.store?.heartbeat || {});
-        const kingState = Vue.computed(() => window.store?.kingState || {});
-        const queenState = Vue.computed(() => window.store?.queenState || {});
-        const jesterState = Vue.computed(() => window.store?.jesterState || {});
-        const valetState = Vue.computed(() => window.store?.valetState || {});
-        const gpuStatus = Vue.computed(() => window.store?.gpuStatus || []);
-        const sentinelState = Vue.computed(() => window.store?.sentinelState || {});
-        const moduleStatuses = Vue.computed(() => window.store?.moduleStatuses || {});
-        
-        const conversations = Vue.computed(() => window.store?.conversations || []);
-        const messages = Vue.computed(() => window.store?.messages || []);
-        const currentConversationId = Vue.computed(() => window.store?.currentConversationId);
-        
-        const models = Vue.computed(() => window.store?.models || []);
-        const prompts = Vue.computed(() => window.store?.prompts || []);
-        const personalities = Vue.computed(() => window.store?.personalities || []);
-        const settings = Vue.computed(() => window.store?.settings || {});
-        
-        const metrics = Vue.computed(() => window.store?.metrics || {});
-        
-        // ====================================================================
-        // SEGÉDFÜGGVÉNYEK
-        // ====================================================================
-        
-        const formatUptime = (seconds) => {
-            return window.store?.formatUptime ? window.store.formatUptime(seconds) : (seconds + 's');
-        };
-        
-        const formatDate = (dateStr) => {
-            return window.store?.formatDate ? window.store.formatDate(dateStr) : dateStr;
-        };
-        
-        const formatTime = (timestamp) => {
-            return window.store?.formatTime ? window.store.formatTime(timestamp) : timestamp;
-        };
-        
-        const formatBytes = (bytes) => {
-            return window.store?.formatBytes ? window.store.formatBytes(bytes) : bytes;
-        };
-        
-        const formatNumber = (num) => {
-            return window.store?.formatNumber ? window.store.formatNumber(num) : num;
-        };
-        
-        // ====================================================================
-        // METÓDUSOK - BESZÉLGETÉSEK
-        // ====================================================================
-        
-        const createNewConversation = () => {
-            const defaultTitle = window.gettext('ui.new_conversation') + ' ' + new Date().toLocaleString();
-            const title = prompt(window.gettext('ui.conversation_title'), defaultTitle);
-            if (title && window.socketManager) {
-                window.socketManager.createConversation(title);
-            }
-        };
-        
-        const loadConversation = (id) => {
-            if (window.socketManager) {
-                window.socketManager.loadConversation(id);
-            }
-        };
-        
-        const deleteConversation = (id) => {
-            if (window.socketManager) {
-                window.socketManager.deleteConversation(id);
-            }
-        };
-        
-        // ====================================================================
-        // METÓDUSOK - ADMIN
-        // ====================================================================
-        
-        const adminLogin = () => {
-            if (window.socketManager && loginPassword.value) {
-                window.socketManager.adminLogin(loginPassword.value);
-                showLoginModal.value = false;
-                loginPassword.value = '';
-            }
-        };
-        
-        const adminLogout = () => {
-            if (window.socketManager) {
-                window.socketManager.adminLogout();
-            }
-        };
-        
-        const controlModule = (module, action) => {
-            if (window.socketManager) {
-                window.socketManager.controlModule(module, action);
-            }
-        };
-        
-        const activateModel = (id) => {
-            if (window.socketManager) {
-                window.socketManager.activateModel(id);
-            }
-        };
-        
-        // ====================================================================
-        // METÓDUSOK - MODÁLOK
-        // ====================================================================
-        
-        const showConfirm = (title, message, callback) => {
-            confirmTitle.value = title;
-            confirmMessage.value = message;
-            confirmCallback = callback;
-            showConfirmModal.value = true;
-        };
-        
-        const confirmAction = () => {
-            if (confirmCallback) {
-                confirmCallback();
-                confirmCallback = null;
-            }
-            showConfirmModal.value = false;
-        };
-        
-        const showNotification = (message, type = 'info', timeout = 5000) => {
-            const id = Date.now() + Math.random();
-            notifications.value.push({ id, message, type });
+// Resize esemény
+window.addEventListener('resize', () => window.store.handleResize());
+
+// ========================================================================
+// KOMPONENSEK
+// ========================================================================
+
+// ConversationList komponens (NINCS VÉGTELEN CIKLUS!)
+window.ConversationList = {
+    name: 'ConversationList',
+    template: `
+        <div class="conversation-list">
+            <button class="btn btn-primary new-conv-btn" @click="createNew" style="width: 100%; margin-bottom: 16px;">
+                + Új beszélgetés
+            </button>
             
-            if (timeout > 0) {
-                setTimeout(() => {
-                    const index = notifications.value.findIndex(n => n.id === id);
-                    if (index !== -1) {
-                        notifications.value.splice(index, 1);
-                    }
-                }, timeout);
+            <div v-if="conversations.length === 0" class="empty-state">
+                <div class="empty-icon">💬</div>
+                <div class="empty-text">Nincs még beszélgetés</div>
+                <button class="btn btn-primary" @click="createNew">Új beszélgetés</button>
+            </div>
+            
+            <div v-else class="conv-list">
+                <div v-for="conv in conversations" :key="conv.id" class="conv-item" :class="{ active: currentId === conv.id }" @click="select(conv.id)">
+                    <div class="conv-title">{{ conv.title || 'Cím nélkül' }}</div>
+                    <div class="conv-preview" v-if="conv.last_message">{{ truncate(conv.last_message, 50) }}</div>
+                    <div class="conv-meta">
+                        <span>{{ formatRelativeTime(conv.updated_at) }}</span>
+                        <button class="delete-btn" @click.stop="deleteConv(conv.id)">🗑️</button>
+                    </div>
+                </div>
+            </div>
+        </div>
+    `,
+    setup() {
+        const conversations = Vue.computed(() => window.store.conversations);
+        const currentId = Vue.computed(() => window.store.currentConversationId);
+        
+        const formatRelativeTime = (ts) => {
+            if (!ts) return '';
+            const diff = Math.floor((Date.now() - new Date(ts).getTime()) / 60000);
+            if (diff < 1) return 'most';
+            if (diff < 60) return `${diff} perce`;
+            if (diff < 1440) return `${Math.floor(diff / 60)} órája`;
+            return new Date(ts).toLocaleDateString();
+        };
+        
+        const createNew = () => {
+            const title = prompt('Beszélgetés címe');
+            if (title) {
+                const newConv = {
+                    id: Date.now(),
+                    title: title,
+                    last_message: null,
+                    updated_at: Date.now(),
+                    message_count: 0
+                };
+                window.store.setConversations([newConv, ...window.store.conversations]);
+                window.store.setCurrentConversationId(newConv.id);
+                window.store.setMessages(newConv.id, []);
             }
         };
         
-        const removeNotification = (id) => {
-            const index = notifications.value.findIndex(n => n.id === id);
-            if (index !== -1) {
-                notifications.value.splice(index, 1);
+        const select = (id) => {
+            window.store.setCurrentConversationId(id);
+        };
+        
+        const deleteConv = (id) => {
+            if (confirm('Biztosan törli ezt a beszélgetést?')) {
+                window.store.removeConversation(id);
             }
         };
         
-        // ====================================================================
-        // METÓDUSOK - NYELV
-        // ====================================================================
+        return { conversations, currentId, formatRelativeTime, truncate: window.truncate, createNew, select, deleteConv };
+    }
+};
+
+// ChatBox komponens
+window.ChatBox = {
+    name: 'ChatBox',
+    template: `
+        <div class="chat-container">
+            <div class="chat-header">
+                <h3>{{ currentConversation?.title || 'Új beszélgetés' }}</h3>
+            </div>
+            <div class="chat-messages" ref="messagesContainer">
+                <div v-if="messages.length === 0" class="empty-state">
+                    <div class="empty-icon">💬</div>
+                    <div class="empty-text">Kezdjen el beszélgetni!</div>
+                </div>
+                <div v-for="msg in messages" :key="msg.id" class="message" :class="msg.role">
+                    <div class="sender">{{ msg.role === 'user' ? 'Te' : 'Kópé' }}</div>
+                    <div class="content">{{ msg.content }}</div>
+                    <div class="time">{{ formatTime(msg.timestamp) }}</div>
+                </div>
+                <div v-if="typing" class="typing-indicator">✍️ gépel...</div>
+            </div>
+            <div class="chat-input-area">
+                <textarea v-model="inputMessage" @keydown.enter.exact.prevent="send" :placeholder="'Írja be üzenetét...'" rows="1"></textarea>
+                <button class="send-btn" @click="send" :disabled="!inputMessage.trim()">📤</button>
+            </div>
+        </div>
+    `,
+    setup() {
+        const currentConversation = Vue.computed(() => {
+            const id = window.store.currentConversationId;
+            return window.store.conversations.find(c => c.id === id);
+        });
+        const messages = Vue.computed(() => window.store.messages);
+        const inputMessage = Vue.ref('');
+        const typing = Vue.ref(false);
+        const messagesContainer = Vue.ref(null);
         
-        const changeLanguage = (lang) => {
-            language.value = lang;
-            window.changeLanguage(lang);
-            showNotification(window.gettext('ui.language_changed'), 'success', 3000);
-        };
+        const formatTime = (ts) => ts ? new Date(ts).toLocaleTimeString() : '';
         
-        // ====================================================================
-        // METÓDUSOK - EGYÉB
-        // ====================================================================
-        
-        const refreshData = () => {
-            if (window.socketManager) {
-                window.socketManager.getStatus();
-                window.socketManager.getConversations();
-                window.socketManager.getPrompts();
-                window.socketManager.getSettings();
-                window.socketManager.getModels();
-                window.socketManager.getPersonalities();
-            }
-        };
-        
-        const copyToClipboard = (text) => {
-            navigator.clipboard.writeText(text).then(() => {
-                showNotification(window.gettext('ui.copied'), 'success', 2000);
-            }).catch(() => {
-                showNotification(window.gettext('ui.copy_failed'), 'error', 3000);
+        const scrollToBottom = () => {
+            Vue.nextTick(() => {
+                if (messagesContainer.value) messagesContainer.value.scrollTop = messagesContainer.value.scrollHeight;
             });
         };
         
-        // ====================================================================
-        // WATCHEREK
-        // ====================================================================
-        
-        // Store-beli értesítések figyelése
-        Vue.watch(() => window.store?.error, (newError) => {
-            if (newError) {
-                showNotification(newError, 'error', 5000);
-            }
-        });
-        
-        // Nyelv változás figyelése
-        Vue.watch(language, (newLang) => {
-            document.documentElement.lang = newLang;
-        });
-        
-        // ====================================================================
-        // ÉLETCIKLUS HOOKOK
-        // ====================================================================
-        
-        // Idő frissítése
-        setInterval(() => {
-            currentTime.value = new Date().toLocaleTimeString(userLanguage.value);
-        }, 1000);
-        
-        // Rendszeres státusz lekérés
-        setInterval(() => {
-            if (connected.value && window.socketManager) {
-                window.socketManager.getStatus();
-            }
-        }, 5000);
-        
-        // Kezdeti nyelv beállítása
-        Vue.onMounted(() => {
-            document.documentElement.lang = language.value;
+        const send = () => {
+            const text = inputMessage.value.trim();
+            if (!text || !window.store.currentConversationId) return;
             
-            // Store figyelése socket eseményekre
-            if (window.socketManager) {
-                window.socketManager.on('notification', (data) => {
-                    showNotification(data.message, data.type || 'info');
+            // Felhasználói üzenet hozzáadása
+            window.store.addMessage(window.store.currentConversationId, {
+                id: Date.now(), role: 'user', content: text, timestamp: Date.now()
+            });
+            inputMessage.value = '';
+            scrollToBottom();
+            
+            // Válasz szimulálása
+            setTimeout(() => {
+                window.store.addMessage(window.store.currentConversationId, {
+                    id: Date.now() + 1, role: 'assistant', content: `Válasz erre: "${text}"`, timestamp: Date.now()
                 });
-            }
+                scrollToBottom();
+            }, 500);
+        };
+        
+        Vue.watch(messages, scrollToBottom, { deep: true });
+        Vue.watch(() => window.store.currentConversationId, () => {
+            Vue.nextTick(scrollToBottom);
         });
         
-        // ====================================================================
-        // RETURN
-        // ====================================================================
+        return { currentConversation, messages, inputMessage, typing, messagesContainer, formatTime, send };
+    }
+};
+
+// TelemetryPanel komponens
+window.TelemetryPanel = {
+    name: 'TelemetryPanel',
+    template: `
+        <div class="telemetry">
+            <div class="metric-group">
+                <div class="metric-group-title">Rendszer</div>
+                <div class="metric"><label>🔧 Státusz</label><span>fut</span></div>
+                <div class="metric"><label>💓 Üzemidő</label><span>{{ formatUptime(heartbeat.uptime_seconds) }}</span></div>
+                <div class="metric"><label>🆔 Rendszerazonosító</label><span><code>{{ systemId }}</code></span></div>
+            </div>
+            <div class="metric-group">
+                <div class="metric-group-title">Király</div>
+                <div class="metric"><label>👑 Státusz</label><span>{{ kingState.status }}</span></div>
+                <div class="metric"><label>😊 Hangulat</label><span>{{ kingState.mood }}</span></div>
+            </div>
+            <div class="metric-group">
+                <div class="metric-group-title">Modulok</div>
+                <div v-for="(status, name) in modules" :key="name" class="metric">
+                    <label>{{ formatModuleName(name) }}</label>
+                    <span class="status-badge" :class="status">{{ status }}</span>
+                </div>
+            </div>
+        </div>
+    `,
+    setup() {
+        const systemId = Vue.computed(() => window.store.systemId);
+        const kingState = Vue.computed(() => window.store.kingState);
+        const heartbeat = Vue.computed(() => window.store.heartbeat);
+        const modules = Vue.computed(() => window.store.modules);
+        
+        const formatModuleName = (name) => {
+            return name.split('_').map(w => w.charAt(0).toUpperCase() + w.slice(1)).join(' ');
+        };
+        
+        return { systemId, kingState, heartbeat, modules, formatModuleName, formatUptime: window.formatUptime };
+    }
+};
+
+// ModuleControl komponens
+window.ModuleControl = {
+    name: 'ModuleControl',
+    template: `
+        <div class="module-control">
+            <div v-for="(status, name) in modules" :key="name" class="module-item">
+                <div class="module-info">
+                    <span class="module-name">{{ formatModuleName(name) }}</span>
+                    <span class="module-status" :class="status">{{ status }}</span>
+                </div>
+                <div class="module-actions">
+                    <button v-if="status === 'stopped'" class="btn-icon" @click="control(name, 'start')">▶️</button>
+                    <button v-else-if="status !== 'error'" class="btn-icon" @click="control(name, 'stop')">⏹️</button>
+                    <button v-if="status !== 'stopped'" class="btn-icon" @click="control(name, 'restart')">🔄</button>
+                </div>
+            </div>
+        </div>
+    `,
+    setup() {
+        const modules = Vue.computed(() => window.store.modules);
+        
+        const formatModuleName = (name) => {
+            return name.split('_').map(w => w.charAt(0).toUpperCase() + w.slice(1)).join(' ');
+        };
+        
+        const control = async (module, action) => {
+            window.store.addNotification('info', `${module} - ${action} parancs küldve`);
+        };
+        
+        return { modules, formatModuleName, control };
+    }
+};
+
+// ========================================================================
+// VUE ALKALMAZÁS
+// ========================================================================
+
+const App = {
+    setup() {
+        const user = Vue.computed(() => window.store.user);
+        const isAdmin = Vue.computed(() => user.value?.role === 'admin');
+        const leftPanelVisible = Vue.computed(() => window.store.leftPanelVisible);
+        const rightPanelVisible = Vue.computed(() => window.store.rightPanelVisible);
+        const isMobile = Vue.computed(() => window.store.isMobile);
+        const connected = Vue.computed(() => window.store.connected);
+        const systemId = Vue.computed(() => window.store.systemId);
+        const heartbeat = Vue.computed(() => window.store.heartbeat);
+        const kingState = Vue.computed(() => window.store.kingState);
+        const notifications = Vue.computed(() => window.store.notifications);
+        const currentTime = Vue.ref(new Date().toLocaleTimeString());
+        const showAboutModal = Vue.ref(false);
+        const showUserMenu = Vue.ref(false);
+        
+        setInterval(() => { currentTime.value = new Date().toLocaleTimeString(); }, 1000);
+        
+        const toggleLeft = () => window.store.toggleLeftPanel();
+        const toggleRight = () => window.store.toggleRightPanel();
+        const closeAll = () => window.store.closeAllPanels();
+        const hideUserMenu = () => { showUserMenu.value = false; };
+        const removeNotification = (id) => window.store.removeNotification(id);
         
         return {
-            // Állapotok
-            heartbeatRunning,
-            currentTime,
-            pageTitle,
-            isLoading,
-            
-            // Modálok
-            showLoginModal,
-            showConfirmModal,
-            showSettingsModal,
-            showAboutModal,
-            
-            // Login
-            loginPassword,
-            loginError,
-            
-            // Confirm
-            confirmTitle,
-            confirmMessage,
-            
-            // Settings
-            activeSettingsTab,
-            
-            // Nyelv
-            language,
-            
-            // Notifications
-            notifications,
-            
-            // Computed
-            connected,
-            isAdmin,
-            userName,
-            userLanguage,
-            
-            heartbeat,
-            kingState,
-            queenState,
-            jesterState,
-            valetState,
-            gpuStatus,
-            sentinelState,
-            moduleStatuses,
-            
-            conversations,
-            messages,
-            currentConversationId,
-            
-            models,
-            prompts,
-            personalities,
-            settings,
-            
-            metrics,
-            
-            // Segédfüggvények
-            formatUptime,
-            formatDate,
-            formatTime,
-            formatBytes,
-            formatNumber,
-            gettext: window.gettext,
-            
-            // Beszélgetés metódusok
-            createNewConversation,
-            loadConversation,
-            deleteConversation,
-            
-            // Admin metódusok
-            adminLogin,
-            adminLogout,
-            controlModule,
-            activateModel,
-            
-            // Modál metódusok
-            showConfirm,
-            confirmAction,
-            
-            // Notification metódusok
-            showNotification,
-            removeNotification,
-            
-            // Nyelv metódusok
-            changeLanguage,
-            
-            // Egyéb metódusok
-            refreshData,
-            copyToClipboard
+            user, isAdmin, leftPanelVisible, rightPanelVisible, isMobile,
+            connected, systemId, heartbeat, kingState, notifications, currentTime,
+            showAboutModal, showUserMenu, toggleLeft, toggleRight, closeAll, hideUserMenu, removeNotification,
+            formatUptime: window.formatUptime, getNotificationIcon: window.getNotificationIcon
         };
-    }
+    },
+    template: `
+        <div class="header">
+            <div class="header-left">
+                <button class="menu-toggle" @click="closeAll" v-if="isMobile">☰</button>
+                <div class="logo">✦ SOULCORE 3.0</div>
+            </div>
+            <div class="header-right">
+                <div class="status-badge">
+                    <div class="badge">💓 {{ formatUptime(heartbeat?.uptime_seconds || 0) }}</div>
+                    <div class="badge">👑 {{ kingState?.status || 'unknown' }}</div>
+                </div>
+                <div class="user-menu">
+                    <button class="user-menu-btn" @click="showUserMenu = !showUserMenu">👤 {{ user?.username }}</button>
+                    <div class="user-menu-dropdown" v-if="showUserMenu" v-click-outside="hideUserMenu">
+                        <a href="/profile" class="dropdown-item">Profil</a>
+                        <a href="/login" class="dropdown-item">Kijelentkezés</a>
+                    </div>
+                </div>
+                <button class="icon-btn" @click="showAboutModal = true">ℹ️</button>
+            </div>
+        </div>
+        
+        <div class="notifications-container">
+            <div v-for="n in notifications" :key="n.id" class="notification" :class="n.type" @click="removeNotification(n.id)">
+                <span class="notification-icon">{{ getNotificationIcon(n.type) }}</span>
+                <div class="notification-content"><div class="notification-message">{{ n.message }}</div></div>
+                <button class="notification-close" @click.stop="removeNotification(n.id)">✕</button>
+            </div>
+        </div>
+        
+        <div class="modal" v-if="showAboutModal" @click.self="showAboutModal = false">
+            <div class="modal-content small">
+                <div class="modal-header"><h3>Névjegy</h3><button class="modal-close" @click="showAboutModal = false">✕</button></div>
+                <div class="modal-body" style="text-align:center"><div style="font-size:48px">✦</div><h2>SoulCore 3.0</h2><p>ID: {{ systemId }}</p></div>
+                <div class="modal-footer"><button class="btn btn-primary" @click="showAboutModal = false">Bezárás</button></div>
+            </div>
+        </div>
+        
+        <div class="main">
+            <div class="left-panel" :class="{ 'mobile-visible': leftPanelVisible && isMobile }">
+                <div class="panel-section"><div class="panel-header">Beszélgetések</div><div class="panel-content"><conversation-list></conversation-list></div></div>
+                <div class="panel-section"><div class="panel-header">Rendszerállapot</div><div class="panel-content"><telemetry-panel></telemetry-panel></div></div>
+            </div>
+            <div class="center-panel"><chat-box></chat-box></div>
+            <div class="right-panel" v-if="isAdmin" :class="{ 'mobile-visible': rightPanelVisible && isMobile }">
+                <div class="panel-section"><div class="panel-header">Modulok</div><div class="panel-content"><module-control></module-control></div></div>
+            </div>
+            <button v-if="isMobile && !leftPanelVisible" class="panel-toggle left-toggle" @click="toggleLeft">▶</button>
+            <button v-if="isMobile && !rightPanelVisible && isAdmin" class="panel-toggle right-toggle" @click="toggleRight">◀</button>
+            <div v-if="isMobile && (leftPanelVisible || rightPanelVisible)" class="panel-overlay" @click="closeAll"></div>
+        </div>
+        
+        <div class="footer">
+            <div class="footer-left"><span>v3.0.0</span><span v-if="systemId">ID: {{ systemId }}</span></div>
+            <div class="footer-center"><div class="connection-status"><span class="status-dot" :class="{ connected }"></span>{{ connected ? 'Kapcsolódva' : 'Nincs kapcsolat' }}</div></div>
+            <div class="footer-right">{{ currentTime }}</div>
+        </div>
+    `
 };
 
 // ========================================================================
-// KOMPONENSEK REGISZTRÁLÁSA
+// ALKALMAZÁS INDÍTÁSA
 // ========================================================================
 
-const app = createApp(App);
-
-// Segédkomponensek (ha hiányoznak, dummy-t rakunk)
-const registerComponent = (name, component) => {
-    if (component) {
-        app.component(name, component);
-        console.log(`✅ ${name} regisztrálva`);
-    } else {
-        console.warn(`⚠️ ${name} nem elérhető, dummy komponens használata`);
-        app.component(name, {
-            template: `<div class="component-placeholder">${name} (loading...)</div>`
-        });
+// Click outside direktíva
+const vClickOutside = {
+    beforeMount: (el, binding) => {
+        el.clickOutsideEvent = (event) => {
+            if (!(el === event.target || el.contains(event.target))) {
+                binding.value(event);
+            }
+        };
+        document.addEventListener('click', el.clickOutsideEvent);
+    },
+    unmounted: (el) => {
+        document.removeEventListener('click', el.clickOutsideEvent);
     }
 };
 
-// Fő komponensek
-registerComponent('conversation-list', window.ConversationList);
-registerComponent('chat-box', window.ChatBox);
-registerComponent('telemetry-panel', window.TelemetryPanel);
-registerComponent('admin-panel', window.AdminPanel);
+const app = Vue.createApp(App);
+app.directive('click-outside', vClickOutside);
 
-// Admin alkomponensek
-registerComponent('module-control', window.ModuleControl);
-registerComponent('model-selector', window.ModelSelector);
-registerComponent('prompt-editor', window.PromptEditor);
-registerComponent('settings-panel', window.SettingsPanel);
+// Komponensek regisztrálása
+app.component('conversation-list', window.ConversationList);
+app.component('chat-box', window.ChatBox);
+app.component('telemetry-panel', window.TelemetryPanel);
+app.component('module-control', window.ModuleControl);
 
-// ========================================================================
-// EGYÉB KONFIGURÁCIÓ
-// ========================================================================
-
-// Globális error handler
-app.config.errorHandler = (err, instance, info) => {
-    console.error('Vue error:', err);
-    console.error('Info:', info);
-    if (window.store) {
-        window.store.setError(err.message || 'Unknown Vue error');
-    }
-};
-
-// Mount
 app.mount('#app');
 
-console.log('✅ Vue app sikeresen elindult');
-console.log('🌐 Nyelv:', window.i18n?.language || 'en');
-console.log('🔗 Kapcsolat:', window.socketManager?.isConnected() ? 'aktív' : 'inaktív');
+console.log('✅ Vue alkalmazás elindult');

@@ -1,449 +1,268 @@
-// REST API hívások - GLOBÁLISAN
+// ==============================================
+// SOULCORE 3.0 - REST API kliens
+// ==============================================
+
 window.api = {
+    // Alap URL
+    baseUrl: '',
+    
     // ========================================================================
-    // ALAP METÓDUSOK
+    // ALAP FETCH METÓDUS
     // ========================================================================
     
-    async fetch(url, options = {}) {
-        const startTime = Date.now();
+    async fetch(endpoint, options = {}) {
+        const url = this.baseUrl + endpoint;
         
-        // Alapértelmezett headers
         const headers = {
             'Content-Type': 'application/json',
-            'X-Requested-With': 'XMLHttpRequest',
+            'Accept': 'application/json',
             ...options.headers
         };
         
-        // Session token (ha van)
-        const token = localStorage.getItem('session_token');
+        // Token hozzáadása, ha van
+        const token = localStorage.getItem('token');
         if (token) {
-            headers['X-Session-Token'] = token;
+            headers['Authorization'] = `Bearer ${token}`;
         }
         
         const config = {
+            credentials: 'include',
             headers,
-            credentials: 'include', // Cookie-k küldése
             ...options
         };
-        
-        // Kimenet naplózása (csak debug módban)
-        if (window.location.hostname === 'localhost' || window.location.hostname === '127.0.0.1') {
-            console.log(`📡 API ${config.method || 'GET'} ${url}`);
-        }
         
         try {
             const response = await fetch(url, config);
             
-            // Válasz idő mérése
-            const duration = Date.now() - startTime;
-            
-            // Sikertelen válasz kezelése
-            if (!response.ok) {
-                let errorData;
-                try {
-                    errorData = await response.json();
-                } catch {
-                    errorData = { message: response.statusText };
+            // Ha 401-es hiba, töröljük a session-t
+            if (response.status === 401) {
+                if (window.store) {
+                    window.store.clearAuth();
+                    window.store.addNotification('error', 'A munkamenet lejárt. Kérjük, jelentkezzen be újra.');
                 }
                 
-                const error = new Error(errorData.message || `HTTP error ${response.status}`);
-                error.status = response.status;
-                error.data = errorData;
-                throw error;
+                // Átirányítás a login oldalra, ha nem ott vagyunk
+                if (!window.location.pathname.includes('/login')) {
+                    window.location.href = '/login';
+                }
+                
+                throw new Error('Unauthorized');
             }
             
-            // JSON válasz feldolgozása
+            // Ha 403-as hiba
+            if (response.status === 403) {
+                throw new Error('Access denied');
+            }
+            
             const data = await response.json();
             
-            // Naplózás (debug)
-            if (window.location.hostname === 'localhost' || window.location.hostname === '127.0.0.1') {
-                console.log(`📡 API ${config.method || 'GET'} ${url} - ${duration}ms`);
+            if (!response.ok) {
+                throw new Error(data.error || `HTTP error ${response.status}`);
             }
             
             return data;
             
         } catch (error) {
-            console.error('❌ API fetch error:', error);
-            
-            // Hibaüzenet normalizálása
-            const errorMessage = error.message || 'Unknown error';
-            const status = error.status || 500;
-            
-            // Értesítés a store-nak (ha van)
-            if (window.store) {
-                window.store.setError(errorMessage);
-            }
-            
-            // Újra dobjuk a hibát a hívó kezeléséhez
-            throw {
-                message: errorMessage,
-                status,
-                data: error.data,
-                original: error
-            };
+            console.error('❌ API hívás hiba:', error);
+            throw error;
         }
     },
     
     // ========================================================================
-    // SEGÉDFÜGGVÉNYEK
+    // AUTH API
     // ========================================================================
     
-    _buildQueryString(params) {
-        if (!params) return '';
-        const query = Object.entries(params)
-            .filter(([_, value]) => value !== undefined && value !== null)
-            .map(([key, value]) => `${encodeURIComponent(key)}=${encodeURIComponent(value)}`)
-            .join('&');
-        return query ? `?${query}` : '';
+    async login(username, password) {
+        const data = await this.fetch('/api/auth/login', {
+            method: 'POST',
+            body: JSON.stringify({ username, password })
+        });
+        
+        if (window.store) {
+            window.store.setAuth(data);
+        }
+        return data;
     },
     
-    _handleResponse(data, errorMessage) {
-        if (data.error) {
-            throw new Error(data.error);
+    async logout() {
+        await this.fetch('/api/auth/logout', { method: 'POST' });
+        if (window.store) {
+            window.store.clearAuth();
+        }
+        window.location.href = '/login';
+    },
+    
+    async register(username, email, password) {
+        const data = await this.fetch('/api/auth/register', {
+            method: 'POST',
+            body: JSON.stringify({ username, email, password })
+        });
+        
+        return data;
+    },
+    
+    async getCurrentUser() {
+        try {
+            const data = await this.fetch('/api/auth/me');
+            if (data.authenticated && window.store) {
+                window.store.setAuth(data);
+            }
+            return data;
+        } catch (error) {
+            return { authenticated: false };
+        }
+    },
+    
+    // ========================================================================
+    // RENDSZER API
+    // ========================================================================
+    
+    async getStatus() {
+        const data = await this.fetch('/api/status');
+        if (window.store) {
+            window.store.setSystemId(data.system_id);
+            window.store.setUptime(data.uptime);
+            window.store.setStatus(data.status);
+        }
+        return data;
+    },
+    
+    async getKingState() {
+        const data = await this.fetch('/api/king/state');
+        if (window.store) {
+            window.store.setKingState(data);
+        }
+        return data;
+    },
+    
+    async getSentinelStatus() {
+        const data = await this.fetch('/api/sentinel/status');
+        if (window.store) {
+            window.store.setSentinelState(data);
         }
         return data;
     },
     
     // ========================================================================
-    // RENDSZER STÁTUSZ
+    // BESZÉLGETÉSEK API
     // ========================================================================
     
-    async getStatus() {
-        const data = await this.fetch('/api/status');
-        return this._handleResponse(data);
+    async getConversations(limit = 50, offset = 0) {
+        const data = await this.fetch(`/api/conversations?limit=${limit}&offset=${offset}`);
+        if (window.store) {
+            window.store.setConversations(data.conversations);
+        }
+        return data;
     },
     
-    async getKingState() {
-        const data = await this.fetch('/api/king/state');
-        return this._handleResponse(data);
-    },
-    
-    async getKingMetrics() {
-        const data = await this.fetch('/api/king/metrics');
-        return this._handleResponse(data);
-    },
-    
-    async getJesterDiagnosis() {
-        const data = await this.fetch('/api/jester/diagnosis');
-        return this._handleResponse(data);
-    },
-    
-    async getSentinelStatus() {
-        const data = await this.fetch('/api/sentinel/status');
-        return this._handleResponse(data);
-    },
-    
-    async getBlackboxStats() {
-        const data = await this.fetch('/api/blackbox/stats');
-        return this._handleResponse(data);
-    },
-    
-    async getBlackboxTrace(traceId) {
-        const data = await this.fetch(`/api/blackbox/trace/${traceId}`);
-        return this._handleResponse(data);
-    },
-    
-    async searchBlackbox(query, limit = 50) {
-        const qs = this._buildQueryString({ q: query, limit });
-        const data = await this.fetch(`/api/blackbox/search${qs}`);
-        return this._handleResponse(data);
-    },
-    
-    // ========================================================================
-    // BESZÉLGETÉSEK
-    // ========================================================================
-    
-    async getConversations(params = {}) {
-        const qs = this._buildQueryString(params);
-        const data = await this.fetch(`/api/conversations${qs}`);
-        return this._handleResponse(data);
-    },
-    
-    async createConversation(data = {}) {
-        const response = await this.fetch('/api/conversations', {
+    async createConversation(title, model = null, systemPrompt = null) {
+        const data = await this.fetch('/api/conversations', {
             method: 'POST',
-            body: JSON.stringify(data)
+            body: JSON.stringify({ title, model, system_prompt: systemPrompt })
         });
-        return this._handleResponse(response);
+        
+        // Új beszélgetés lekérése
+        await this.getConversations();
+        
+        return data;
     },
     
     async getConversation(id) {
         const data = await this.fetch(`/api/conversations/${id}`);
-        return this._handleResponse(data);
+        return data;
     },
     
-    async updateConversation(id, data) {
-        const response = await this.fetch(`/api/conversations/${id}`, {
-            method: 'PUT',
-            body: JSON.stringify(data)
+    async getMessages(conversationId, limit = 100, before = null) {
+        let url = `/api/conversations/${conversationId}/messages?limit=${limit}`;
+        if (before) {
+            url += `&before=${before}`;
+        }
+        
+        const data = await this.fetch(url);
+        if (window.store) {
+            window.store.setMessages(conversationId, data.messages);
+        }
+        return data;
+    },
+    
+    async sendMessage(conversationId, content) {
+        const data = await this.fetch(`/api/conversations/${conversationId}/messages`, {
+            method: 'POST',
+            body: JSON.stringify({ role: 'user', content })
         });
-        return this._handleResponse(response);
+        
+        return data;
     },
     
     async deleteConversation(id) {
-        const response = await this.fetch(`/api/conversations/${id}`, {
-            method: 'DELETE'
-        });
-        return this._handleResponse(response);
-    },
-    
-    async getMessages(id, params = {}) {
-        const qs = this._buildQueryString(params);
-        const data = await this.fetch(`/api/conversations/${id}/messages${qs}`);
-        return this._handleResponse(data);
-    },
-    
-    async addMessage(id, message) {
-        const response = await this.fetch(`/api/conversations/${id}/messages`, {
-            method: 'POST',
-            body: JSON.stringify(message)
-        });
-        return this._handleResponse(response);
-    },
-    
-    async exportConversation(id, format = 'json') {
-        const qs = this._buildQueryString({ format });
-        const response = await this.fetch(`/api/conversations/${id}/export${qs}`);
-        return response; // Lehet szöveg vagy JSON
+        await this.fetch(`/api/conversations/${id}`, { method: 'DELETE' });
+        if (window.store) {
+            window.store.removeConversation(id);
+        }
     },
     
     // ========================================================================
-    // PROMPT SABLONOK
+    // MODELLEK API
     // ========================================================================
     
-    async getPrompts(category = null) {
-        const qs = category ? `?category=${encodeURIComponent(category)}` : '';
-        const data = await this.fetch(`/api/prompts${qs}`);
-        return this._handleResponse(data);
-    },
-    
-    async savePrompt(prompt) {
-        const response = await this.fetch('/api/prompts', {
-            method: 'POST',
-            body: JSON.stringify(prompt)
-        });
-        return this._handleResponse(response);
-    },
-    
-    async getPrompt(id) {
-        const data = await this.fetch(`/api/prompts/${id}`);
-        return this._handleResponse(data);
-    },
-    
-    async deletePrompt(id) {
-        const response = await this.fetch(`/api/prompts/${id}`, {
-            method: 'DELETE'
-        });
-        return this._handleResponse(response);
-    },
-    
-    // ========================================================================
-    // SZEMÉLYISÉGEK
-    // ========================================================================
-    
-    async getPersonalities() {
-        const data = await this.fetch('/api/personalities');
-        return this._handleResponse(data);
-    },
-    
-    async createPersonality(data) {
-        const response = await this.fetch('/api/personalities', {
-            method: 'POST',
-            body: JSON.stringify(data)
-        });
-        return this._handleResponse(response);
-    },
-    
-    async activatePersonality(id) {
-        const response = await this.fetch(`/api/personalities/${id}/activate`, {
-            method: 'POST'
-        });
-        return this._handleResponse(response);
-    },
-    
-    // ========================================================================
-    // BEÁLLÍTÁSOK
-    // ========================================================================
-    
-    async getSettings(category = null) {
-        const qs = category ? `?category=${encodeURIComponent(category)}` : '';
-        const data = await this.fetch(`/api/settings${qs}`);
-        return this._handleResponse(data);
-    },
-    
-    async getSetting(key) {
-        const data = await this.fetch(`/api/settings/${key}`);
-        return this._handleResponse(data);
-    },
-    
-    async updateSetting(key, value, type = null, category = 'general') {
-        const response = await this.fetch(`/api/settings/${key}`, {
-            method: 'POST',
-            body: JSON.stringify({ value, type, category })
-        });
-        return this._handleResponse(response);
-    },
-    
-    // ========================================================================
-    // MODELLEK
-    // ========================================================================
-    
-    async getModels(activeOnly = true) {
-        const qs = this._buildQueryString({ active_only: activeOnly });
-        const data = await this.fetch(`/api/models${qs}`);
-        return this._handleResponse(data);
-    },
-    
-    async addModel(model) {
-        const response = await this.fetch('/api/models', {
-            method: 'POST',
-            body: JSON.stringify(model)
-        });
-        return this._handleResponse(response);
+    async getModels(activeOnly = false) {
+        const data = await this.fetch(`/api/models?active_only=${activeOnly}`);
+        if (window.store) {
+            window.store.setModels(data.models);
+        }
+        return data;
     },
     
     async activateModel(id) {
-        const response = await this.fetch(`/api/models/${id}/activate`, {
-            method: 'POST'
-        });
-        return this._handleResponse(response);
-    },
-    
-    async deleteModel(id) {
-        const response = await this.fetch(`/api/models/${id}`, {
-            method: 'DELETE'
-        });
-        return this._handleResponse(response);
+        const data = await this.fetch(`/api/models/${id}/activate`, { method: 'POST' });
+        if (window.store) {
+            window.store.activateModel(id);
+        }
+        return data;
     },
     
     // ========================================================================
-    // MODUL VEZÉRLÉS
+    // PROMPTOK API
+    // ========================================================================
+    
+    async getPrompts(category = null) {
+        const url = category ? `/api/prompts?category=${category}` : '/api/prompts';
+        const data = await this.fetch(url);
+        if (window.store) {
+            window.store.setPrompts(data.prompts);
+        }
+        return data;
+    },
+    
+    async savePrompt(prompt) {
+        const data = await this.fetch('/api/prompts', {
+            method: 'POST',
+            body: JSON.stringify(prompt)
+        });
+        
+        await this.getPrompts();
+        return data;
+    },
+    
+    async deletePrompt(id) {
+        await this.fetch(`/api/prompts/${id}`, { method: 'DELETE' });
+        await this.getPrompts();
+    },
+    
+    // ========================================================================
+    // MODUL VEZÉRLÉS (ADMIN)
     // ========================================================================
     
     async controlModule(module, action) {
-        const response = await this.fetch(`/api/modules/${module}/${action}`, {
+        const data = await this.fetch(`/api/modules/${module}/${action}`, {
             method: 'POST'
         });
-        return this._handleResponse(response);
-    },
-    
-    // ========================================================================
-    // VISION (EYE-CORE)
-    // ========================================================================
-    
-    async processImage(imageData, source = 'upload') {
-        const response = await this.fetch('/api/vision/process', {
-            method: 'POST',
-            body: JSON.stringify({ image: imageData, source })
-        });
-        return this._handleResponse(response);
-    },
-    
-    // ========================================================================
-    // SANDBOX
-    // ========================================================================
-    
-    async executeCode(code, context = {}) {
-        const response = await this.fetch('/api/tools/execute', {
-            method: 'POST',
-            body: JSON.stringify({ code, context })
-        });
-        return this._handleResponse(response);
-    },
-    
-    // ========================================================================
-    // ADMIN
-    // ========================================================================
-    
-    async login(password) {
-        const response = await this.fetch('/login', {
-            method: 'POST',
-            body: JSON.stringify({ password })
-        });
-        return this._handleResponse(response);
-    },
-    
-    async logout() {
-        const response = await this.fetch('/logout', {
-            method: 'POST'
-        });
-        return this._handleResponse(response);
-    },
-    
-    async getSession() {
-        const data = await this.fetch('/api/session');
-        return this._handleResponse(data);
-    },
-    
-    async setLanguage(lang) {
-        const response = await this.fetch('/api/language', {
-            method: 'POST',
-            body: JSON.stringify({ language: lang })
-        });
-        return this._handleResponse(response);
-    },
-    
-    // ========================================================================
-    // AUDIT LOG
-    // ========================================================================
-    
-    async getAuditLog(limit = 100) {
-        const qs = this._buildQueryString({ limit });
-        const data = await this.fetch(`/api/audit${qs}`);
-        return this._handleResponse(data);
-    },
-    
-    // ========================================================================
-    // METRIKÁK
-    // ========================================================================
-    
-    async getMetrics(period = 'hour') {
-        const qs = this._buildQueryString({ period });
-        const data = await this.fetch(`/api/metrics${qs}`);
-        return this._handleResponse(data);
-    },
-    
-    // ========================================================================
-    // EGÉSZSÉGÜGYI ELLENŐRZÉS
-    // ========================================================================
-    
-    async healthCheck() {
-        const data = await this.fetch('/health');
-        return this._handleResponse(data);
-    },
-    
-    // ========================================================================
-    // BATCH MŰVELETEK
-    // ========================================================================
-    
-    async getInitialData() {
-        try {
-            const [status, king, sentinel, conversations, prompts, settings, models, personalities] = await Promise.allSettled([
-                this.getStatus(),
-                this.getKingState(),
-                this.getSentinelStatus(),
-                this.getConversations({ limit: 50 }),
-                this.getPrompts(),
-                this.getSettings(),
-                this.getModels(),
-                this.getPersonalities()
-            ]);
-            
-            return {
-                status: status.status === 'fulfilled' ? status.value : null,
-                king: king.status === 'fulfilled' ? king.value : null,
-                sentinel: sentinel.status === 'fulfilled' ? sentinel.value : null,
-                conversations: conversations.status === 'fulfilled' ? conversations.value : null,
-                prompts: prompts.status === 'fulfilled' ? prompts.value : null,
-                settings: settings.status === 'fulfilled' ? settings.value : null,
-                models: models.status === 'fulfilled' ? models.value : null,
-                personalities: personalities.status === 'fulfilled' ? personalities.value : null
-            };
-        } catch (error) {
-            console.error('Batch data fetch error:', error);
-            return {};
-        }
+        
+        // Státusz frissítése
+        setTimeout(() => this.getStatus(), 500);
+        
+        return data;
     }
 };
 
-console.log('✅ API betöltve globálisan');
+console.log('✅ API modul betöltve');

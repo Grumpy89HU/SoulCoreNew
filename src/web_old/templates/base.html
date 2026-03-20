@@ -1,0 +1,318 @@
+<!DOCTYPE html>
+<html lang="hu">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, maximum-scale=1.0, user-scalable=yes">
+    <title>SoulCore 3.0 - {{ gettext('ui.dashboard') }}</title>
+    
+    <!-- Favicon -->
+    <link rel="icon" type="image/svg+xml" href="{{ url_for('static', filename='favicon.svg') }}">
+    <link rel="alternate icon" href="{{ url_for('static', filename='favicon.ico') }}">
+    
+    <!-- CSS - CSAK EGY FÁJL! -->
+    <link rel="stylesheet" href="{{ url_for('static', filename='css/main.css') }}">
+    
+    {% block head %}{% endblock %}
+</head>
+<body>
+    <div id="app">
+        <!-- ======================================================================== -->
+        <!-- ÉRTESÍTÉSEK (Vue) -->
+        <!-- ======================================================================== -->
+        {% raw %}
+        <div class="notifications-container">
+            <div v-for="notification in notifications" 
+                 :key="notification.id" 
+                 class="notification" 
+                 :class="notification.type"
+                 @click="removeNotification(notification.id)">
+                <span class="notification-icon">{{ getNotificationIcon(notification.type) }}</span>
+                <div class="notification-content">
+                    <div class="notification-title" v-if="notification.title">{{ notification.title }}</div>
+                    <div class="notification-message">{{ notification.message }}</div>
+                </div>
+                <button class="notification-close" @click.stop="removeNotification(notification.id)">✕</button>
+            </div>
+        </div>
+        
+        <!-- ======================================================================== -->
+        <!-- MODÁLOK -->
+        <!-- ======================================================================== -->
+        
+        <!-- Bejelentkezés modal -->
+        <div class="modal" v-if="showLoginModal" @click.self="showLoginModal = false">
+            <div class="modal-content small">
+                <div class="modal-header">
+                    <h3>{{ t('admin.login') }}</h3>
+                    <button class="close-btn" @click="showLoginModal = false">✕</button>
+                </div>
+                <div class="modal-body">
+                    <div class="form-group">
+                        <label>{{ t('admin.password') }}</label>
+                        <input type="password" v-model="loginPassword" class="form-input" @keyup.enter="adminLogin">
+                    </div>
+                    <div v-if="loginError" class="login-error">{{ loginError }}</div>
+                </div>
+                <div class="modal-footer">
+                    <button class="btn-secondary" @click="showLoginModal = false">{{ t('ui.cancel') }}</button>
+                    <button class="btn-primary" @click="adminLogin" :disabled="!loginPassword">
+                        {{ t('admin.login') }}
+                    </button>
+                </div>
+            </div>
+        </div>
+        
+        <!-- Megerősítő modal -->
+        <div class="modal" v-if="showConfirmModal" @click.self="showConfirmModal = false">
+            <div class="modal-content small">
+                <div class="modal-header">
+                    <h3>{{ confirmTitle }}</h3>
+                    <button class="close-btn" @click="showConfirmModal = false">✕</button>
+                </div>
+                <div class="modal-body">
+                    <p>{{ confirmMessage }}</p>
+                </div>
+                <div class="modal-footer">
+                    <button class="btn-secondary" @click="showConfirmModal = false">{{ t('ui.cancel') }}</button>
+                    <button class="btn-primary" @click="confirmAction">{{ t('ui.confirm') }}</button>
+                </div>
+            </div>
+        </div>
+        
+        <!-- Névjegy modal -->
+        <div class="modal" v-if="showAboutModal" @click.self="showAboutModal = false">
+            <div class="modal-content">
+                <div class="modal-header">
+                    <h3>{{ t('ui.about') }}</h3>
+                    <button class="close-btn" @click="showAboutModal = false">✕</button>
+                </div>
+                <div class="modal-body">
+                    <div class="about-content">
+                        <div class="about-logo">⚡</div>
+                        <h2>SoulCore 3.0</h2>
+                        <p class="about-version">{{ t('ui.version') }} 3.0.0</p>
+                        <p class="about-description">{{ t('ui.about_description') }}</p>
+                        <div class="about-links">
+                            <a href="https://soulcore.hu" target="_blank" rel="noopener">soulcore.hu</a>
+                            <a href="https://github.com/Grumpy89HU/SoulCoreNew" target="_blank" rel="noopener">GitHub</a>
+                        </div>
+                    </div>
+                </div>
+                <div class="modal-footer">
+                    <button class="btn-primary" @click="showAboutModal = false">{{ t('ui.close') }}</button>
+                </div>
+            </div>
+        </div>
+        {% endraw %}
+        
+        <!-- ======================================================================== -->
+        <!-- FEJLÉC -->
+        <!-- ======================================================================== -->
+        {% raw %}
+        <div class="header">
+            <div class="header-left">
+                <button class="menu-toggle" @click="toggleMobileMenu" v-if="isMobile">
+                    <span>☰</span>
+                </button>
+                <div class="title">
+                    <span>✦</span> SOULCORE 3.0 <span>✦</span>
+                </div>
+            </div>
+            
+            <div class="header-right">
+                <div class="status-badge">
+                    <div class="badge" :class="{'heartbeat': heartbeatRunning, 'paused': !heartbeatRunning}">
+                        <span>💓</span>
+                        <span v-text="formatUptime(heartbeat.uptime_seconds)"></span>
+                    </div>
+                    <div class="badge" :class="kingState.status == 'ready' ? 'heartbeat' : 'paused'">
+                        <span>👑</span>
+                        <span v-text="kingState.status || '???'"></span>
+                    </div>
+                    <div class="badge">
+                        <select v-model="language" @change="changeLanguage(language)" class="language-select">
+                            <option value="hu">Magyar</option>
+                            <option value="en">English</option>
+                        </select>
+                    </div>
+                </div>
+                
+                <div class="user-menu" v-if="isAdmin">
+                    <button class="user-menu-btn" @click="showUserMenu = !showUserMenu">
+                        👤 {{ userName }}
+                    </button>
+                    <div class="user-menu-dropdown" v-if="showUserMenu" v-click-outside="() => showUserMenu = false">
+                        <a href="#" @click.prevent="showAdminPanel" class="dropdown-item">⚙️ {{ t('admin.title') }}</a>
+                        <a href="#" @click.prevent="adminLogout" class="dropdown-item">🚪 {{ t('ui.logout') }}</a>
+                    </div>
+                </div>
+                
+                <button class="icon-btn" @click="showAboutModal = true" :title="t('ui.about')">
+                    ℹ️
+                </button>
+            </div>
+        </div>
+        
+        <!-- Mobil panel toggle gombok -->
+        <button class="panel-toggle left-toggle" @click="toggleLeftPanel" v-if="isMobile && !leftPanelVisible">
+            ▶
+        </button>
+        <button class="panel-toggle right-toggle" @click="toggleRightPanel" v-if="isMobile && !rightPanelVisible">
+            ◀
+        </button>
+        {% endraw %}
+        
+        <!-- ======================================================================== -->
+        <!-- FŐ TARTALOM - FONTOS: itt .main-ot használunk, nem .main-layout-ot! -->
+        <!-- ======================================================================== -->
+        <div class="main">
+            <!-- Bal panel -->
+            {% raw %}
+            <div class="left-panel" :class="{ 'mobile-visible': leftPanelVisible, 'collapsed': !leftPanelVisible && isMobile }">
+                <div class="panel-section">
+                    <div class="panel-header">
+                        <h3>{{ t('conversations.title') }}</h3>
+                        <button class="icon-btn" @click="createNewConversation" :disabled="!connected">
+                            <span>+</span>
+                        </button>
+                    </div>
+                    <div class="panel-content">
+                        <conversation-list></conversation-list>
+                    </div>
+                </div>
+                
+                <div class="panel-section">
+                    <div class="panel-header">
+                        <h3>{{ t('telemetry.title') }}</h3>
+                    </div>
+                    <div class="panel-content">
+                        <telemetry-panel></telemetry-panel>
+                    </div>
+                </div>
+            </div>
+            {% endraw %}
+            
+            <!-- Középső panel -->
+            <div class="center-panel">
+                {% raw %}
+                <chat-box></chat-box>
+                {% endraw %}
+            </div>
+            
+            <!-- Jobb panel (csak adminoknak) -->
+            {% raw %}
+            <div class="right-panel" v-if="isAdmin" :class="{ 'mobile-visible': rightPanelVisible, 'collapsed': !rightPanelVisible && isMobile }">
+                <div class="panel-section">
+                    <div class="panel-header">
+                        <h3>{{ t('modules.title') }}</h3>
+                    </div>
+                    <div class="panel-content">
+                        <module-control></module-control>
+                    </div>
+                </div>
+            </div>
+            {% endraw %}
+        </div>
+        
+        <!-- ======================================================================== -->
+        <!-- MOBIL NAVIGÁCIÓ (kívül a .main-en, mert fixed) -->
+        <!-- ======================================================================== -->
+        {% raw %}
+        <div class="mobile-nav" v-if="isMobile">
+            <button class="mobile-nav-btn" :class="{ active: leftPanelVisible }" @click="toggleLeftPanel">
+                <span>📋</span>
+                <span>{{ t('conversations.title') }}</span>
+            </button>
+            <button class="mobile-nav-btn" :class="{ active: !leftPanelVisible && !rightPanelVisible }" @click="showChatOnly">
+                <span>💬</span>
+                <span>{{ t('chat.title') }}</span>
+            </button>
+            <button class="mobile-nav-btn" :class="{ active: rightPanelVisible }" @click="toggleRightPanel" v-if="isAdmin">
+                <span>⚙️</span>
+                <span>{{ t('modules.title') }}</span>
+            </button>
+        </div>
+        
+        <!-- Panel overlay mobil nézetben -->
+        <div class="panel-overlay" v-if="isMobile && (leftPanelVisible || rightPanelVisible)" @click="closeAllPanels"></div>
+        {% endraw %}
+        
+        <!-- ======================================================================== -->
+        <!-- LÁBLÉC -->
+        <!-- ======================================================================== -->
+        {% raw %}
+        <div class="footer">
+            <div class="footer-left">
+                <span class="version">v3.0.0</span>
+                <span class="system-id" v-if="systemId">ID: {{ systemId }}</span>
+            </div>
+            
+            <div class="footer-center">
+                <div class="connection-status">
+                    <span class="status-dot" :class="{ connected: connected, disconnected: !connected }"></span>
+                    <span v-if="connected" v-text="t('ui.connected')"></span>
+                    <span v-else style="color: var(--error-color);" v-text="t('ui.disconnected')"></span>
+                </div>
+            </div>
+            
+            <div class="footer-right">
+                <span v-text="currentTime"></span>
+            </div>
+        </div>
+        {% endraw %}
+    </div>
+    
+    <!-- ======================================================================== -->
+    <!-- JAVASCRIPT MODULOK -->
+    <!-- ======================================================================== -->
+    
+    <!-- Külső könyvtárak -->
+    <script src="https://cdn.socket.io/4.5.4/socket.io.min.js"></script>
+    <script src="https://unpkg.com/vue@3/dist/vue.global.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
+    
+    <!-- Saját scriptek -->
+    <script src="{{ url_for('static', filename='js/i18n.js') }}"></script>
+    <script src="{{ url_for('static', filename='js/store.js') }}"></script>
+    <script src="{{ url_for('static', filename='js/api.js') }}"></script>
+    <script src="{{ url_for('static', filename='js/socket.js') }}"></script>
+    
+    <!-- Utils -->
+    <script src="{{ url_for('static', filename='js/utils/formatters.js') }}"></script>
+    <script src="{{ url_for('static', filename='js/utils/validators.js') }}"></script>
+    
+    <!-- Click outside direktíva -->
+    <script>
+        (function() {
+            const vClickOutside = {
+                beforeMount: (el, binding) => {
+                    el.clickOutsideEvent = (event) => {
+                        if (!(el === event.target || el.contains(event.target))) {
+                            binding.value(event);
+                        }
+                    };
+                    document.addEventListener('click', el.clickOutsideEvent);
+                },
+                unmounted: (el) => {
+                    document.removeEventListener('click', el.clickOutsideEvent);
+                }
+            };
+            if (typeof Vue !== 'undefined' && Vue.directive) {
+                Vue.directive('click-outside', vClickOutside);
+            }
+        })();
+    </script>
+    
+    <!-- Vue komponensek -->
+    <script src="{{ url_for('static', filename='js/components/ConversationList.js') }}"></script>
+    <script src="{{ url_for('static', filename='js/components/TelemetryPanel.js') }}"></script>
+    <script src="{{ url_for('static', filename='js/components/ChatBox.js') }}"></script>
+    <script src="{{ url_for('static', filename='js/components/ModuleControl.js') }}"></script>
+    <script src="{{ url_for('static', filename='js/components/AdminPanel.js') }}"></script>
+    
+    <!-- Fő alkalmazás - UTOLSÓ! -->
+    <script src="{{ url_for('static', filename='js/main.js') }}"></script>
+    
+    {% block scripts %}{% endblock %}
+</body>
+</html>

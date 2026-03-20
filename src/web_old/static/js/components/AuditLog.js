@@ -469,7 +469,7 @@ window.AuditLog = {
             
             try {
                 if (window.api) {
-                    const data = await window.api.getAuditLog(1000);
+                    const data = await window.api.getAuditLog(50);
                     logs.value = data.audit_log || [];
                     
                     // Statisztikák számolása

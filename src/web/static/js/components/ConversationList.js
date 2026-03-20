@@ -1,310 +1,178 @@
-// Beszélgetés lista komponens - GLOBÁLISAN
+// ==============================================
+// SOULCORE 3.0 - Beszélgetés lista komponens
+// ==============================================
+
 window.ConversationList = {
+    name: 'ConversationList',
+    
     template: `
         <div class="conversation-list-container">
-            <!-- Fejléc keresőmezővel -->
-            <div class="panel-header">
-                <div class="header-title">
-                    <span>📋 {{ gettext('ui.conversations') }}</span>
-                    <span class="conv-count" v-if="filteredConversations.length">({{ filteredConversations.length }})</span>
-                </div>
-                <button class="new-conv-btn" @click="createNew" :disabled="!connected || loading">
-                    <span>+</span> {{ gettext('ui.new_conversation') }}
+            <button 
+                class="btn btn-primary" 
+                style="width: 100%; margin-bottom: 16px;"
+                @click="createNew"
+                :disabled="!connected"
+            >
+                + {{ t('conversations.new') }}
+            </button>
+            
+            <div class="search-box" style="margin-bottom: 16px;">
+                <input 
+                    type="text" 
+                    v-model="searchQuery"
+                    class="form-input"
+                    :placeholder="t('conversations.search')"
+                >
+            </div>
+            
+            <div v-if="loading" class="loading-spinner">
+                <div class="spinner-small"></div>
+            </div>
+            
+            <div v-else-if="filteredConversations.length === 0" class="empty-state">
+                <div class="empty-icon">💬</div>
+                <div class="empty-title">{{ t('conversations.no_conversations') }}</div>
+                <div class="empty-text">{{ t('conversations.create_first') }}</div>
+                <button class="btn btn-primary" @click="createNew">
+                    {{ t('conversations.new') }}
                 </button>
             </div>
             
-            <!-- Keresőmező -->
-            <div class="search-box" v-if="conversations.length > 0">
-                <input 
-                    type="text" 
-                    v-model="searchQuery" 
-                    :placeholder="gettext('ui.search_conversations')"
-                    class="search-input"
+            <div v-else class="conversation-list">
+                <div 
+                    v-for="conv in filteredConversations" 
+                    :key="conv.id"
+                    class="conversation-item"
+                    :class="{ active: currentConversationId === conv.id }"
+                    @click="selectConversation(conv.id)"
                 >
-                <span class="search-icon">🔍</span>
-            </div>
-            
-            <!-- Rendezés és szűrés -->
-            <div class="filter-bar" v-if="conversations.length > 0">
-                <select v-model="sortBy" class="sort-select">
-                    <option value="updated_desc">{{ gettext('ui.sort_recent') }}</option>
-                    <option value="updated_asc">{{ gettext('ui.sort_oldest') }}</option>
-                    <option value="title_asc">{{ gettext('ui.sort_title_asc') }}</option>
-                    <option value="title_desc">{{ gettext('ui.sort_title_desc') }}</option>
-                </select>
-            </div>
-            
-            <!-- Betöltés jelző -->
-            <div v-if="loading" class="loading-spinner">
-                <div class="spinner"></div>
-            </div>
-            
-            <!-- Beszélgetés lista -->
-            <div class="conversation-list" v-else>
-                <div v-for="conv in filteredAndSortedConversations" :key="conv.id" 
-                     class="conversation-item" 
-                     :class="{ 
-                         active: currentId == conv.id,
-                         'has-unread': conv.unread
-                     }"
-                     @click="loadConversation(conv.id)">
-                    
                     <div class="conv-content">
                         <div class="conv-title">
-                            <span v-if="conv.unread" class="unread-dot">●</span>
-                            {{ conv.title }}
+                            {{ conv.title || t('conversations.untitled') }}
                         </div>
-                        <div class="conv-preview" v-if="conv.preview">
-                            {{ conv.preview }}
+                        <div class="conv-preview" v-if="conv.last_message">
+                            {{ truncate(conv.last_message, 50) }}
                         </div>
                         <div class="conv-meta">
-                            <span class="conv-date">{{ formatDate(conv.updated_at) }}</span>
-                            <span class="conv-model" v-if="conv.model">🤖 {{ conv.model }}</span>
+                            <span class="conv-date">
+                                {{ formatRelativeTime(conv.updated_at) }}
+                            </span>
+                            <span v-if="conv.message_count" class="conv-count">
+                                {{ conv.message_count }} üzenet
+                            </span>
                         </div>
                     </div>
-                    
-                    <div class="conv-actions" v-if="isAdmin">
-                        <button class="icon-btn" @click.stop="renameConv(conv.id, conv.title)" title="Átnevezés">
-                            ✏️
-                        </button>
-                        <button class="icon-btn delete-btn" @click.stop="deleteConv(conv.id)" title="Törlés">
+                    <div class="conv-actions" @click.stop>
+                        <button 
+                            class="btn-icon" 
+                            @click="deleteConversation(conv.id)"
+                            :title="t('ui.delete')"
+                        >
                             🗑️
                         </button>
                     </div>
                 </div>
-                
-                <div v-if="filteredConversations.length === 0 && conversations.length > 0" class="empty-search">
-                    🔍 {{ gettext('ui.no_search_results') }}
-                </div>
-                
-                <div v-if="conversations.length === 0 && !loading" class="empty-list">
-                    <div class="empty-icon">💬</div>
-                    <div class="empty-text">{{ gettext('ui.no_conversations') }}</div>
-                    <button class="new-conv-btn" @click="createNew" :disabled="!connected">
-                        {{ gettext('ui.create_first') }}
-                    </button>
-                </div>
-            </div>
-            
-            <!-- Betöltés több (infinite scroll) -->
-            <div v-if="hasMore" class="load-more">
-                <button @click="loadMore" :disabled="loadingMore" class="load-more-btn">
-                    <span v-if="!loadingMore">{{ gettext('ui.load_more') }}</span>
-                    <span v-else>{{ gettext('ui.loading') }}</span>
-                </button>
             </div>
         </div>
     `,
     
     setup() {
-        // ====================================================================
-        // REAKTÍV ÁLLAPOTOK
-        // ====================================================================
+        const conversations = Vue.computed(() => window.store.conversations);
+        const currentConversationId = Vue.computed(() => window.store.currentConversationId);
+        const connected = Vue.computed(() => window.store.connected);
         
-        const conversations = Vue.computed(() => window.store?.conversations || []);
-        const currentId = Vue.computed(() => window.store?.currentConversationId);
-        const connected = Vue.computed(() => window.store?.connected || false);
-        const isAdmin = Vue.computed(() => window.store?.isAdmin || false);
-        
-        // Keresés és szűrés
+        const loading = Vue.ref(true);
         const searchQuery = Vue.ref('');
-        const sortBy = Vue.ref('updated_desc');
         
-        // Lapozás
-        const page = Vue.ref(1);
-        const limit = Vue.ref(20);
-        const hasMore = Vue.ref(false);
-        const loading = Vue.ref(false);
-        const loadingMore = Vue.ref(false);
+        const t = (key, params = {}) => {
+            return window.gettext ? window.gettext(key, params) : key;
+        };
         
-        // ====================================================================
-        // COMPUTED PROPERTIES
-        // ====================================================================
-        
-        // Szűrt beszélgetések
         const filteredConversations = Vue.computed(() => {
             if (!searchQuery.value) return conversations.value;
             
             const query = searchQuery.value.toLowerCase();
             return conversations.value.filter(conv => 
                 conv.title?.toLowerCase().includes(query) ||
-                conv.preview?.toLowerCase().includes(query) ||
-                conv.model?.toLowerCase().includes(query)
+                conv.last_message?.toLowerCase().includes(query)
             );
         });
         
-        // Rendezett és szűrt beszélgetések
-        const filteredAndSortedConversations = Vue.computed(() => {
-            let sorted = [...filteredConversations.value];
-            
-            switch (sortBy.value) {
-                case 'updated_desc':
-                    sorted.sort((a, b) => new Date(b.updated_at) - new Date(a.updated_at));
-                    break;
-                case 'updated_asc':
-                    sorted.sort((a, b) => new Date(a.updated_at) - new Date(b.updated_at));
-                    break;
-                case 'title_asc':
-                    sorted.sort((a, b) => (a.title || '').localeCompare(b.title || ''));
-                    break;
-                case 'title_desc':
-                    sorted.sort((a, b) => (b.title || '').localeCompare(a.title || ''));
-                    break;
+        const formatRelativeTime = (timestamp) => {
+            if (window.formatters) {
+                return window.formatters.formatRelativeTime(timestamp);
             }
-            
-            return sorted.slice(0, page.value * limit.value);
-        });
+            return timestamp;
+        };
         
-        // ====================================================================
-        // METÓDUSOK
-        // ====================================================================
-        
-        const createNew = () => {
-            if (!connected.value) {
-                window.socketManager?.addSystemMessage?.(
-                    window.gettext?.('errors.offline') || 'You are offline',
-                    'error'
-                );
-                return;
+        const truncate = (text, length) => {
+            if (window.formatters) {
+                return window.formatters.truncate(text, length);
             }
-            
-            const defaultTitle = window.gettext?.('ui.new_conversation') || 'New conversation';
-            const title = prompt(
-                window.gettext?.('ui.conversation_title') || 'Conversation title:',
-                `${defaultTitle} ${new Date().toLocaleString()}`
-            );
-            
-            if (title && window.socketManager) {
-                window.socketManager.createConversation(title);
+            return text;
+        };
+        
+        const loadConversations = async () => {
+            loading.value = true;
+            try {
+                await window.api.getConversations();
+            } catch (error) {
+                console.error('Hiba a beszélgetések betöltésekor:', error);
+            } finally {
+                loading.value = false;
             }
         };
         
-        const loadConversation = (id) => {
-            if (window.socketManager) {
-                window.socketManager.loadConversation(id);
-                // Ha van unread jelzés, eltüntetjük
-                const conv = conversations.value.find(c => c.id === id);
-                if (conv && conv.unread) {
-                    conv.unread = false;
+        const createNew = async () => {
+            const title = prompt(t('conversations.new_title'));
+            if (title) {
+                try {
+                    await window.api.createConversation(title);
+                } catch (error) {
+                    console.error('Hiba a beszélgetés létrehozásakor:', error);
+                    window.store.addNotification('error', t('conversations.create_error'));
                 }
             }
         };
         
-        const deleteConv = (id) => {
-            const conv = conversations.value.find(c => c.id === id);
-            const message = window.gettext?.('conversation.confirm_delete') || 
-                `Are you sure you want to delete "${conv?.title || 'this conversation'}"?`;
+        const selectConversation = async (id) => {
+            if (currentConversationId.value === id) return;
             
-            if (window.socketManager && confirm(message)) {
-                window.socketManager.deleteConversation(id);
-            }
+            window.store.setCurrentConversationId(id);
+            await window.api.getMessages(id);
         };
         
-        const renameConv = (id, currentTitle) => {
-            const newTitle = prompt(
-                window.gettext?.('ui.rename_conversation') || 'Rename conversation:',
-                currentTitle
-            );
+        const deleteConversation = async (id) => {
+            if (!confirm(t('conversations.confirm_delete'))) return;
             
-            if (newTitle && newTitle !== currentTitle && window.api) {
-                window.api.updateConversation(id, { title: newTitle })
-                    .then(() => {
-                        window.socketManager?.addSystemMessage?.(
-                            window.gettext?.('ui.rename_success') || 'Conversation renamed',
-                            'success'
-                        );
-                    })
-                    .catch(error => {
-                        window.socketManager?.addSystemMessage?.(
-                            error.message || 'Failed to rename',
-                            'error'
-                        );
-                    });
-            }
-        };
-        
-        const loadMore = async () => {
-            if (loadingMore.value || !hasMore.value) return;
-            
-            loadingMore.value = true;
             try {
-                page.value++;
-                // Itt lehetne új adatokat lekérni a szervertől
-                // Most csak a meglévő listából mutatunk többet
-            } finally {
-                loadingMore.value = false;
+                await window.api.deleteConversation(id);
+                window.store.addNotification('success', t('conversations.deleted'));
+            } catch (error) {
+                console.error('Hiba a beszélgetés törlésekor:', error);
+                window.store.addNotification('error', t('conversations.delete_error'));
             }
         };
-        
-        const formatDate = (dateStr) => {
-            if (!dateStr) return '';
-            
-            const date = new Date(dateStr);
-            const now = new Date();
-            const diffMs = now - date;
-            const diffMins = Math.floor(diffMs / 60000);
-            const diffHours = Math.floor(diffMs / 3600000);
-            const diffDays = Math.floor(diffMs / 86400000);
-            
-            if (diffMins < 1) return window.gettext?.('time.just_now') || 'just now';
-            if (diffMins < 60) return `${diffMins} ${window.gettext?.('time.minutes_ago') || 'min ago'}`;
-            if (diffHours < 24) return `${diffHours} ${window.gettext?.('time.hours_ago') || 'hours ago'}`;
-            if (diffDays < 7) return `${diffDays} ${window.gettext?.('time.days_ago') || 'days ago'}`;
-            
-            return date.toLocaleDateString(window.store?.userLanguage || 'en');
-        };
-        
-        const gettext = (key, params = {}) => {
-            return window.gettext ? window.gettext(key, params) : key;
-        };
-        
-        // ====================================================================
-        // WATCHEREK
-        // ====================================================================
-        
-        Vue.watch(conversations, (newConvs) => {
-            // Ha új beszélgetések jönnek, ellenőrizzük a lapozást
-            hasMore.value = newConvs.length > page.value * limit.value;
-        }, { immediate: true });
-        
-        Vue.watch(searchQuery, () => {
-            page.value = 1; // Kereséskor visszaállítjuk a lapozást
-        });
-        
-        // ====================================================================
-        // ÉLETCIKLUS
-        // ====================================================================
         
         Vue.onMounted(() => {
-            // Kezdeti lapozás beállítása
-            hasMore.value = conversations.value.length > page.value * limit.value;
+            loadConversations();
         });
         
         return {
-            // Állapotok
             conversations,
-            currentId,
+            currentConversationId,
             connected,
-            isAdmin,
-            searchQuery,
-            sortBy,
-            filteredConversations,
-            filteredAndSortedConversations,
             loading,
-            loadingMore,
-            hasMore,
-            
-            // Metódusok
+            searchQuery,
+            filteredConversations,
+            t,
+            formatRelativeTime,
+            truncate,
             createNew,
-            loadConversation,
-            deleteConv,
-            renameConv,
-            loadMore,
-            formatDate,
-            gettext
+            selectConversation,
+            deleteConversation
         };
     }
 };
 
-window.ConversationList = ConversationList;
-console.log('✅ ConversationList betöltve globálisan');
+console.log('✅ ConversationList komponens betöltve');
