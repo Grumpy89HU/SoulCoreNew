@@ -3,73 +3,37 @@
 // ==============================================
 
 window.api = {
-    // Alap URL
     baseUrl: '',
     
-    // ========================================================================
-    // ALAP FETCH METÓDUS
-    // ========================================================================
-    
     async fetch(endpoint, options = {}) {
-        const url = this.baseUrl + endpoint;
-        
-        const headers = {
-            'Content-Type': 'application/json',
-            'Accept': 'application/json',
-            ...options.headers
-        };
-        
-        // Token hozzáadása, ha van
-        const token = localStorage.getItem('token');
-        if (token) {
-            headers['Authorization'] = `Bearer ${token}`;
-        }
-        
-        const config = {
-            credentials: 'include',
-            headers,
-            ...options
-        };
+        const headers = { 'Content-Type': 'application/json', ...options.headers };
         
         try {
-            const response = await fetch(url, config);
+            const response = await fetch(this.baseUrl + endpoint, {
+                credentials: 'include',
+                headers,
+                ...options
+            });
             
-            // Ha 401-es hiba, töröljük a session-t
             if (response.status === 401) {
-                if (window.store) {
-                    window.store.clearAuth();
-                    window.store.addNotification('error', 'A munkamenet lejárt. Kérjük, jelentkezzen be újra.');
-                }
-                
-                // Átirányítás a login oldalra, ha nem ott vagyunk
+                window.store.clearAuth();
                 if (!window.location.pathname.includes('/login')) {
                     window.location.href = '/login';
                 }
-                
                 throw new Error('Unauthorized');
             }
             
-            // Ha 403-as hiba
-            if (response.status === 403) {
-                throw new Error('Access denied');
-            }
-            
             const data = await response.json();
-            
-            if (!response.ok) {
-                throw new Error(data.error || `HTTP error ${response.status}`);
-            }
-            
+            if (!response.ok) throw new Error(data.error || `HTTP ${response.status}`);
             return data;
-            
-        } catch (error) {
-            console.error('❌ API hívás hiba:', error);
-            throw error;
+        } catch (e) {
+            console.error('❌ API hiba:', e);
+            throw e;
         }
     },
     
     // ========================================================================
-    // AUTH API
+    // AUTH
     // ========================================================================
     
     async login(username, password) {
@@ -77,160 +41,140 @@ window.api = {
             method: 'POST',
             body: JSON.stringify({ username, password })
         });
-        
-        if (window.store) {
-            window.store.setAuth(data);
-        }
+        window.store.setAuth(data);
         return data;
     },
     
     async logout() {
         await this.fetch('/api/auth/logout', { method: 'POST' });
-        if (window.store) {
-            window.store.clearAuth();
-        }
+        window.store.clearAuth();
         window.location.href = '/login';
     },
     
     async register(username, email, password) {
-        const data = await this.fetch('/api/auth/register', {
+        return await this.fetch('/api/auth/register', {
             method: 'POST',
             body: JSON.stringify({ username, email, password })
         });
-        
-        return data;
     },
     
     async getCurrentUser() {
         try {
             const data = await this.fetch('/api/auth/me');
-            if (data.authenticated && window.store) {
-                window.store.setAuth(data);
-            }
+            if (data.authenticated) window.store.setAuth(data);
             return data;
-        } catch (error) {
+        } catch {
             return { authenticated: false };
         }
     },
     
     // ========================================================================
-    // RENDSZER API
+    // RENDSZER
     // ========================================================================
     
     async getStatus() {
         const data = await this.fetch('/api/status');
-        if (window.store) {
-            window.store.setSystemId(data.system_id);
-            window.store.setUptime(data.uptime);
-            window.store.setStatus(data.status);
-        }
+        window.store.setSystemId(data.system_id);
+        window.store.setHeartbeat({ uptime_seconds: data.uptime });
+        window.store.setModules(data.modules || {});
         return data;
     },
     
     async getKingState() {
         const data = await this.fetch('/api/king/state');
-        if (window.store) {
-            window.store.setKingState(data);
-        }
+        window.store.setKingState(data);
         return data;
     },
     
     async getSentinelStatus() {
         const data = await this.fetch('/api/sentinel/status');
-        if (window.store) {
-            window.store.setSentinelState(data);
-        }
+        window.store.setGpuStatus(data.gpus || []);
+        window.store.setSentinelState(data);
         return data;
     },
     
-    // ========================================================================
-    // BESZÉLGETÉSEK API
-    // ========================================================================
-    
-    async getConversations(limit = 50, offset = 0) {
-        const data = await this.fetch(`/api/conversations?limit=${limit}&offset=${offset}`);
-        if (window.store) {
-            window.store.setConversations(data.conversations);
-        }
+    async getBlackboxStats() {
+        const data = await this.fetch('/api/blackbox/stats');
+        window.store.setBlackboxStats(data);
         return data;
     },
     
-    async createConversation(title, model = null, systemPrompt = null) {
+    async getBlackboxTrace(traceId) {
+        return await this.fetch(`/api/blackbox/trace/${traceId}`);
+    },
+    
+    async searchBlackbox(query, limit = 50) {
+        return await this.fetch(`/api/blackbox/search?q=${encodeURIComponent(query)}&limit=${limit}`);
+    },
+    
+    // ========================================================================
+    // BESZÉLGETÉSEK
+    // ========================================================================
+    
+    async getConversations() {
+        const data = await this.fetch('/api/conversations');
+        window.store.setConversations(data.conversations || []);
+        return data;
+    },
+    
+    async createConversation(title) {
         const data = await this.fetch('/api/conversations', {
             method: 'POST',
-            body: JSON.stringify({ title, model, system_prompt: systemPrompt })
+            body: JSON.stringify({ title })
         });
-        
-        // Új beszélgetés lekérése
         await this.getConversations();
-        
         return data;
     },
     
     async getConversation(id) {
-        const data = await this.fetch(`/api/conversations/${id}`);
-        return data;
+        return await this.fetch(`/api/conversations/${id}`);
     },
     
-    async getMessages(conversationId, limit = 100, before = null) {
-        let url = `/api/conversations/${conversationId}/messages?limit=${limit}`;
-        if (before) {
-            url += `&before=${before}`;
-        }
-        
-        const data = await this.fetch(url);
-        if (window.store) {
-            window.store.setMessages(conversationId, data.messages);
-        }
+    async getMessages(conversationId) {
+        const data = await this.fetch(`/api/conversations/${conversationId}/messages`);
+        window.store.setMessages(conversationId, data.messages || []);
         return data;
     },
     
     async sendMessage(conversationId, content) {
-        const data = await this.fetch(`/api/conversations/${conversationId}/messages`, {
+        return await this.fetch(`/api/conversations/${conversationId}/messages`, {
             method: 'POST',
             body: JSON.stringify({ role: 'user', content })
         });
-        
-        return data;
     },
     
     async deleteConversation(id) {
         await this.fetch(`/api/conversations/${id}`, { method: 'DELETE' });
-        if (window.store) {
-            window.store.removeConversation(id);
-        }
+        window.store.removeConversation(id);
+    },
+    
+    async exportConversation(id, format = 'json') {
+        return await this.fetch(`/api/conversations/${id}/export?format=${format}`);
     },
     
     // ========================================================================
-    // MODELLEK API
+    // MODELLEK
     // ========================================================================
     
-    async getModels(activeOnly = false) {
-        const data = await this.fetch(`/api/models?active_only=${activeOnly}`);
-        if (window.store) {
-            window.store.setModels(data.models);
-        }
+    async getModels() {
+        const data = await this.fetch('/api/models');
+        window.store.setModels(data.models || []);
         return data;
     },
     
     async activateModel(id) {
         const data = await this.fetch(`/api/models/${id}/activate`, { method: 'POST' });
-        if (window.store) {
-            window.store.activateModel(id);
-        }
+        window.store.activateModel(id);
         return data;
     },
     
     // ========================================================================
-    // PROMPTOK API
+    // PROMPTOK
     // ========================================================================
     
-    async getPrompts(category = null) {
-        const url = category ? `/api/prompts?category=${category}` : '/api/prompts';
-        const data = await this.fetch(url);
-        if (window.store) {
-            window.store.setPrompts(data.prompts);
-        }
+    async getPrompts() {
+        const data = await this.fetch('/api/prompts');
+        window.store.setPrompts(data.prompts || []);
         return data;
     },
     
@@ -239,7 +183,6 @@ window.api = {
             method: 'POST',
             body: JSON.stringify(prompt)
         });
-        
         await this.getPrompts();
         return data;
     },
@@ -250,18 +193,150 @@ window.api = {
     },
     
     // ========================================================================
-    // MODUL VEZÉRLÉS (ADMIN)
+    // SZEMÉLYISÉGEK
+    // ========================================================================
+    
+    async getPersonalities() {
+        const data = await this.fetch('/api/personalities');
+        window.store.setPersonalities(data.personalities || []);
+        return data;
+    },
+    
+    async savePersonality(personality) {
+        const data = await this.fetch('/api/personalities', {
+            method: 'POST',
+            body: JSON.stringify(personality)
+        });
+        await this.getPersonalities();
+        return data;
+    },
+    
+    async activatePersonality(id) {
+        const data = await this.fetch(`/api/personalities/${id}/activate`, { method: 'POST' });
+        window.store.activatePersonality(id);
+        return data;
+    },
+    
+    async deletePersonality(id) {
+        await this.fetch(`/api/personalities/${id}`, { method: 'DELETE' });
+        await this.getPersonalities();
+    },
+    
+    // ========================================================================
+    // MODUL VEZÉRLÉS
     // ========================================================================
     
     async controlModule(module, action) {
-        const data = await this.fetch(`/api/modules/${module}/${action}`, {
-            method: 'POST'
-        });
-        
-        // Státusz frissítése
+        const data = await this.fetch(`/api/modules/${module}/${action}`, { method: 'POST' });
         setTimeout(() => this.getStatus(), 500);
-        
         return data;
+    },
+    
+    // ========================================================================
+    // BEÁLLÍTÁSOK
+    // ========================================================================
+    
+    async getSettings() {
+        const data = await this.fetch('/api/settings');
+        window.store.setSettings(data);
+        return data;
+    },
+    
+    async updateSetting(key, value, type = null, category = 'general') {
+        return await this.fetch(`/api/settings/${key}`, {
+            method: 'POST',
+            body: JSON.stringify({ value, type, category })
+        });
+    },
+    
+    // ========================================================================
+    // AUDIT LOG
+    // ========================================================================
+    
+    async getAuditLog(limit = 100) {
+        const data = await this.fetch(`/api/audit?limit=${Math.min(limit, 500)}`);
+        window.store.setAuditLog(data.audit_log || []);
+        return data;
+    },
+    
+    // ========================================================================
+    // METRIKÁK
+    // ========================================================================
+    
+    async getMetrics(period = 'day', limit = 100) {
+        const data = await this.fetch(`/api/metrics?period=${period}&limit=${Math.min(limit, 500)}`);
+        window.store.setMetrics(data.metrics || {});
+        return data;
+    },
+    
+    // ========================================================================
+    // VISION (EYE-CORE)
+    // ========================================================================
+    
+    async processImage(imageData, source = 'upload') {
+        return await this.fetch('/api/vision/process', {
+            method: 'POST',
+            body: JSON.stringify({ image: imageData, source })
+        });
+    },
+    
+    // ========================================================================
+    // SANDBOX
+    // ========================================================================
+    
+    async executeCode(code, context = {}) {
+        return await this.fetch('/api/sandbox/execute', {
+            method: 'POST',
+            body: JSON.stringify({ code, context })
+        });
+    },
+    
+    // ========================================================================
+    // GATEWAY
+    // ========================================================================
+    
+    async getGateways() {
+        const data = await this.fetch('/api/gateway/status');
+        window.store.setGateways(data.gateways || []);
+        return data;
+    },
+    
+    async sendGatewayMessage(gatewayId, message) {
+        return await this.fetch(`/api/gateway/message`, {
+            method: 'POST',
+            body: JSON.stringify({ gateway_id: gatewayId, message })
+        });
+    },
+    
+    // ========================================================================
+    // EGÉSZSÉGÜGYI ELLENŐRZÉS
+    // ========================================================================
+    
+    async healthCheck() {
+        return await this.fetch('/health');
+    },
+    
+    // ========================================================================
+    // BATCH MŰVELETEK
+    // ========================================================================
+    
+    async loadInitialData() {
+        if (!window.store.authenticated) return;
+        
+        try {
+            await Promise.all([
+                this.getStatus(),
+                this.getKingState(),
+                this.getSentinelStatus(),
+                this.getConversations(),
+                this.getModels(),
+                this.getPrompts(),
+                this.getPersonalities(),
+                this.getSettings()
+            ]);
+        } catch (e) {
+            console.error('Hiba az inicializálás során:', e);
+        }
     }
 };
 

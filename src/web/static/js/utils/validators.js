@@ -27,7 +27,6 @@ window.validators = {
     isPassword(password) {
         if (!password) return false;
         if (password.length < 8) return false;
-        // Legalább egy szám
         return /\d/.test(password);
     },
     
@@ -35,7 +34,7 @@ window.validators = {
      * Üres string ellenőrzése
      */
     isNotEmpty(value) {
-        return value !== undefined && value !== null && value.trim() !== '';
+        return value !== undefined && value !== null && String(value).trim() !== '';
     },
     
     /**
@@ -83,6 +82,84 @@ window.validators = {
         } catch {
             return false;
         }
+    },
+    
+    /**
+     * Hex szín validálása
+     */
+    isHexColor(color) {
+        if (!color) return false;
+        const re = /^#([A-Fa-f0-9]{6}|[A-Fa-f0-9]{3})$/;
+        return re.test(color);
+    },
+    
+    /**
+     * UUID validálása
+     */
+    isUUID(uuid) {
+        if (!uuid) return false;
+        const re = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
+        return re.test(uuid);
+    },
+    
+    /**
+     * IP cím validálása (IPv4)
+     */
+    isIPv4(ip) {
+        if (!ip) return false;
+        const re = /^(\d{1,3}\.){3}\d{1,3}$/;
+        if (!re.test(ip)) return false;
+        const parts = ip.split('.');
+        return parts.every(p => {
+            const num = parseInt(p, 10);
+            return num >= 0 && num <= 255;
+        });
+    },
+    
+    /**
+     * Port szám validálása
+     */
+    isPort(port) {
+        if (!port) return false;
+        const num = parseInt(port, 10);
+        return !isNaN(num) && num >= 1 && num <= 65535;
+    },
+    
+    /**
+     * Két jelszó egyezésének ellenőrzése
+     */
+    passwordsMatch(password, confirm) {
+        return password === confirm;
+    },
+    
+    /**
+     * Távolság ellenőrzése (min/max)
+     */
+    isBetween(value, min, max) {
+        const num = Number(value);
+        return !isNaN(num) && num >= min && num <= max;
+    },
+    
+    /**
+     * Min hossz ellenőrzése
+     */
+    minLength(value, length) {
+        return String(value).length >= length;
+    },
+    
+    /**
+     * Max hossz ellenőrzése
+     */
+    maxLength(value, length) {
+        return String(value).length <= length;
+    },
+    
+    /**
+     * Regex ellenőrzés
+     */
+    matchesRegex(value, regex) {
+        if (!value) return false;
+        return regex.test(value);
     }
 };
 

@@ -6,70 +6,38 @@ window.ConversationList = {
     name: 'ConversationList',
     
     template: `
-        <div class="conversation-list-container">
-            <button 
-                class="btn btn-primary" 
-                style="width: 100%; margin-bottom: 16px;"
-                @click="createNew"
-                :disabled="!connected"
-            >
+        <div class="conversation-list">
+            <button class="btn btn-primary btn-block" @click="createNew" style="margin-bottom: 12px;">
                 + {{ t('conversations.new') }}
             </button>
-            
-            <div class="search-box" style="margin-bottom: 16px;">
-                <input 
-                    type="text" 
-                    v-model="searchQuery"
-                    class="form-input"
-                    :placeholder="t('conversations.search')"
-                >
-            </div>
             
             <div v-if="loading" class="loading-spinner">
                 <div class="spinner-small"></div>
             </div>
             
-            <div v-else-if="filteredConversations.length === 0" class="empty-state">
+            <div v-else-if="conversations.length === 0" class="empty-state">
                 <div class="empty-icon">💬</div>
-                <div class="empty-title">{{ t('conversations.no_conversations') }}</div>
-                <div class="empty-text">{{ t('conversations.create_first') }}</div>
+                <div class="empty-text">{{ t('conversations.no_conversations') }}</div>
                 <button class="btn btn-primary" @click="createNew">
-                    {{ t('conversations.new') }}
+                    {{ t('conversations.create_first') }}
                 </button>
             </div>
             
-            <div v-else class="conversation-list">
+            <div v-else class="conv-list">
                 <div 
-                    v-for="conv in filteredConversations" 
-                    :key="conv.id"
-                    class="conversation-item"
-                    :class="{ active: currentConversationId === conv.id }"
-                    @click="selectConversation(conv.id)"
+                    v-for="conv in conversations" 
+                    :key="conv.id" 
+                    class="conv-item" 
+                    :class="{ active: currentId === conv.id }"
+                    @click="select(conv.id)"
                 >
-                    <div class="conv-content">
-                        <div class="conv-title">
-                            {{ conv.title || t('conversations.untitled') }}
-                        </div>
-                        <div class="conv-preview" v-if="conv.last_message">
-                            {{ truncate(conv.last_message, 50) }}
-                        </div>
-                        <div class="conv-meta">
-                            <span class="conv-date">
-                                {{ formatRelativeTime(conv.updated_at) }}
-                            </span>
-                            <span v-if="conv.message_count" class="conv-count">
-                                {{ conv.message_count }} üzenet
-                            </span>
-                        </div>
+                    <div class="conv-title">{{ conv.title || t('conversations.untitled') }}</div>
+                    <div class="conv-preview" v-if="conv.last_message">
+                        {{ truncate(conv.last_message, 50) }}
                     </div>
-                    <div class="conv-actions" @click.stop>
-                        <button 
-                            class="btn-icon" 
-                            @click="deleteConversation(conv.id)"
-                            :title="t('ui.delete')"
-                        >
-                            🗑️
-                        </button>
+                    <div class="conv-meta">
+                        <span>{{ formatRelativeTime(conv.updated_at) }}</span>
+                        <button class="delete-btn" @click.stop="deleteConv(conv.id)">🗑️</button>
                     </div>
                 </div>
             </div>
@@ -78,46 +46,20 @@ window.ConversationList = {
     
     setup() {
         const conversations = Vue.computed(() => window.store.conversations);
-        const currentConversationId = Vue.computed(() => window.store.currentConversationId);
-        const connected = Vue.computed(() => window.store.connected);
+        const currentId = Vue.computed(() => window.store.currentConversationId);
+        const loading = Vue.ref(false);
         
-        const loading = Vue.ref(true);
-        const searchQuery = Vue.ref('');
+        const t = (key, params = {}) => window.gettext(key, params);
+        const formatRelativeTime = (ts) => window.formatRelativeTime(ts);
+        const truncate = (text, len) => window.truncate(text, len);
         
-        const t = (key, params = {}) => {
-            return window.gettext ? window.gettext(key, params) : key;
-        };
-        
-        const filteredConversations = Vue.computed(() => {
-            if (!searchQuery.value) return conversations.value;
-            
-            const query = searchQuery.value.toLowerCase();
-            return conversations.value.filter(conv => 
-                conv.title?.toLowerCase().includes(query) ||
-                conv.last_message?.toLowerCase().includes(query)
-            );
-        });
-        
-        const formatRelativeTime = (timestamp) => {
-            if (window.formatters) {
-                return window.formatters.formatRelativeTime(timestamp);
-            }
-            return timestamp;
-        };
-        
-        const truncate = (text, length) => {
-            if (window.formatters) {
-                return window.formatters.truncate(text, length);
-            }
-            return text;
-        };
-        
-        const loadConversations = async () => {
+        const load = async () => {
             loading.value = true;
             try {
                 await window.api.getConversations();
             } catch (error) {
                 console.error('Hiba a beszélgetések betöltésekor:', error);
+                window.store.addNotification('error', t('conversations.load_error'));
             } finally {
                 loading.value = false;
             }
@@ -128,6 +70,7 @@ window.ConversationList = {
             if (title) {
                 try {
                     await window.api.createConversation(title);
+                    window.store.addNotification('success', t('conversations.created'));
                 } catch (error) {
                     console.error('Hiba a beszélgetés létrehozásakor:', error);
                     window.store.addNotification('error', t('conversations.create_error'));
@@ -135,14 +78,19 @@ window.ConversationList = {
             }
         };
         
-        const selectConversation = async (id) => {
-            if (currentConversationId.value === id) return;
+        const select = async (id) => {
+            if (currentId.value === id) return;
             
             window.store.setCurrentConversationId(id);
-            await window.api.getMessages(id);
+            try {
+                await window.api.getMessages(id);
+            } catch (error) {
+                console.error('Hiba az üzenetek betöltésekor:', error);
+                window.store.addNotification('error', t('conversations.load_messages_error'));
+            }
         };
         
-        const deleteConversation = async (id) => {
+        const deleteConv = async (id) => {
             if (!confirm(t('conversations.confirm_delete'))) return;
             
             try {
@@ -154,23 +102,18 @@ window.ConversationList = {
             }
         };
         
-        Vue.onMounted(() => {
-            loadConversations();
-        });
+        Vue.onMounted(load);
         
         return {
             conversations,
-            currentConversationId,
-            connected,
+            currentId,
             loading,
-            searchQuery,
-            filteredConversations,
             t,
             formatRelativeTime,
             truncate,
             createNew,
-            selectConversation,
-            deleteConversation
+            select,
+            deleteConv
         };
     }
 };

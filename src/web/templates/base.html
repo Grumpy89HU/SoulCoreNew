@@ -2,25 +2,21 @@
 <html lang="hu">
 <head>
     <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0">
-    <title>SoulCore 3.0 - {{ title if title else 'Vezérlőpult' }}</title>
-    
-    <!-- Favicon -->
-    <link rel="icon" type="image/svg+xml" href="/static/favicon.svg">
-    
-    <!-- CSS -->
-    <link rel="stylesheet" href="/static/css/main.css">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=yes">
+    <title>SoulCore 3.0 - Szuverén AI Rendszer</title>
     
     <!-- Külső könyvtárak -->
     <script src="https://cdn.socket.io/4.5.4/socket.io.min.js"></script>
     <script src="https://unpkg.com/vue@3/dist/vue.global.js"></script>
+    <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
     
-    {% block head %}{% endblock %}
+    <!-- CSS -->
+    <link rel="stylesheet" href="/static/css/main.css">
 </head>
 <body>
     <div id="app"></div>
-
-    <!-- Saját scriptek - SZIGORÚ SORRENDBEN -->
+    
+    <!-- JavaScript modulok (sorban) -->
     <script src="/static/js/i18n.js"></script>
     <script src="/static/js/store.js"></script>
     <script src="/static/js/api.js"></script>
@@ -29,20 +25,25 @@
     <script src="/static/js/utils/validators.js"></script>
     
     <!-- Komponensek -->
-    <script src="/static/js/components/LoginForm.js"></script>
-    <script src="/static/js/components/RegisterForm.js"></script>
     <script src="/static/js/components/ConversationList.js"></script>
-    <script src="/static/js/components/ChatBox.js"></script>
     <script src="/static/js/components/TelemetryPanel.js"></script>
+    <script src="/static/js/components/ChatBox.js"></script>
     <script src="/static/js/components/ModuleControl.js"></script>
     <script src="/static/js/components/ModelSelector.js"></script>
     <script src="/static/js/components/PromptEditor.js"></script>
+    <script src="/static/js/components/PersonalityManager.js"></script>
     <script src="/static/js/components/SettingsPanel.js"></script>
+    <script src="/static/js/components/AuditLog.js"></script>
+    <script src="/static/js/components/MetricsPanel.js"></script>
+    <script src="/static/js/components/TracePanel.js"></script>
+    <script src="/static/js/components/VisionUpload.js"></script>
+    <script src="/static/js/components/SandboxEditor.js"></script>
+    <script src="/static/js/components/GatewayPanel.js"></script>
     <script src="/static/js/components/AdminPanel.js"></script>
+    <script src="/static/js/components/LoginForm.js"></script>
+    <script src="/static/js/components/RegisterForm.js"></script>
     
     <!-- Fő alkalmazás -->
     <script src="/static/js/main.js"></script>
-    
-    {% block scripts %}{% endblock %}
 </body>
 </html>

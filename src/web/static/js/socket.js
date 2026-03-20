@@ -1,17 +1,12 @@
 // ==============================================
-// SOULCORE 3.0 - WebSocket kapcsolat (Socket.IO)
+// SOULCORE 3.0 - WebSocket kliens (Socket.IO)
 // ==============================================
 
 window.socketManager = {
     socket: null,
     connected: false,
-    reconnectAttempts: 0,
-    maxReconnectAttempts: 5,
-    reconnectDelay: 2000,
+    typingActive: false,
     
-    /**
-     * Kapcsolódás a szerverhez
-     */
     connect() {
         if (this.socket?.connected) return;
         
@@ -19,146 +14,178 @@ window.socketManager = {
             path: '/socket.io',
             transports: ['websocket', 'polling'],
             reconnection: true,
-            reconnectionAttempts: this.maxReconnectAttempts,
-            reconnectionDelay: this.reconnectDelay
+            reconnectionAttempts: 5,
+            reconnectionDelay: 2000
         });
         
         this._registerEvents();
     },
     
-    /**
-     * Események regisztrálása
-     */
     _registerEvents() {
         this.socket.on('connect', () => {
-            console.log('✅ WebSocket kapcsolódva');
             this.connected = true;
-            this.reconnectAttempts = 0;
             window.store.setConnected(true);
-            window.store.setSocketId(this.socket.id);
-            
-            // Session adatok lekérése
             this.emit('auth:get_session');
+            console.log('✅ WebSocket kapcsolódva');
         });
         
-        this.socket.on('disconnect', (reason) => {
-            console.log('❌ WebSocket kapcsolat bontva:', reason);
+        this.socket.on('disconnect', () => {
             this.connected = false;
             window.store.setConnected(false);
+            console.log('❌ WebSocket kapcsolat bontva');
         });
         
-        this.socket.on('connect_error', (error) => {
-            console.error('❌ WebSocket kapcsolódási hiba:', error);
-            this.reconnectAttempts++;
-        });
-        
-        this.socket.on('reconnect', (attemptNumber) => {
-            console.log(`✅ WebSocket újrakapcsolódva (${attemptNumber})`);
-            this.connected = true;
-            window.store.setConnected(true);
-        });
-        
-        // AUTH események
         this.socket.on('auth:session', (data) => {
-            if (data.authenticated) {
-                window.store.setAuth(data);
-            }
+            if (data.authenticated) window.store.setAuth(data);
         });
         
-        // CHAT események
+        // Chat üzenet válasz
         this.socket.on('chat:response', (data) => {
-            const message = {
-                id: `msg_${Date.now()}`,
+            const msg = {
+                id: data.id || Date.now(),
                 role: 'assistant',
                 content: data.text,
-                timestamp: Date.now(),
+                timestamp: data.timestamp || Date.now(),
                 trace_id: data.trace_id
             };
-            
             if (data.conversation_id) {
-                window.store.addMessage(data.conversation_id, message);
+                window.store.addMessage(data.conversation_id, msg);
+            } else if (window.store.currentConversationId) {
+                window.store.addMessage(window.store.currentConversationId, msg);
             }
         });
         
+        // Proaktív üzenet (entitás kezdeményez)
+        this.socket.on('proactive_message', (data) => {
+            const msg = {
+                id: data.id || Date.now(),
+                role: 'assistant',
+                content: data.text,
+                timestamp: data.timestamp || Date.now(),
+                proactive: true
+            };
+            if (window.store.currentConversationId) {
+                window.store.addMessage(window.store.currentConversationId, msg);
+                window.store.addNotification('info', 'Proaktív üzenet érkezett', 'Kópé');
+            }
+        });
+        
+        // Chat hiba
         this.socket.on('chat:error', (data) => {
-            window.store.addNotification('error', data.error);
+            window.store.addNotification('error', data.error || 'Hiba az üzenet küldésekor');
         });
         
-        this.socket.on('chat:ack', (data) => {
-            console.log('Üzenet fogadva:', data);
+        // Státusz frissítés
+        this.socket.on('status_update', (data) => {
+            if (data.heartbeat) window.store.setHeartbeat(data.heartbeat);
+            if (data.king) window.store.setKingState(data.king);
+            if (data.modules) window.store.setModules(data.modules);
+            if (data.gpu) window.store.setGpuStatus(data.gpu);
         });
         
-        // RENDSZER események
-        this.socket.on('connected', (data) => {
-            console.log('Szerver üdvözlet:', data);
+        // Gépelés jelzés
+        this.socket.on('typing_start', (data) => {
+            if (data.conversation_id === window.store.currentConversationId) {
+                this.typingActive = true;
+            }
+        });
+        
+        this.socket.on('typing_stop', (data) => {
+            if (data.conversation_id === window.store.currentConversationId) {
+                this.typingActive = false;
+            }
+        });
+        
+        // Új naplóbejegyzés
+        this.socket.on('audit_entry', (data) => {
+            window.store.addAuditEntry(data);
+        });
+        
+        // Új trace
+        this.socket.on('trace_entry', (data) => {
+            window.store.addTrace(data);
+        });
+        
+        // Modul állapot változás
+        this.socket.on('module_status', (data) => {
+            if (data.name && data.status) {
+                window.store.updateModule(data.name, data.status);
+            }
+        });
+        
+        // Értesítés
+        this.socket.on('notification', (data) => {
+            window.store.addNotification(data.type || 'info', data.message, data.title);
         });
     },
     
-    /**
-     * Esemény küldése
-     */
-    emit(event, data = {}) {
-        if (!this.socket?.connected) {
-            console.warn('⚠️ Nincs WebSocket kapcsolat');
-            return false;
-        }
-        
-        this.socket.emit(event, data);
-        return true;
-    },
-    
-    /**
-     * Esemény figyelése
-     */
-    on(event, callback) {
-        if (this.socket) {
-            this.socket.on(event, callback);
-        }
-    },
-    
-    /**
-     * Esemény figyelés leállítása
-     */
-    off(event, callback) {
-        if (this.socket) {
-            this.socket.off(event, callback);
-        }
-    },
-    
-    /**
-     * Kapcsolat bontása
-     */
     disconnect() {
         if (this.socket) {
             this.socket.disconnect();
             this.socket = null;
             this.connected = false;
-            window.store.setConnected(false);
         }
     },
     
-    /**
-     * Chat üzenet küldése
-     */
+    emit(event, data = {}) {
+        if (!this.socket?.connected) {
+            console.warn('⚠️ Nincs WebSocket kapcsolat');
+            return false;
+        }
+        this.socket.emit(event, data);
+        return true;
+    },
+    
+    on(event, callback) {
+        if (this.socket) this.socket.on(event, callback);
+    },
+    
+    off(event, callback) {
+        if (this.socket) this.socket.off(event, callback);
+    },
+    
+    // Chat metódusok
     sendMessage(text, conversationId) {
         return this.emit('chat:message', { text, conversation_id: conversationId });
     },
     
-    /**
-     * Gépelés jelzés
-     */
     startTyping(conversationId) {
-        return this.emit('chat:typing_start', { conversation_id: conversationId });
+        this.emit('chat:typing_start', { conversation_id: conversationId });
     },
     
     stopTyping(conversationId) {
-        return this.emit('chat:typing_stop', { conversation_id: conversationId });
+        this.emit('chat:typing_stop', { conversation_id: conversationId });
+    },
+    
+    // Admin metódusok
+    getStatus() {
+        this.emit('get_status');
+    },
+    
+    getConversations() {
+        this.emit('get_conversations');
+    },
+    
+    getModels() {
+        this.emit('get_models');
+    },
+    
+    getPrompts() {
+        this.emit('get_prompts');
+    },
+    
+    getPersonalities() {
+        this.emit('get_personalities');
+    },
+    
+    getSettings() {
+        this.emit('get_settings');
+    },
+    
+    controlModule(module, action) {
+        this.emit('control_module', { module, action });
     }
 };
 
-// Automatikus kapcsolódás
-setTimeout(() => {
-    window.socketManager.connect();
-}, 500);
-
+setTimeout(() => window.socketManager.connect(), 500);
 console.log('✅ SocketManager modul betöltve');

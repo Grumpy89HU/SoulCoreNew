@@ -1,6 +1,6 @@
 # ==============================================
-# SoulCore 3.0 - Web App Backend (app.py)
-# Open WebUI ihletésű, tiszta struktúra
+# SoulCore 3.0 - Web App Backend
+# Flask + Socket.IO, teljes API készlettel
 # ==============================================
 
 import os
@@ -20,7 +20,7 @@ from flask import (
 )
 from flask_socketio import SocketIO, emit, join_room, leave_room
 
-# Projekt gyökér és modulok elérési útja
+# Projekt gyökér
 ROOT_DIR = Path(__file__).parent.parent.parent
 
 # ----------------------------------------------------------------------
@@ -28,7 +28,7 @@ ROOT_DIR = Path(__file__).parent.parent.parent
 # ----------------------------------------------------------------------
 
 def hash_password(password: str) -> str:
-    """Jelszó hash-elése"""
+    """Jelszó hash-elése (PBKDF2)"""
     salt = b"soulcore_salt_2026"
     return hashlib.pbkdf2_hmac(
         'sha256',
@@ -52,8 +52,8 @@ class WebApp:
     - Socket.IO valós idejű kommunikáció
     - Felhasználókezelés (session, admin)
     - Többnyelvű támogatás (i18n)
-    - Beszélgetések, modellek, promptok kezelése
-    - Admin felület modulvezérléssel
+    - Beszélgetések, modellek, promptok, személyiségek
+    - Embedding/Reranker, Audio (ASR/TTS), Vision, Sandbox, Gateway
     """
     
     def __init__(self, modules: Dict[str, Any] = None):
@@ -70,27 +70,24 @@ class WebApp:
         
         # Konfiguráció
         self.app.config["SECRET_KEY"] = os.environ.get("SECRET_KEY", "dev-secret-key-change-me")
-        self.app.config["SESSION_TYPE"] = "filesystem"
         self.app.config["PERMANENT_SESSION_LIFETIME"] = timedelta(days=7)
         self.app.config["SESSION_COOKIE_NAME"] = "soulcore_session"
         
-        # Hibakezelés - JSON válaszok minden hibára
+        # Hibakezelő
         @self.app.errorhandler(Exception)
         def handle_exception(e):
-            """Globális hibakezelő - JSON válasz"""
-            print(f"❌ Hiba: {e}")
             traceback.print_exc()
-            return jsonify({
-                "error": str(e),
-                "type": e.__class__.__name__
-            }), 500
+            return jsonify({"error": str(e), "type": e.__class__.__name__}), 500
         
         @self.app.errorhandler(404)
         def handle_404(e):
-            """404 hibakezelő - JSON válasz API hívásoknál"""
             if request.path.startswith('/api/'):
                 return jsonify({"error": "Not found"}), 404
-            return render_template("404.html"), 404
+            # Ha nincs 404.html, visszaadjuk a base.html-t
+            try:
+                return render_template("404.html"), 404
+            except:
+                return "<h1>404 - Page not found</h1><p>The page you are looking for does not exist.</p>", 404
         
         # Socket.IO
         self.socketio = SocketIO(
@@ -98,18 +95,16 @@ class WebApp:
             cors_allowed_origins="*",
             ping_timeout=60,
             ping_interval=25,
-            manage_session=False
+            manage_session=False  # Fontos a session kezeléshez!
         )
         
         # --- ALAPÉRTELMEZETT FELHASZNÁLÓK ---
-        admin_password_hash = hash_password("admin123")
-        print(f"🔐 Admin jelszó hash: {admin_password_hash[:20]}...")
-        
+        admin_hash = hash_password("admin123")
         self.users = {
             "admin": {
                 "id": 1,
                 "username": "admin",
-                "password_hash": admin_password_hash,
+                "password_hash": admin_hash,
                 "role": "admin",
                 "email": "admin@localhost",
                 "created_at": time.time()
@@ -126,12 +121,40 @@ class WebApp:
         # FEJLESZTŐI MÓD
         self.dev_mode = os.environ.get("DEV_MODE", "true").lower() == "true"
         if self.dev_mode:
-            print("⚠️ WebApp: FEJLESZTŐI MÓDBAN FUT - hitelesítés kikapcsolva!")
+            print("⚠️ FEJLESZTŐI MÓD - automatikus admin bejelentkezés")
+        
+        # Beállítások tároló (memória)
+        self.settings = {
+            "embedding": {
+                "engine": "sentence-transformers",
+                "model": "all-MiniLM-L6-v2",
+                "batch_size": 32,
+                "enable_reranker": False,
+                "reranker_engine": "cross-encoder",
+                "reranker_model": "cross-encoder/ms-marco-MiniLM-L-6-v2",
+                "top_k": 10,
+                "vector_db": "qdrant",
+                "qdrant_url": "http://localhost:6333",
+                "collection_name": "soulcore_knowledge"
+            },
+            "asr": {
+                "engine": "whisper",
+                "whisper_model": "base",
+                "language": "auto"
+            },
+            "tts": {
+                "engine": "coqui",
+                "coqui_model": "tts_models/hu/cess_cat",
+                "voice": "default",
+                "speed": 1.0
+            },
+            "gateways": []
+        }
         
         # Útvonalak regisztrálása
         self._register_routes()
         
-        # Socket események regisztrálása
+        # Socket események
         self._register_socket_events()
         
         print(f"🌐 WebApp inicializálva (system_id: {self.system_id})")
@@ -141,7 +164,6 @@ class WebApp:
     # ----------------------------------------------------------------------
     
     def login_required(self, f):
-        """Dekorátor: bejelentkezés szükséges"""
         @wraps(f)
         def decorated_function(*args, **kwargs):
             if self.dev_mode:
@@ -158,7 +180,6 @@ class WebApp:
         return decorated_function
     
     def admin_required(self, f):
-        """Dekorátor: admin jogosultság szükséges"""
         @wraps(f)
         def decorated_function(*args, **kwargs):
             if self.dev_mode:
@@ -170,19 +191,16 @@ class WebApp:
                 return f(*args, **kwargs)
             
             if "user_id" not in session:
-                return jsonify({"error": "Authentication required", "code": "UNAUTHORIZED"}), 401
+                return jsonify({"error": "Authentication required"}), 401
             
-            user_id = session["user_id"]
-            user = self._get_user_by_id(user_id)
-            
+            user = self._get_user_by_id(session["user_id"])
             if not user or user.get("role") != "admin":
-                return jsonify({"error": "Admin privileges required", "code": "FORBIDDEN"}), 403
-            
+                return jsonify({"error": "Admin required"}), 403
             return f(*args, **kwargs)
         return decorated_function
     
     # ----------------------------------------------------------------------
-    # FELHASZNÁLÓ KEZELÉS (BELSŐ)
+    # FELHASZNÁLÓ KEZELÉS
     # ----------------------------------------------------------------------
     
     def _get_user_by_id(self, user_id: int) -> Optional[Dict]:
@@ -208,43 +226,42 @@ class WebApp:
         """Flask útvonalak regisztrálása"""
         
         # --- STATIKUS OLDALAK ---
-
+        
         @self.app.route("/")
         def index():
-            """Főoldal - egyszerű HTML fájl"""
-            # Visszaadjuk a fájlt HTML-ként
-            with open(ROOT_DIR / "src" / "web" / "templates" / "index.html", "r", encoding="utf-8") as f:
-                html_content = f.read()
-            return html_content, 200, {'Content-Type': 'text/html'}
+            return render_template("base.html")
         
         @self.app.route("/admin")
         @self.admin_required
         def admin_page():
-            return render_template("admin.html")
+            return render_template("base.html")
         
         @self.app.route("/login")
         def login_page():
             if "user_id" in session:
                 return redirect(url_for("index"))
-            return render_template("login.html")
+            return render_template("base.html")
         
         @self.app.route("/register")
         def register_page():
             if "user_id" in session:
                 return redirect(url_for("index"))
-            return render_template("register.html")
+            return render_template("base.html")
         
         @self.app.route("/profile")
         @self.login_required
         def profile_page():
-            return render_template("profile.html")
+            return render_template("base.html")
+        
+        @self.app.route("/static/<path:filename>")
+        def static_files(filename):
+            return send_from_directory(str(ROOT_DIR / "src" / "web" / "static"), filename)
         
         # --- API: AUTH ---
         
         @self.app.route("/api/auth/login", methods=["POST"])
         def api_auth_login():
             data = request.get_json() or {}
-            
             username = data.get("username", "").strip()
             password = data.get("password", "")
             
@@ -254,7 +271,7 @@ class WebApp:
             user = self._get_user_by_username(username)
             
             if not user or not verify_password(password, user["password_hash"]):
-                return jsonify({"error": "Invalid username or password"}), 401
+                return jsonify({"error": "Invalid credentials"}), 401
             
             session.permanent = True
             session["user_id"] = user["id"]
@@ -276,7 +293,6 @@ class WebApp:
         @self.app.route("/api/auth/register", methods=["POST"])
         def api_auth_register():
             data = request.get_json() or {}
-            
             username = data.get("username", "").strip()
             email = data.get("email", "").strip()
             password = data.get("password", "")
@@ -318,7 +334,6 @@ class WebApp:
                 return jsonify({"authenticated": False})
             
             user = self._get_user_by_id(session["user_id"])
-            
             if not user:
                 session.clear()
                 return jsonify({"authenticated": False})
@@ -331,22 +346,7 @@ class WebApp:
                 "email": user["email"]
             })
         
-        @self.app.route("/api/auth/test")
-        def api_auth_test():
-            users_list = []
-            for username, user in self.users.items():
-                users_list.append({
-                    "username": username,
-                    "role": user["role"],
-                    "email": user["email"]
-                })
-            return jsonify({
-                "users": users_list,
-                "dev_mode": self.dev_mode,
-                "session": dict(session)
-            })
-        
-        # --- API: RENDSZER STÁTUSZ ---
+        # --- API: RENDSZER ---
         
         @self.app.route("/api/status")
         def api_status():
@@ -411,9 +411,8 @@ class WebApp:
                     "offset": offset
                 })
             except Exception as e:
-                print(f"❌ Hiba a beszélgetések lekérésekor: {e}")
-                traceback.print_exc()
-                return jsonify({"error": str(e), "conversations": []}), 200
+                print(f"❌ Hiba: {e}")
+                return jsonify({"conversations": [], "error": str(e)}), 200
         
         @self.app.route("/api/conversations", methods=["POST"])
         @self.login_required
@@ -435,23 +434,6 @@ class WebApp:
             
             return jsonify({"id": conv_id, "success": True})
         
-        @self.app.route("/api/conversations/<int:conv_id>", methods=["GET"])
-        @self.login_required
-        def api_get_conversation(conv_id):
-            db = self.modules.get("database")
-            if not db:
-                return jsonify({"error": "Database not available"}), 500
-            
-            conv = db.get_conversation(conv_id)
-            
-            if not conv:
-                return jsonify({"error": "Conversation not found"}), 404
-            
-            if conv.get("user_id") != session["user_id"]:
-                return jsonify({"error": "Access denied"}), 403
-            
-            return jsonify(conv)
-        
         @self.app.route("/api/conversations/<int:conv_id>/messages", methods=["GET"])
         @self.login_required
         def api_get_messages(conv_id):
@@ -460,13 +442,7 @@ class WebApp:
                 return jsonify({"error": "Database not available"}), 500
             
             limit = request.args.get("limit", 100, type=int)
-            before = request.args.get("before", type=int)
-            
             messages = db.get_messages(conv_id, limit=limit)
-            
-            if before:
-                messages = [m for m in messages if m.get("timestamp", 0) < before]
-                messages = messages[-limit:]
             
             return jsonify({
                 "messages": messages,
@@ -499,13 +475,6 @@ class WebApp:
             if not db:
                 return jsonify({"error": "Database not available"}), 500
             
-            conv = db.get_conversation(conv_id)
-            if not conv:
-                return jsonify({"error": "Conversation not found"}), 404
-            
-            if conv.get("user_id") != session["user_id"]:
-                return jsonify({"error": "Access denied"}), 403
-            
             db.delete_conversation(conv_id)
             return jsonify({"success": True})
         
@@ -517,9 +486,7 @@ class WebApp:
             if not db:
                 return jsonify({"models": []})
             
-            active_only = request.args.get("active_only", "false").lower() == "true"
-            models = db.get_models(active_only=active_only)
-            
+            models = db.get_models()
             return jsonify({"models": models})
         
         @self.app.route("/api/models/<int:model_id>/activate", methods=["POST"])
@@ -537,6 +504,36 @@ class WebApp:
             
             return jsonify({"success": True})
         
+        @self.app.route("/api/models", methods=["POST"])
+        @self.admin_required
+        def api_add_model():
+            db = self.modules.get("database")
+            if not db:
+                return jsonify({"error": "Database not available"}), 500
+            
+            data = request.get_json() or {}
+            
+            model_id = db.add_model(
+                name=data.get("name"),
+                path=data.get("path"),
+                quantization=data.get("quantization"),
+                context_length=data.get("context_length", 4096),
+                n_gpu_layers=data.get("n_gpu_layers", -1),
+                description=data.get("description")
+            )
+            
+            return jsonify({"id": model_id, "success": True})
+        
+        @self.app.route("/api/models/<int:model_id>", methods=["DELETE"])
+        @self.admin_required
+        def api_delete_model(model_id):
+            db = self.modules.get("database")
+            if not db:
+                return jsonify({"error": "Database not available"}), 500
+            
+            db.delete_model(model_id)
+            return jsonify({"success": True})
+        
         # --- API: PROMPTOK ---
         
         @self.app.route("/api/prompts", methods=["GET"])
@@ -545,9 +542,7 @@ class WebApp:
             if not db:
                 return jsonify({"prompts": []})
             
-            category = request.args.get("category")
-            prompts = db.get_prompts(category=category)
-            
+            prompts = db.get_prompts()
             return jsonify({"prompts": prompts})
         
         @self.app.route("/api/prompts", methods=["POST"])
@@ -579,34 +574,372 @@ class WebApp:
             db.delete_prompt(prompt_id)
             return jsonify({"success": True})
         
-        # --- API: MODUL VEZÉRLÉS (ADMIN) ---
+        # --- API: SZEMÉLYISÉGEK ---
         
-        @self.app.route("/api/modules/<module_name>/<action>", methods=["POST"])
+        @self.app.route("/api/personalities", methods=["GET"])
+        def api_get_personalities():
+            db = self.modules.get("database")
+            if not db:
+                return jsonify({"personalities": []})
+            
+            personalities = db.get_personalities()
+            return jsonify({"personalities": personalities})
+        
+        @self.app.route("/api/personalities", methods=["POST"])
         @self.admin_required
-        def api_control_module(module_name, action):
-            module = self.modules.get(module_name)
+        def api_save_personality():
+            db = self.modules.get("database")
+            if not db:
+                return jsonify({"error": "Database not available"}), 500
             
-            if not module:
-                return jsonify({"error": f"Module '{module_name}' not found"}), 404
+            data = request.get_json() or {}
             
-            try:
-                if action == "start" and hasattr(module, "start"):
-                    module.start()
-                elif action == "stop" and hasattr(module, "stop"):
-                    module.stop()
-                elif action == "restart":
-                    if hasattr(module, "stop"):
-                        module.stop()
-                    time.sleep(1)
-                    if hasattr(module, "start"):
-                        module.start()
-                else:
-                    return jsonify({"error": f"Action '{action}' not supported"}), 400
-                
-                return jsonify({"success": True})
+            personality_id = db.save_personality(
+                name=data.get("name"),
+                motto=data.get("motto"),
+                description=data.get("description"),
+                traits=data.get("traits", []),
+                relationships=data.get("relationships", []),
+                content=data.get("content"),
+                is_default=data.get("is_default", False)
+            )
             
-            except Exception as e:
-                return jsonify({"error": str(e)}), 500
+            return jsonify({"id": personality_id, "success": True})
+        
+        @self.app.route("/api/personalities/<int:personality_id>/activate", methods=["POST"])
+        @self.admin_required
+        def api_activate_personality(personality_id):
+            db = self.modules.get("database")
+            if not db:
+                return jsonify({"error": "Database not available"}), 500
+            
+            db.activate_personality(personality_id)
+            return jsonify({"success": True})
+        
+        @self.app.route("/api/personalities/<int:personality_id>", methods=["DELETE"])
+        @self.admin_required
+        def api_delete_personality(personality_id):
+            db = self.modules.get("database")
+            if not db:
+                return jsonify({"error": "Database not available"}), 500
+            
+            db.delete_personality(personality_id)
+            return jsonify({"success": True})
+        
+        # --- API: EMBEDDING ---
+        
+        @self.app.route("/api/embedding/settings", methods=["GET"])
+        def api_get_embedding_settings():
+            return jsonify(self.settings.get("embedding", {}))
+        
+        @self.app.route("/api/embedding/settings", methods=["POST"])
+        @self.admin_required
+        def api_update_embedding_settings():
+            data = request.get_json() or {}
+            self.settings["embedding"] = {**self.settings.get("embedding", {}), **data}
+            return jsonify({"success": True})
+        
+        @self.app.route("/api/embedding/test", methods=["POST"])
+        @self.login_required
+        def api_test_embedding():
+            data = request.get_json() or {}
+            text = data.get("text", "")
+            settings = data.get("settings", self.settings.get("embedding", {}))
+            
+            if not text:
+                return jsonify({"error": "Text required"}), 400
+            
+            # Demo válasz (valós implementáció később)
+            return jsonify({
+                "dimension": 384,
+                "vector": [0.1, 0.2, 0.3, 0.4, 0.5] + [0.0] * 379
+            })
+        
+        # --- API: AUDIO (ASR/TTS) ---
+        
+        @self.app.route("/api/audio/asr/settings", methods=["GET"])
+        def api_get_asr_settings():
+            return jsonify(self.settings.get("asr", {}))
+        
+        @self.app.route("/api/audio/asr/settings", methods=["POST"])
+        @self.admin_required
+        def api_update_asr_settings():
+            data = request.get_json() or {}
+            self.settings["asr"] = {**self.settings.get("asr", {}), **data}
+            return jsonify({"success": True})
+        
+        @self.app.route("/api/audio/tts/settings", methods=["GET"])
+        def api_get_tts_settings():
+            return jsonify(self.settings.get("tts", {}))
+        
+        @self.app.route("/api/audio/tts/settings", methods=["POST"])
+        @self.admin_required
+        def api_update_tts_settings():
+            data = request.get_json() or {}
+            self.settings["tts"] = {**self.settings.get("tts", {}), **data}
+            return jsonify({"success": True})
+        
+        @self.app.route("/api/audio/transcribe", methods=["POST"])
+        @self.login_required
+        def api_transcribe_audio():
+            if 'audio' not in request.files:
+                return jsonify({"error": "No audio file"}), 400
+            
+            file = request.files['audio']
+            # Demo válasz (valós implementáció később)
+            return jsonify({"text": "Ez egy demo beszédfelismerési eredmény."})
+        
+        @self.app.route("/api/audio/synthesize", methods=["POST"])
+        @self.login_required
+        def api_synthesize_speech():
+            data = request.get_json() or {}
+            text = data.get("text", "")
+            settings = data.get("settings", self.settings.get("tts", {}))
+            
+            if not text:
+                return jsonify({"error": "Text required"}), 400
+            
+            # Demo válasz (valós implementáció később)
+            # Itt egy üres audio fájlt adunk vissza
+            return jsonify({"success": True, "message": "Audio szintézis (demo)"})
+        
+        # --- API: VISION ---
+        
+        @self.app.route("/api/vision/process", methods=["POST"])
+        @self.login_required
+        def api_process_image():
+            data = request.get_json() or {}
+            image = data.get("image", "")
+            settings = data.get("settings", {})
+            
+            if not image:
+                return jsonify({"error": "No image data"}), 400
+            
+            # Demo válasz (valós implementáció később)
+            return jsonify({
+                "success": True,
+                "description": "Ez egy demo képfeldolgozási eredmény.",
+                "ocr_text": "Demo OCR szöveg",
+                "entities": ["demo", "entity"]
+            })
+        
+        # --- API: SANDBOX ---
+        
+        @self.app.route("/api/sandbox/execute", methods=["POST"])
+        @self.admin_required
+        def api_execute_code():
+            data = request.get_json() or {}
+            code = data.get("code", "")
+            language = data.get("language", "python")
+            timeout = data.get("timeout", 30)
+            memory_limit = data.get("memory_limit", 512)
+            network_access = data.get("network_access", False)
+            
+            if not code:
+                return jsonify({"error": "No code to execute"}), 400
+            
+            # Demo válasz (valós implementáció később)
+            return jsonify({
+                "output": f"Demo kimenet a {language} kódhoz:\n{code[:100]}...",
+                "error": None,
+                "execution_time": 0.1,
+                "memory_used": 10
+            })
+        
+        # --- API: GATEWAY ---
+        
+        @self.app.route("/api/gateway/status", methods=["GET"])
+        def api_get_gateways():
+            return jsonify({"gateways": self.settings.get("gateways", [])})
+        
+        @self.app.route("/api/gateway", methods=["POST"])
+        @self.admin_required
+        def api_add_gateway():
+            data = request.get_json() or {}
+            gateways = self.settings.get("gateways", [])
+            new_id = max([g.get("id", 0) for g in gateways] + [0]) + 1
+            
+            gateway = {
+                "id": new_id,
+                "name": data.get("name", ""),
+                "type": data.get("type", "custom"),
+                "endpoint": data.get("endpoint", ""),
+                "api_key": data.get("api_key", ""),
+                "model": data.get("model", ""),
+                "status": "offline",
+                "trust_score": 500,
+                "created_at": time.time()
+            }
+            
+            gateways.append(gateway)
+            self.settings["gateways"] = gateways
+            
+            return jsonify({"id": new_id, "success": True})
+        
+        @self.app.route("/api/gateway/<int:gateway_id>", methods=["PUT"])
+        @self.admin_required
+        def api_update_gateway(gateway_id):
+            data = request.get_json() or {}
+            gateways = self.settings.get("gateways", [])
+            
+            for g in gateways:
+                if g["id"] == gateway_id:
+                    g.update(data)
+                    break
+            
+            self.settings["gateways"] = gateways
+            return jsonify({"success": True})
+        
+        @self.app.route("/api/gateway/<int:gateway_id>", methods=["DELETE"])
+        @self.admin_required
+        def api_delete_gateway(gateway_id):
+            gateways = self.settings.get("gateways", [])
+            self.settings["gateways"] = [g for g in gateways if g["id"] != gateway_id]
+            return jsonify({"success": True})
+        
+        @self.app.route("/api/gateway/<int:gateway_id>/test", methods=["POST"])
+        @self.admin_required
+        def api_test_gateway(gateway_id):
+            gateways = self.settings.get("gateways", [])
+            gateway = next((g for g in gateways if g["id"] == gateway_id), None)
+            
+            if not gateway:
+                return jsonify({"error": "Gateway not found"}), 404
+            
+            # Demo válasz
+            gateway["status"] = "online"
+            gateway["last_communication"] = time.time()
+            gateway["trust_score"] = min(gateway.get("trust_score", 500) + 50, 1000)
+            
+            return jsonify({"success": True, "status": "online"})
+        
+        @self.app.route("/api/gateway/message", methods=["POST"])
+        @self.login_required
+        def api_gateway_message():
+            data = request.get_json() or {}
+            gateway_id = data.get("gateway_id")
+            message = data.get("message", "")
+            
+            if not gateway_id or not message:
+                return jsonify({"error": "Gateway ID and message required"}), 400
+            
+            # Demo válasz
+            return jsonify({
+                "text": f"Demo válasz a(z) {gateway_id} gateway-től: {message}"
+            })
+        
+        # --- API: BEÁLLÍTÁSOK ---
+        
+        @self.app.route("/api/settings", methods=["GET"])
+        def api_get_settings():
+            category = request.args.get("category")
+            if category:
+                return jsonify(self.settings.get(category, {}))
+            return jsonify(self.settings)
+        
+        @self.app.route("/api/settings/<category>", methods=["POST"])
+        @self.admin_required
+        def api_update_settings(category):
+            data = request.get_json() or {}
+            self.settings[category] = {**self.settings.get(category, {}), **data}
+            return jsonify({"success": True})
+        
+        # --- API: AUDIT LOG (demo) ---
+        
+        @self.app.route("/api/audit", methods=["GET"])
+        @self.admin_required
+        def api_get_audit_log():
+            limit = request.args.get("limit", 100, type=int)
+            
+            # Demo audit log
+            logs = []
+            for i in range(min(limit, 50)):
+                logs.append({
+                    "id": i,
+                    "timestamp": time.time() - i * 3600,
+                    "user": "admin" if i % 3 == 0 else "user1",
+                    "action": ["login", "logout", "create_conversation", "delete_conversation"][i % 4],
+                    "resource": f"resource_{i % 10}",
+                    "details": {"key": "value"},
+                    "ip": "127.0.0.1",
+                    "level": ["info", "warning", "error"][i % 3]
+                })
+            
+            return jsonify({"audit_log": logs})
+        
+        # --- API: METRIKÁK ---
+        
+        @self.app.route("/api/metrics", methods=["GET"])
+        @self.admin_required
+        def api_get_metrics():
+            period = request.args.get("period", "day")
+            limit = request.args.get("limit", 100, type=int)
+            
+            points = 24 if period == "day" else (7 if period == "week" else 30)
+            
+            # Demo metrikák
+            timestamps = [time.time() - i * 3600 for i in range(points, 0, -1)]
+            
+            return jsonify({
+                "total_messages": 1234,
+                "total_tokens": 56789,
+                "avg_response_time": 450,
+                "active_users": 3,
+                "timestamps": timestamps,
+                "tokens": [100 + i * 10 for i in range(points)],
+                "responses": [50 + i * 5 for i in range(points)],
+                "conversations": [1 + i // 4 for i in range(points)],
+                "gpu": [[20 + i % 30] for i in range(points)],
+                "top_users": [
+                    {"id": 1, "name": "admin", "messages": 450, "tokens": 12000, "avg_time": 400},
+                    {"id": 2, "name": "user1", "messages": 320, "tokens": 8900, "avg_time": 520},
+                    {"id": 3, "name": "user2", "messages": 180, "tokens": 4500, "avg_time": 380}
+                ],
+                "top_intents": [
+                    {"name": "greeting", "count": 450, "percentage": 36},
+                    {"name": "question", "count": 380, "percentage": 31},
+                    {"name": "command", "count": 210, "percentage": 17}
+                ]
+            })
+        
+        # --- API: TRACE (BlackBox) ---
+        
+        @self.app.route("/api/blackbox/search", methods=["GET"])
+        @self.admin_required
+        def api_blackbox_search():
+            query = request.args.get("q", "")
+            limit = request.args.get("limit", 100, type=int)
+            
+            # Demo trace-ek
+            traces = []
+            modules = ["orchestrator", "king", "queen", "scribe", "valet", "jester"]
+            levels = ["info", "debug", "warning", "error"]
+            
+            for i in range(min(limit, 50)):
+                traces.append({
+                    "id": i,
+                    "trace_id": f"trace_{uuid.uuid4().hex[:16]}",
+                    "timestamp": time.time() - i * 600,
+                    "module": modules[i % len(modules)],
+                    "level": levels[i % len(levels)],
+                    "message": f"Demo trace message {i}",
+                    "duration": 10 + i % 100,
+                    "context": {"request_id": i, "user": "admin"}
+                })
+            
+            return jsonify({"results": traces})
+        
+        @self.app.route("/api/blackbox/trace/<trace_id>", methods=["GET"])
+        @self.admin_required
+        def api_blackbox_trace(trace_id):
+            return jsonify({
+                "trace_id": trace_id,
+                "timestamp": time.time(),
+                "module": "orchestrator",
+                "level": "info",
+                "message": "Demo trace details",
+                "context": {"full_data": "sample"}
+            })
         
         # --- EGÉSZSÉGÜGYI ELLENŐRZÉS ---
         
@@ -633,8 +966,7 @@ class WebApp:
             self.sessions[client_id] = {
                 "connected_at": time.time(),
                 "user_id": user_id,
-                "ip": request.remote_addr,
-                "user_agent": request.headers.get("User-Agent", "unknown")
+                "ip": request.remote_addr
             }
             
             emit("connected", {
@@ -666,7 +998,6 @@ class WebApp:
                 return
             
             user = self._get_user_by_id(session["user_id"])
-            
             if not user:
                 emit("auth:session", {"authenticated": False})
                 return
@@ -685,7 +1016,7 @@ class WebApp:
             conv_id = data.get("conversation_id") if data else None
             
             if not text or not conv_id:
-                emit("chat:error", {"error": "Missing text or conversation_id"})
+                emit("chat:error", {"error": "Missing data"})
                 return
             
             orch = self.modules.get("orchestrator")
@@ -696,12 +1027,10 @@ class WebApp:
             
             username = session.get("username", "User")
             packet = f"INTENT:UNKNOWN|USER:{username}|MESSAGE:{text}"
-            
             result = orch.process_raw_packet(packet)
             
             if result and isinstance(result, dict) and "trace_id" in result:
                 king = self.modules.get("king")
-                
                 if king:
                     response = king.process({
                         "header": {
@@ -742,30 +1071,27 @@ class WebApp:
             room = data.get("conversation_id") if data else None
             if room:
                 emit("chat:typing_stop", {"user": session.get("username", "User")}, room=room)
+        
+        @self.socketio.on("get_status")
+        def handle_get_status():
+            emit("status_update", {
+                "heartbeat": self.modules.get("heartbeat", {}).get_state() if self.modules.get("heartbeat") else {},
+                "king": self.modules.get("king", {}).get_state() if self.modules.get("king") else {},
+                "modules": list(self.modules.keys()),
+                "gpu": self.modules.get("sentinel", {}).get_gpu_status() if self.modules.get("sentinel") else []
+            })
     
     # ----------------------------------------------------------------------
     # INDIÍTÁS / LEÁLLÍTÁS
     # ----------------------------------------------------------------------
     
-    # ----------------------------------------------------------------------
-# INDIÍTÁS / LEÁLLÍTÁS
-# ----------------------------------------------------------------------
-
     def start(self, host="0.0.0.0", port=5000, debug=False):
-        """Web szerver indítása (blokkoló hívás)"""
         self.running = True
         print(f"🌐 WebApp indul: http://{host}:{port}")
         if self.dev_mode:
-            print("⚠️ FEJLESZTŐI MÓD: Bejelentkezés automatikusan admin-ként történik")
-            print("🔐 Teszteléshez: admin / admin123")
-        
-        # JAVÍTVA: ne használjuk az allow_unsafe_werkzeug paramétert debug módban
-        if debug:
-            print("🐛 Debug mód bekapcsolva")
-            # Debug módban ne használjuk az allow_unsafe_werkzeug-t
-            self.socketio.run(self.app, host=host, port=port, debug=True)
-        else:
-            self.socketio.run(self.app, host=host, port=port, debug=False, allow_unsafe_werkzeug=True)
+            print("⚠️ FEJLESZTŐI MÓD - automatikus admin bejelentkezés")
+            print("🔐 Admin jelszó: admin123")
+        self.socketio.run(self.app, host=host, port=port, debug=debug)
     
     def start_thread(self):
         import threading
@@ -782,15 +1108,14 @@ class WebApp:
         return {
             "status": "running" if self.running else "stopped",
             "clients": len(self.sessions),
-            "system_id": self.system_id,
-            "uptime": time.time() - getattr(self.thread, "start_time", time.time())
+            "system_id": self.system_id
         }
 
 
 # ----------------------------------------------------------------------
-# EGYSZERŰ FŐ PROGRAM
+# FŐ PROGRAM
 # ----------------------------------------------------------------------
 
 if __name__ == "__main__":
     app = WebApp()
-    app.start(host="0.0.0.0", port=5000, debug=True)
+    app.start(host="0.0.0.0", port=5000, debug=False)
