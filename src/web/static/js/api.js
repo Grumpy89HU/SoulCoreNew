@@ -37,12 +37,21 @@ window.api = {
     // ========================================================================
     
     async login(username, password) {
-        const data = await this.fetch('/api/auth/login', {
-            method: 'POST',
-            body: JSON.stringify({ username, password })
-        });
-        window.store.setAuth(data);
-        return data;
+        try {
+            const data = await this.fetch('/api/auth/login', {
+                method: 'POST',
+                body: JSON.stringify({ username, password })
+            });
+            
+            if (data && data.id && window.store) {
+                window.store.setAuth(data);
+            }
+            
+            return data;
+        } catch (error) {
+            console.error('Login API hiba:', error);
+            throw error;
+        }
     },
     
     async logout() {
@@ -59,17 +68,20 @@ window.api = {
     },
     
     async getCurrentUser() {
-		try {
-			const data = await this.fetch('/api/auth/me');
-			if (data.authenticated && data.id) {
-				window.store.setAuth(data);
-			}
-			return data;
-		} catch (error) {
-			console.error('Error getting current user:', error);
-			return { authenticated: false };
-		}
-	},
+        try {
+            const data = await this.fetch('/api/auth/me');
+            if (data && data.authenticated && data.id) {
+                if (window.store) {
+                    window.store.setAuth(data);
+                }
+                return data;
+            }
+            return { authenticated: false };
+        } catch (error) {
+            console.error('Error getting current user:', error);
+            return { authenticated: false };
+        }
+    },
     
     // ========================================================================
     // RENDSZER
@@ -115,9 +127,27 @@ window.api = {
     // ========================================================================
     
     async getConversations() {
-        const data = await this.fetch('/api/conversations');
-        window.store.setConversations(data.conversations || []);
-        return data;
+        try {
+            const data = await this.fetch('/api/conversations');
+            if (data && data.conversations) {
+                window.store.setConversations(data.conversations);
+                // Ha van beszélgetés, az elsőt állítsuk be aktuálisnak
+                if (data.conversations.length > 0 && !window.store.currentConversationId) {
+                    window.store.setCurrentConversationId(data.conversations[0].id);
+                    await this.getMessages(data.conversations[0].id);
+                }
+            }
+            return data;
+        } catch (error) {
+            console.error('Error loading conversations:', error);
+            // Demo beszélgetések
+            window.store.setConversations([
+                { id: 1, title: 'Első beszélgetés', updated_at: Date.now(), message_count: 0 }
+            ]);
+            window.store.setCurrentConversationId(1);
+            window.store.setMessages(1, []);
+            return { conversations: [] };
+        }
     },
     
     async createConversation(title) {

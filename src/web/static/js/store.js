@@ -16,8 +16,8 @@ window.store = {
         
         // === BESZÉLGETÉSEK ===
         conversations: [],
-        currentConversationId: null,
-        messages: {},
+		currentConversationId: null,
+		messages: {}, 
         
         // === MODELLEK ===
         models: [],
@@ -136,15 +136,16 @@ window.store = {
     // ========================================================================
     
     setAuth(user) {
-		if (!user) return;
-		this.state.authenticated = true;
-		this.state.user = {
-			id: user.id,
-			username: user.username,
-			role: user.role,
-			email: user.email
-		};
-	},
+        if (!user) return;
+        this.state.authenticated = true;
+        this.state.user = {
+            id: user.id,
+            username: user.username,
+            role: user.role,
+            email: user.email
+        };
+        console.log('✅ Felhasználó bejelentkezve:', user.username);
+    },
     
     clearAuth() {
         this.state.authenticated = false;
@@ -180,8 +181,9 @@ window.store = {
     },
     
     setMessages(id, msgs) {
-        this.state.messages[id] = msgs;
-    },
+		if (!this.state.messages) this.state.messages = {};
+		this.state.messages[id] = msgs;
+	},
     
     addMessage(id, msg) {
         if (!this.state.messages[id]) this.state.messages[id] = [];
@@ -472,9 +474,26 @@ window.store = {
         
         window.addEventListener('resize', () => this.handleResize());
         
+        // ========== ALAPÉRTELMEZETT BESZÉLGETÉS ==========
+        // Ha nincs beszélgetés, hozzunk létre egyet
+        if (this.state.conversations.length === 0) {
+            const defaultConv = {
+                id: 1,
+                title: 'Új beszélgetés',
+                created_at: Date.now(),
+                updated_at: Date.now(),
+                message_count: 0,
+                last_message: null
+            };
+            this.state.conversations = [defaultConv];
+            this.state.currentConversationId = 1;
+            this.state.messages[1] = [];
+            console.log('✅ Alapértelmezett beszélgetés létrehozva');
+        }
+        
         console.log('✅ Store inicializálva');
     }
-};
+};  // <-- ITT KELL ZÁRÓJELEM A window.store OBJEKTUMHOZ!
 
 window.store.init();
 console.log('✅ Store modul betöltve');

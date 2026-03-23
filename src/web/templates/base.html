@@ -2,48 +2,45 @@
 <html lang="hu">
 <head>
     <meta charset="UTF-8">
-    <meta name="viewport" content="width=device-width, initial-scale=1.0, user-scalable=yes">
-    <title>SoulCore 3.0 - Szuverén AI Rendszer</title>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>SoulCore 3.0</title>
+    <link rel="stylesheet" href="/static/css/main.css">
     
     <!-- Külső könyvtárak -->
-    <script src="https://cdn.socket.io/4.5.4/socket.io.min.js"></script>
     <script src="https://unpkg.com/vue@3/dist/vue.global.js"></script>
-    <script src="https://cdn.jsdelivr.net/npm/chart.js@4.4.0/dist/chart.umd.min.js"></script>
-    
-    <!-- CSS -->
-    <link rel="stylesheet" href="/static/css/main.css">
+    <script src="https://cdn.socket.io/4.5.4/socket.io.min.js"></script>
 </head>
 <body>
     <div id="app"></div>
     
-    <!-- JavaScript modulok (sorban) -->
+    <!-- ======================================================================== -->
+    <!-- ALAP MODULOK - SORREND FONTOS! -->
+    <!-- ======================================================================== -->
     <script src="/static/js/i18n.js"></script>
     <script src="/static/js/store.js"></script>
-    <script src="/static/js/api.js"></script>
+    <script src="/static/js/api.js"></script>      <!-- api.js a store.js UTÁN -->
     <script src="/static/js/socket.js"></script>
     <script src="/static/js/utils/formatters.js"></script>
     <script src="/static/js/utils/validators.js"></script>
     
-    <!-- Komponensek -->
+    <!-- ======================================================================== -->
+    <!-- KOMPONENSEK -->
+    <!-- ======================================================================== -->
+    <script src="/static/js/components/LoginForm.js"></script>
+    <script src="/static/js/components/RegisterForm.js"></script>
     <script src="/static/js/components/ConversationList.js"></script>
-    <script src="/static/js/components/TelemetryPanel.js"></script>
     <script src="/static/js/components/ChatBox.js"></script>
+    <script src="/static/js/components/TelemetryPanel.js"></script>
     <script src="/static/js/components/ModuleControl.js"></script>
     <script src="/static/js/components/ModelSelector.js"></script>
     <script src="/static/js/components/PromptEditor.js"></script>
     <script src="/static/js/components/PersonalityManager.js"></script>
     <script src="/static/js/components/SettingsPanel.js"></script>
-    <script src="/static/js/components/AuditLog.js"></script>
-    <script src="/static/js/components/MetricsPanel.js"></script>
-    <script src="/static/js/components/TracePanel.js"></script>
-    <script src="/static/js/components/VisionUpload.js"></script>
-    <script src="/static/js/components/SandboxEditor.js"></script>
-    <script src="/static/js/components/GatewayPanel.js"></script>
     <script src="/static/js/components/AdminPanel.js"></script>
-    <script src="/static/js/components/LoginForm.js"></script>
-    <script src="/static/js/components/RegisterForm.js"></script>
     
-    <!-- Fő alkalmazás -->
+    <!-- ======================================================================== -->
+    <!-- FŐ ALKALMAZÁS - UTOLSÓ! -->
+    <!-- ======================================================================== -->
     <script src="/static/js/main.js"></script>
 </body>
 </html>

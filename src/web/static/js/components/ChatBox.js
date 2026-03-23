@@ -1,6 +1,6 @@
 // ==============================================
 // SOULCORE 3.0 - Chat ablak komponens
-// Kódblokk támogatással, másolás/letöltés funkcióval
+// JAVÍTOTT VERZIÓ - store elérés javítva
 // ==============================================
 
 window.ChatBox = {
@@ -10,62 +10,54 @@ window.ChatBox = {
         <div class="chat-container">
             <!-- Chat fejléc -->
             <div class="chat-header">
-                <h3>{{ currentConversation ? currentConversation.title : t('chat.untitled') }}</h3>
+                <h3 align="center">{{ currentConversation ? currentConversation.title : (t ? t('chat.untitled') : 'Új beszélgetés') }}</h3>
                 <div class="chat-header-actions">
                     <span v-if="currentModel" class="chat-model-badge">
                         🤖 {{ currentModel.name || currentModel }}
                     </span>
-                    <button class="icon-btn" @click="showInfo" :title="t('chat.info')">ℹ️</button>
                     <button 
                         v-if="isAdmin && currentConversation" 
                         class="icon-btn" 
                         @click="clearChat" 
-                        :title="t('chat.clear')"
+                        :title="(t ? t('chat.clear') : 'Törlés')"
                     >🗑️</button>
                 </div>
             </div>
             
             <!-- Üzenetek területe -->
             <div class="chat-messages" ref="messagesContainer" @scroll="handleScroll">
-                <!-- Betöltés jelző (több üzenet betöltésekor) -->
                 <div v-if="loadingMore" class="loading-more">
                     <div class="spinner-small"></div>
                 </div>
                 
-                <!-- Üzenetek -->
                 <div v-for="msg in messages" :key="msg.id" 
                      class="message" 
                      :class="[msg.role, msg.proactive ? 'proactive' : '']"
                      :data-id="msg.id">
                     
-                    <!-- Feladó neve -->
                     <div class="sender">
-                        <span v-if="msg.role === 'user'">{{ t('chat.you') }}</span>
-                        <span v-else-if="msg.role === 'assistant'">{{ t('chat.assistant') }}</span>
-                        <span v-else-if="msg.role === 'jester'">{{ t('chat.jester') }}</span>
-                        <span v-else>{{ t('chat.system') }}</span>
-                        <span v-if="msg.proactive" class="proactive-badge" :title="t('chat.proactive_hint')">🔔</span>
+                        <span v-if="msg.role === 'user'">{{ t ? t('chat.you') : 'Te' }}</span>
+                        <span v-else-if="msg.role === 'assistant'">{{ t ? t('chat.assistant') : 'Kópé' }}</span>
+                        <span v-else-if="msg.role === 'jester'">{{ t ? t('chat.jester') : 'Bohóc' }}</span>
+                        <span v-else>{{ t ? t('chat.system') : 'Rendszer' }}</span>
+                        <span v-if="msg.proactive" class="proactive-badge" :title="(t ? t('chat.proactive_hint') : 'Proaktív')">🔔</span>
                         <span class="message-time">{{ formatTime(msg.timestamp) }}</span>
                     </div>
                     
-                    <!-- Üzenet tartalom (markdown támogatással) -->
                     <div class="content" v-html="formatMessage(msg.content)"></div>
                     
-                    <!-- Idéző gomb (csak nem rendszer üzeneteknél) -->
                     <button 
                         v-if="msg.role !== 'system'" 
                         class="quote-btn" 
                         @click="quoteMessage(msg)"
-                        :title="t('chat.quote')"
+                        :title="(t ? t('chat.quote') : 'Idézés')"
                     >↩️</button>
                     
-                    <!-- Token információ (ha van) -->
                     <div class="message-footer" v-if="msg.tokens">
-                        <span class="token-count">🔤 {{ msg.tokens }} {{ t('chat.tokens') }}</span>
+                        <span class="token-count">🔤 {{ msg.tokens }} {{ t ? t('chat.tokens') : 'token' }}</span>
                     </div>
                 </div>
                 
-                <!-- Gépelés jelzés -->
                 <div v-if="isTyping" class="typing-indicator">
                     <span></span>
                     <span></span>
@@ -75,63 +67,55 @@ window.ChatBox = {
             
             <!-- Chat input terület -->
             <div class="chat-input-area">
-                <!-- Prompt választó (ha van) -->
-                <div class="prompt-bar" v-if="prompts.length">
+                <div class="prompt-bar" v-if="prompts && prompts.length">
                     <select v-model="selectedPromptId" class="prompt-select" @change="loadPrompt">
-                        <option value="">{{ t('chat.select_prompt') }}</option>
+                        <option value="">{{ t ? t('chat.select_prompt') : 'Válassz promptot...' }}</option>
                         <option v-for="p in prompts" :key="p.id" :value="p.id">
                             {{ p.name }}
                         </option>
                     </select>
                 </div>
                 
-                <!-- Input sor -->
                 <div class="input-container">
-                    <!-- Quote előnézet -->
                     <div v-if="quotedMessage" class="quote-preview">
                         <div class="quote-content">
                             <span class="quote-author">
-                                {{ quotedMessage.role === 'user' ? t('chat.you') : t('chat.assistant') }}:
+                                {{ quotedMessage.role === 'user' ? (t ? t('chat.you') : 'Te') : (t ? t('chat.assistant') : 'Kópé') }}:
                             </span>
                             {{ truncate(quotedMessage.content, 50) }}
                         </div>
                         <button class="quote-close" @click="clearQuote">✕</button>
                     </div>
                     
-                    <!-- Textarea beviteli mező -->
                     <textarea 
                         v-model="inputMessage" 
                         @keydown.enter.exact.prevent="sendMessage"
                         @keydown.enter.shift.exact="insertNewline"
                         @input="handleTyping"
-                        :placeholder="t('chat.type_message')"
+                        :placeholder="(t ? t('chat.type_message') : 'Írja be üzenetét...')"
                         :disabled="!connected || !currentConversationId"
                         class="chat-input"
                         rows="1"
                         ref="inputField"
                     ></textarea>
                     
-                    <!-- Eszköztár -->
                     <div class="input-toolbar">
-                        <button class="tool-btn" @click="uploadImage" :title="t('chat.upload_image')">📷</button>
-                        <button class="tool-btn" @click="openEmojiPicker" :title="t('chat.emoji')">😊</button>
-                        <button class="tool-btn" @click="clearInput" :title="t('chat.clear_input')" v-if="inputMessage">🗑️</button>
+                        <button class="tool-btn" @click="uploadImage" :title="(t ? t('chat.upload_image') : 'Kép feltöltés')">📷</button>
+                        <button class="tool-btn" @click="openEmojiPicker" :title="(t ? t('chat.emoji') : 'Hangulatjel')">😊</button>
+                        <button class="tool-btn" @click="clearInput" :title="(t ? t('chat.clear_input') : 'Törlés')" v-if="inputMessage">🗑️</button>
                     </div>
                     
-                    <!-- Küldés gomb -->
                     <button class="send-btn" @click="sendMessage" :disabled="!canSend">
                         <span v-if="!isSending">📤</span>
                         <span v-else class="spinner-small"></span>
                     </button>
                 </div>
                 
-                <!-- Rejtett fájl input (kép feltöltéshez) -->
                 <input type="file" ref="fileInput" accept="image/*" style="display: none;" @change="handleFileSelect">
                 
-                <!-- Modell információ -->
                 <div class="model-info" v-if="currentModel">
                     <span>🤖 {{ currentModel.name || currentModel }}</span>
-                    <span v-if="tokenCount" class="token-info"> | 🔤 {{ tokenCount }} {{ t('chat.tokens') }}</span>
+                    <span v-if="tokenCount" class="token-info"> | 🔤 {{ tokenCount }} {{ t ? t('chat.tokens') : 'token' }}</span>
                 </div>
             </div>
         </div>
@@ -152,39 +136,52 @@ window.ChatBox = {
         const page = Vue.ref(1);
         const hasMore = Vue.ref(false);
         
-        // Refs
         const messagesContainer = Vue.ref(null);
         const inputField = Vue.ref(null);
         const fileInput = Vue.ref(null);
         
-        // Gépelés timeout
         let typingTimeout = null;
         
         // ====================================================================
-        // COMPUTED PROPERTIES (BIZTONSÁGOS)
+        // COMPUTED PROPERTIES (BIZTONSÁGOS STORE ELÉRÉS)
         // ====================================================================
         
         const currentConversation = Vue.computed(() => {
-            const convId = window.store?.currentConversationId;
+            if (!window.store) return null;
+            const convId = window.store.currentConversationId;
             if (!convId) return null;
-            return window.store?.conversations?.find(c => c.id === convId);
+            const convs = window.store.conversations;
+            return convs ? convs.find(c => c.id === convId) : null;
         });
         
-        const currentConversationId = Vue.computed(() => window.store?.currentConversationId);
+        const currentConversationId = Vue.computed(() => {
+            return window.store ? window.store.currentConversationId : null;
+        });
         
         const messages = Vue.computed(() => {
-            const convId = window.store?.currentConversationId;
+            if (!window.store) return [];
+            const convId = window.store.currentConversationId;
             if (!convId) return [];
-            return window.store?.messages?.[convId] || [];
+            const msgs = window.store.messages;
+            return msgs && msgs[convId] ? msgs[convId] : [];
         });
         
-        const connected = Vue.computed(() => window.store?.connected || false);
-        const isAdmin = Vue.computed(() => window.store?.user?.role === 'admin');
-        const prompts = Vue.computed(() => window.store?.prompts || []);
+        const connected = Vue.computed(() => {
+            return window.store ? window.store.connected : false;
+        });
+        
+        const isAdmin = Vue.computed(() => {
+            return window.store && window.store.user ? window.store.user.role === 'admin' : false;
+        });
+        
+        const prompts = Vue.computed(() => {
+            return window.store ? window.store.prompts : [];
+        });
         
         const currentModel = Vue.computed(() => {
-            const models = window.store?.models || [];
-            return models.find(m => m.is_active) || null;
+            if (!window.store) return null;
+            const models = window.store.models;
+            return models ? models.find(m => m.is_active) : null;
         });
         
         const canSend = Vue.computed(() => {
@@ -195,10 +192,12 @@ window.ChatBox = {
         });
         
         // ====================================================================
-        // KÓDBLOKK SEGÉDFÜGGVÉNYEK
+        // SEGÉDFÜGGVÉNYEK
         // ====================================================================
         
-        const t = (key, params = {}) => window.gettext ? window.gettext(key, params) : key;
+        const t = (key, params = {}) => {
+            return window.gettext ? window.gettext(key, params) : key;
+        };
         
         const formatTime = (timestamp) => {
             if (!timestamp) return '';
@@ -211,226 +210,107 @@ window.ChatBox = {
             return text.length > length ? text.substring(0, length) + '...' : text;
         };
         
-        /**
-         * Kód másolása a vágólapra
-         */
+        const scrollToBottom = () => {
+            Vue.nextTick(() => {
+                if (messagesContainer.value) {
+                    messagesContainer.value.scrollTop = messagesContainer.value.scrollHeight;
+                }
+            });
+        };
+        
+        // ====================================================================
+        // KÓDBLOKK FUNKCIÓK
+        // ====================================================================
+        
         const copyCodeToClipboard = async (code, language) => {
             try {
                 await navigator.clipboard.writeText(code);
-                window.store?.addNotification('success', `${language || 'Kód'} másolva a vágólapra`);
+                if (window.store) window.store.addNotification('success', `${language || 'Kód'} másolva a vágólapra`);
             } catch (err) {
                 console.error('Másolás hiba:', err);
-                window.store?.addNotification('error', 'Másolás sikertelen');
+                if (window.store) window.store.addNotification('error', 'Másolás sikertelen');
             }
         };
         
-        /**
-         * Kód letöltése fájlként
-         */
         const downloadCode = (code, language) => {
-            const ext = getFileExtension(language);
+            const exts = {
+                'python': 'py', 'javascript': 'js', 'html': 'html', 'css': 'css',
+                'json': 'json', 'bash': 'sh', 'sql': 'sql', 'java': 'java'
+            };
+            const ext = exts[language?.toLowerCase()] || 'txt';
             const filename = `code_${Date.now()}.${ext}`;
             const blob = new Blob([code], { type: 'text/plain' });
             const url = URL.createObjectURL(blob);
             const a = document.createElement('a');
             a.href = url;
             a.download = filename;
-            document.body.appendChild(a);
             a.click();
-            document.body.removeChild(a);
             URL.revokeObjectURL(url);
-            window.store?.addNotification('success', `Kód mentve: ${filename}`);
+            if (window.store) window.store.addNotification('success', `Kód mentve: ${filename}`);
         };
         
-        /**
-         * Fájlkiterjesztés meghatározása nyelv alapján
-         */
-        const getFileExtension = (language) => {
-            const exts = {
-                'python': 'py',
-                'javascript': 'js',
-                'typescript': 'ts',
-                'html': 'html',
-                'css': 'css',
-                'json': 'json',
-                'yaml': 'yaml',
-                'yml': 'yml',
-                'markdown': 'md',
-                'bash': 'sh',
-                'shell': 'sh',
-                'sql': 'sql',
-                'java': 'java',
-                'c': 'c',
-                'cpp': 'cpp',
-                'csharp': 'cs',
-                'go': 'go',
-                'rust': 'rs',
-                'php': 'php',
-                'ruby': 'rb',
-                'lua': 'lua',
-                'xml': 'xml'
-            };
-            return exts[language?.toLowerCase()] || 'txt';
+        const escapeHtml = (str) => {
+            return str.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;').replace(/'/g, '&#39;');
         };
         
-        /**
-         * HTML attribútum escape (biztonság)
-         */
-        const escapeHtmlAttribute = (str) => {
-            return str
-                .replace(/&/g, '&amp;')
-                .replace(/</g, '&lt;')
-                .replace(/>/g, '&gt;')
-                .replace(/"/g, '&quot;')
-                .replace(/'/g, '&#39;');
-        };
-        
-        /**
-         * Kód blokk HTML generálása másolás/letöltés gombokkal
-         */
         const generateCodeBlock = (code, language) => {
             const langLabel = language || 'code';
-            const escapedCode = code
-                .replace(/&/g, '&amp;')
-                .replace(/</g, '&lt;')
-                .replace(/>/g, '&gt;');
-            
+            const escapedCode = escapeHtml(code);
             return `
                 <div class="code-block-container">
                     <div class="code-block-header">
                         <span class="code-language">${langLabel}</span>
                         <div class="code-actions">
-                            <button class="code-copy-btn" data-code="${escapeHtmlAttribute(code)}" data-lang="${langLabel}">
-                                📋 Másolás
-                            </button>
-                            <button class="code-download-btn" data-code="${escapeHtmlAttribute(code)}" data-lang="${langLabel}">
-                                💾 Letöltés
-                            </button>
+                            <button class="code-copy-btn" data-code="${escapeHtml(code)}" data-lang="${langLabel}">📋 Másolás</button>
+                            <button class="code-download-btn" data-code="${escapeHtml(code)}" data-lang="${langLabel}">💾 Letöltés</button>
                         </div>
                     </div>
-                    <pre><code class="language-${langLabel}">${escapedCode}</code></pre>
+                    <pre><code>${escapedCode}</code></pre>
                 </div>
             `;
         };
         
-        /**
-         * Kódblokk események beállítása (DOM-ba helyezés után)
-         */
         const attachCodeBlockEvents = (element) => {
             if (!element) return;
-            
-            const copyButtons = element.querySelectorAll('.code-copy-btn');
-            copyButtons.forEach(btn => {
-                btn.removeEventListener('click', handleCopyClick);
-                btn.addEventListener('click', handleCopyClick);
+            element.querySelectorAll('.code-copy-btn').forEach(btn => {
+                btn.onclick = async (e) => {
+                    e.stopPropagation();
+                    const code = btn.getAttribute('data-code');
+                    const lang = btn.getAttribute('data-lang');
+                    if (code) {
+                        await copyCodeToClipboard(code, lang);
+                        const original = btn.innerHTML;
+                        btn.innerHTML = '✅ Másolva!';
+                        setTimeout(() => { btn.innerHTML = original; }, 1500);
+                    }
+                };
             });
-            
-            const downloadButtons = element.querySelectorAll('.code-download-btn');
-            downloadButtons.forEach(btn => {
-                btn.removeEventListener('click', handleDownloadClick);
-                btn.addEventListener('click', handleDownloadClick);
-            });
-        };
-        
-        /**
-         * Másolás gomb eseménykezelő
-         */
-        const handleCopyClick = async (e) => {
-            e.stopPropagation();
-            const btn = e.currentTarget;
-            const code = btn.getAttribute('data-code');
-            const lang = btn.getAttribute('data-lang');
-            if (code) {
-                await copyCodeToClipboard(code, lang);
-                const originalText = btn.innerHTML;
-                btn.innerHTML = '✅ Másolva!';
-                setTimeout(() => { btn.innerHTML = originalText; }, 1500);
-            }
-        };
-        
-        /**
-         * Letöltés gomb eseménykezelő
-         */
-        const handleDownloadClick = (e) => {
-            e.stopPropagation();
-            const btn = e.currentTarget;
-            const code = btn.getAttribute('data-code');
-            const lang = btn.getAttribute('data-lang');
-            if (code) {
-                downloadCode(code, lang);
-            }
-        };
-        
-        /**
-         * Kódblokk események frissítése (minden üzenet változás után)
-         */
-        const refreshCodeBlockEvents = () => {
-            Vue.nextTick(() => {
-                if (messagesContainer.value) {
-                    attachCodeBlockEvents(messagesContainer.value);
-                }
+            element.querySelectorAll('.code-download-btn').forEach(btn => {
+                btn.onclick = (e) => {
+                    e.stopPropagation();
+                    const code = btn.getAttribute('data-code');
+                    const lang = btn.getAttribute('data-lang');
+                    if (code) downloadCode(code, lang);
+                };
             });
         };
-        
-        // ====================================================================
-        // ÜZENET FORMÁZÁS (markdown, linkek, kódblokkok)
-        // ====================================================================
         
         const formatMessage = (content) => {
             if (!content) return '';
             
             let html = content;
-            
-            // Kódblokkok feldolgozása (```language\ncode\n```)
             html = html.replace(/```(\w*)\n([\s\S]*?)```/g, (match, language, code) => {
                 return generateCodeBlock(code.trim(), language);
             });
-            
-            // HTML escape a maradék tartalomra
-            html = html
-                .replace(/&/g, '&amp;')
-                .replace(/</g, '&lt;')
-                .replace(/>/g, '&gt;')
-                .replace(/"/g, '&quot;')
-                .replace(/'/g, '&#039;');
-            
-            // Linkek
-            html = html.replace(
-                /(https?:\/\/[^\s]+)/g,
-                '<a href="$1" target="_blank" rel="noopener noreferrer">$1</a>'
-            );
-            
-            // Inline kód (nem kódblokkban)
-            html = html.replace(
-                /`([^`]+)`/g,
-                '<code>$1</code>'
-            );
-            
-            // Félkövér
+            html = html.replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;');
+            html = html.replace(/(https?:\/\/[^\s]+)/g, '<a href="$1" target="_blank" rel="noopener noreferrer">$1</a>');
+            html = html.replace(/`([^`]+)`/g, '<code>$1</code>');
             html = html.replace(/\*\*([^*]+)\*\*/g, '<strong>$1</strong>');
-            
-            // Dőlt
             html = html.replace(/\*([^*]+)\*/g, '<em>$1</em>');
-            
-            // Idézetek
             html = html.replace(/^&gt; (.*)$/gm, '<blockquote>$1</blockquote>');
-            
-            // Sortörések
             html = html.replace(/\n/g, '<br>');
             
             return html;
-        };
-        
-        /**
-         * Görgetés az üzenetek aljára
-         */
-        const scrollToBottom = () => {
-            Vue.nextTick(() => {
-                if (messagesContainer.value) {
-                    messagesContainer.value.scrollTop = messagesContainer.value.scrollHeight;
-                    attachCodeBlockEvents(messagesContainer.value);
-                }
-            });
         };
         
         // ====================================================================
@@ -444,7 +324,7 @@ window.ChatBox = {
             
             let finalText = text;
             if (quotedMessage.value) {
-                const quoteAuthor = quotedMessage.value.role === 'user' ? t('chat.you') : t('chat.assistant');
+                const quoteAuthor = quotedMessage.value.role === 'user' ? (t ? t('chat.you') : 'Te') : (t ? t('chat.assistant') : 'Kópé');
                 finalText = `> ${quoteAuthor}: ${quotedMessage.value.content}\n\n${text}`;
                 quotedMessage.value = null;
             }
@@ -452,20 +332,24 @@ window.ChatBox = {
             isSending.value = true;
             const convId = currentConversationId.value;
             
-            // Helyi üzenet hozzáadása
-            const tempId = `temp_${Date.now()}`;
-            if (window.store && convId) {
-                if (!window.store.state.messages[convId]) window.store.state.messages[convId] = [];
-                window.store.state.messages[convId].push({
-                    id: tempId,
-                    role: 'user',
-                    content: text,
-                    timestamp: Date.now(),
-                    temp: true
-                });
-            }
-            scrollToBottom();
+            // JAVÍTVA: helyi üzenet hozzáadása a store-hoz
+            const tempMsg = {
+                id: Date.now(),
+                role: 'user',
+                content: text,
+                timestamp: Date.now(),
+                temp: true
+            };
             
+            if (window.store && convId) {
+                // Közvetlenül a store state-jébe írunk
+                if (!window.store.state.messages[convId]) {
+                    window.store.state.messages[convId] = [];
+                }
+                window.store.state.messages[convId].push(tempMsg);
+            }
+            
+            scrollToBottom();
             tokenCount.value += Math.ceil(text.length / 4);
             inputMessage.value = '';
             if (inputField.value) inputField.value.style.height = 'auto';
@@ -475,19 +359,20 @@ window.ChatBox = {
                 if (window.socketManager) window.socketManager.sendMessage(finalText, convId);
             } catch (error) {
                 console.error('Hiba az üzenet küldésekor:', error);
-                window.store?.addNotification('error', t('chat.send_error'));
+                if (window.store) window.store.addNotification('error', 'Hiba az üzenet küldésekor');
+                
+                // Hiba esetén töröljük a helyi üzenetet
                 if (window.store && convId && window.store.state.messages[convId]) {
                     const msgs = window.store.state.messages[convId];
-                    if (msgs && msgs[msgs.length - 1]?.id === tempId) msgs.pop();
+                    if (msgs[msgs.length - 1]?.id === tempMsg.id) {
+                        msgs.pop();
+                    }
                 }
             } finally {
                 isSending.value = false;
             }
         };
         
-        /**
-         * Új sor beszúrása (Shift+Enter)
-         */
         const insertNewline = () => {
             if (!inputField.value) return;
             const start = inputField.value.selectionStart;
@@ -500,19 +385,16 @@ window.ChatBox = {
             });
         };
         
-        /**
-         * Gépelés jelzés küldése
-         */
         const handleTyping = () => {
             if (typingTimeout) clearTimeout(typingTimeout);
             if (!isTyping.value && currentConversationId.value) {
                 isTyping.value = true;
-                window.socketManager?.startTyping(currentConversationId.value);
+                if (window.socketManager) window.socketManager.startTyping(currentConversationId.value);
             }
             typingTimeout = setTimeout(() => {
                 if (isTyping.value) {
                     isTyping.value = false;
-                    window.socketManager?.stopTyping(currentConversationId.value);
+                    if (window.socketManager) window.socketManager.stopTyping(currentConversationId.value);
                 }
             }, 2000);
             if (inputField.value) {
@@ -523,7 +405,7 @@ window.ChatBox = {
         
         const quoteMessage = (msg) => {
             quotedMessage.value = msg;
-            inputField.value?.focus();
+            if (inputField.value) inputField.value.focus();
         };
         
         const clearQuote = () => { quotedMessage.value = null; };
@@ -532,7 +414,7 @@ window.ChatBox = {
             if (inputField.value) inputField.value.style.height = 'auto';
         };
         
-        const uploadImage = () => { fileInput.value?.click(); };
+        const uploadImage = () => { if (fileInput.value) fileInput.value.click(); };
         
         const handleFileSelect = async (event) => {
             const file = event.target.files[0];
@@ -545,12 +427,7 @@ window.ChatBox = {
             if (window.store && convId) {
                 if (!window.store.state.messages[convId]) window.store.state.messages[convId] = [];
                 window.store.state.messages[convId].push({
-                    id: tempId,
-                    role: 'user',
-                    content: `📷 ${file.name}`,
-                    timestamp: Date.now(),
-                    image: previewUrl,
-                    temp: true
+                    id: tempId, role: 'user', content: `📷 ${file.name}`, timestamp: Date.now(), image: previewUrl, temp: true
                 });
             }
             scrollToBottom();
@@ -562,16 +439,15 @@ window.ChatBox = {
                         const result = await window.api.processImage(e.target.result);
                         if (window.store && convId && window.store.state.messages[convId]) {
                             const msgs = window.store.state.messages[convId];
-                            if (msgs && msgs[msgs.length - 1]?.id === tempId) msgs.pop();
-                            if (result.success) {
+                            if (msgs[msgs.length - 1]?.id === tempId) msgs.pop();
+                            if (result && result.success) {
                                 window.store.state.messages[convId].push({
-                                    id: Date.now(),
-                                    role: 'assistant',
+                                    id: Date.now(), role: 'assistant',
                                     content: `🖼️ **Kép feldolgozás eredménye:**\n\n${result.description || result.ocr_text || 'Kép feldolgozva'}`,
                                     timestamp: Date.now()
                                 });
                             } else {
-                                window.store?.addNotification('error', result.error || 'Kép feldolgozása sikertelen');
+                                if (window.store) window.store.addNotification('error', result?.error || 'Kép feldolgozása sikertelen');
                             }
                             scrollToBottom();
                         }
@@ -580,27 +456,27 @@ window.ChatBox = {
                 reader.readAsDataURL(file);
             } catch (error) {
                 console.error('Hiba a kép feltöltésekor:', error);
-                window.store?.addNotification('error', t('chat.upload_error'));
+                if (window.store) window.store.addNotification('error', 'Hiba a kép feltöltésekor');
                 if (window.store && convId && window.store.state.messages[convId]) {
                     const msgs = window.store.state.messages[convId];
-                    if (msgs && msgs[msgs.length - 1]?.id === tempId) msgs.pop();
+                    if (msgs[msgs.length - 1]?.id === tempId) msgs.pop();
                 }
             }
             event.target.value = '';
         };
         
         const openEmojiPicker = () => {
-            const emojis = ['😊', '😂', '❤️', '👍', '🎉', '🔥', '💡', '🤔', '👋', '🙏', '🐍', '🚀', '✨', '💻', '🔧'];
+            const emojis = ['😊', '😂', '❤️', '👍', '🎉', '🔥', '💡', '🤔', '👋', '🙏'];
             const emoji = prompt('Válassz egy emojit:\n\n' + emojis.join(' '));
             if (emoji && emojis.includes(emoji)) {
                 inputMessage.value += emoji;
-                inputField.value?.focus();
+                if (inputField.value) inputField.value.focus();
             }
         };
         
         const loadPrompt = () => {
             if (!selectedPromptId.value) return;
-            const prompt = prompts.value.find(p => p.id === selectedPromptId.value);
+            const prompt = prompts.value ? prompts.value.find(p => p.id === selectedPromptId.value) : null;
             if (prompt && prompt.content) {
                 inputMessage.value = prompt.content;
                 if (inputField.value) {
@@ -617,13 +493,13 @@ window.ChatBox = {
         
         const clearChat = async () => {
             if (!isAdmin.value || !currentConversationId.value) return;
-            if (!confirm(t('chat.confirm_clear'))) return;
+            if (!confirm('Biztosan törli ezt a beszélgetést?')) return;
             try {
                 if (window.api) await window.api.deleteConversation(currentConversationId.value);
-                window.store?.addNotification('success', t('chat.cleared'));
+                if (window.store) window.store.addNotification('success', 'Beszélgetés törölve');
             } catch (error) {
                 console.error('Hiba a chat törlésekor:', error);
-                window.store?.addNotification('error', t('chat.clear_error'));
+                if (window.store) window.store.addNotification('error', 'Hiba a törlés során');
             }
         };
         
@@ -663,18 +539,15 @@ window.ChatBox = {
         // WATCHEREK
         // ====================================================================
         
-        Vue.watch(messages, (newMessages, oldMessages) => {
-            if (newMessages.length !== oldMessages.length) {
-                scrollToBottom();
-                refreshCodeBlockEvents();
-            }
+        Vue.watch(messages, () => {
+            scrollToBottom();
+            Vue.nextTick(() => {
+                if (messagesContainer.value) attachCodeBlockEvents(messagesContainer.value);
+            });
         }, { deep: true });
         
         Vue.watch(currentConversationId, () => {
-            Vue.nextTick(() => {
-                scrollToBottom();
-                refreshCodeBlockEvents();
-            });
+            Vue.nextTick(scrollToBottom);
             page.value = 1;
             hasMore.value = false;
         });
@@ -689,11 +562,11 @@ window.ChatBox = {
         
         Vue.onMounted(() => {
             scrollToBottom();
-            refreshCodeBlockEvents();
+            if (messagesContainer.value) attachCodeBlockEvents(messagesContainer.value);
             if (window.socketManager) {
                 window.socketManager.on('proactive_message', () => {
-                    if (window.store?.currentConversationId) {
-                        window.store?.addNotification('info', t('chat.proactive_received'), 'Kópé');
+                    if (window.store && window.store.currentConversationId) {
+                        if (window.store) window.store.addNotification('info', 'Proaktív üzenet érkezett', 'Kópé');
                     }
                 });
             }
@@ -750,4 +623,4 @@ window.ChatBox = {
     }
 };
 
-console.log('✅ ChatBox komponens betöltve (teljes verzió)');
+console.log('✅ ChatBox komponens betöltve (javított verzió)');

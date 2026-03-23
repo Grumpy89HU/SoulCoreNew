@@ -54,11 +54,15 @@ window.LoginForm = {
                     <button 
                         type="submit" 
                         class="btn btn-primary btn-block" 
-                        :disabled="loading"
+                        :disabled="loading || !apiReady"
                     >
                         <span v-if="!loading">{{ t('auth.login_button') }}</span>
                         <span v-else class="spinner-small"></span>
                     </button>
+                    
+                    <div v-if="!apiReady" class="auth-warning">
+                        ⚠️ Kapcsolódás a szerverhez...
+                    </div>
                     
                     <div v-if="authError" class="auth-error">
                         {{ authError }}
@@ -69,7 +73,7 @@ window.LoginForm = {
                     <p>{{ t('auth.no_account') }} <a href="/register">{{ t('auth.register_link') }}</a></p>
                 </div>
                 
-                <div class="auth-demo" v-if="showDemo">
+                <div class="auth-demo" v-if="showDemo && apiReady">
                     <button class="demo-btn" @click="demoLogin">
                         🧪 {{ t('auth.demo_login') }}
                     </button>
@@ -93,12 +97,15 @@ window.LoginForm = {
         const loading = Vue.ref(false);
         const rememberMe = Vue.ref(false);
         const showDemo = Vue.ref(true);
+        const apiReady = Vue.ref(false);
         
         // ====================================================================
         // SEGÉDFÜGGVÉNYEK
         // ====================================================================
         
-        const t = (key, params = {}) => window.gettext(key, params);
+        const t = (key, params = {}) => {
+            return window.gettext ? window.gettext(key, params) : key;
+        };
         
         /**
          * Űrlap validálás
@@ -134,6 +141,17 @@ window.LoginForm = {
         const handleSubmit = async () => {
             if (!validate()) return;
             
+            // Várjuk meg, amíg az API betöltődik
+            if (!window.api) {
+                authError.value = 'A rendszer inicializálása folyamatban van, kérjük várjon...';
+                return;
+            }
+            
+            if (typeof window.api.login !== 'function') {
+                authError.value = 'A bejelentkezés szolgáltatás nem elérhető';
+                return;
+            }
+            
             loading.value = true;
             authError.value = '';
             
@@ -147,7 +165,9 @@ window.LoginForm = {
                     localStorage.removeItem('remember_me');
                 }
                 
-                window.store.addNotification('success', t('auth.login_success'));
+                if (window.store && window.store.addNotification) {
+                    window.store.addNotification('success', t('auth.login_success'));
+                }
                 
                 // Átirányítás a főoldalra
                 window.location.href = '/';
@@ -182,15 +202,29 @@ window.LoginForm = {
             }
         };
         
+        /**
+         * API elérhetőségének ellenőrzése
+         */
+        const checkApiReady = () => {
+            if (window.api && typeof window.api.login === 'function') {
+                apiReady.value = true;
+                console.log('✅ API elérhető a LoginForm számára');
+            } else {
+                console.log('⏳ API betöltése folyamatban...');
+                setTimeout(checkApiReady, 100);
+            }
+        };
+        
         // ====================================================================
         // ÉLETCIKLUS
         // ====================================================================
         
         Vue.onMounted(() => {
             loadSavedUsername();
+            checkApiReady();
             
             // Ha már be van jelentkezve, átirányítás
-            if (window.store.authenticated) {
+            if (window.store && window.store.authenticated) {
                 window.location.href = '/';
             }
         });
@@ -206,6 +240,7 @@ window.LoginForm = {
             loading,
             rememberMe,
             showDemo,
+            apiReady,
             t,
             clearError,
             handleSubmit,

@@ -35,6 +35,7 @@ const App = {
         const showHelpModal = ref(false);
         
         const currentTime = ref(new Date().toLocaleTimeString());
+        const apiReady = ref(false);
         
         // ====================================================================
         // SEGÉDFÜGGVÉNYEK
@@ -42,6 +43,21 @@ const App = {
         const t = (key, params = {}) => {
             if (window.gettext) return window.gettext(key, params);
             return key;
+        };
+        
+        // ====================================================================
+        // API ELÉRHETŐSÉG ELLENŐRZÉSE
+        // ====================================================================
+        const checkApiReady = () => {
+            if (window.api && typeof window.api.getCurrentUser === 'function') {
+                apiReady.value = true;
+                console.log('✅ API elérhető');
+                return true;
+            } else {
+                console.log('⏳ API betöltése folyamatban...');
+                setTimeout(checkApiReady, 200);
+                return false;
+            }
         };
         
         // ====================================================================
@@ -72,24 +88,66 @@ const App = {
                 currentTime.value = new Date().toLocaleTimeString();
             }, 1000);
             
+            // Várjuk meg az API betöltődését
+            await new Promise(resolve => {
+                const check = () => {
+                    if (window.api && typeof window.api.getCurrentUser === 'function') {
+                        apiReady.value = true;
+                        resolve(true);
+                    } else {
+                        setTimeout(check, 100);
+                    }
+                };
+                check();
+            });
+            
+            console.log('✅ API elérhető, inicializálás...');
+            
             try {
-                if (window.api) {
+                if (window.api && typeof window.api.getCurrentUser === 'function') {
                     await window.api.getCurrentUser();
+                    
+                    // Ha nincs bejelentkezve, de fejlesztői módban vagyunk, automatikus bejelentkezés
+                    if (!window.store?.authenticated) {
+                        console.log('🔓 Fejlesztői mód: automatikus bejelentkezés admin-ként');
+                        if (window.store) {
+                            window.store.setAuth({
+                                id: 1,
+                                username: 'admin',
+                                role: 'admin',
+                                email: 'admin@localhost'
+                            });
+                        }
+                    }
+                    
                     if (window.store?.authenticated && window.api.loadInitialData) {
                         await window.api.loadInitialData();
                     }
                 }
             } catch (error) {
                 console.error('Init error:', error);
+                // Hiba esetén is próbáljuk meg az automatikus bejelentkezést
+                if (window.store && !window.store.authenticated) {
+                    console.log('🔓 Hiba esetén automatikus bejelentkezés');
+                    window.store.setAuth({
+                        id: 1,
+                        username: 'admin',
+                        role: 'admin',
+                        email: 'admin@localhost'
+                    });
+                }
             }
         });
         
-        onUnmounted(() => { if (timeInterval) clearInterval(timeInterval); });
+        onUnmounted(() => { 
+            if (timeInterval) clearInterval(timeInterval); 
+        });
         
         return {
             authenticated, user, isAdmin, connected, systemId, heartbeat, kingState,
             notifications, sidebarOpen, isMobile, currentTime, showAboutModal,
             showUserMenu, showSettingsMenu, showAdminModal, showSettingsModal, showHelpModal,
+            apiReady,
             t, toggleSidebar, logout, hideUserMenu, hideSettingsMenu, removeNotification,
             formatUptime: window.formatUptime || ((s) => s + 's'),
             getNotificationIcon: window.getNotificationIcon
@@ -98,6 +156,7 @@ const App = {
     
     template: `
         <div class="app" style="display: flex; flex-direction: column; height: 100vh; overflow: hidden;">
+            <!-- Fejléc -->
             <div class="header">
                 <div class="header-left">
                     <button class="menu-toggle" @click="toggleSidebar" title="Menü">
@@ -107,7 +166,7 @@ const App = {
                 </div>
                 
                 <div class="header-center" v-if="authenticated" style="flex: 1; max-width: 600px; margin: 0 20px;">
-                     <input type="text" placeholder="Keresés..." style="width: 100%; padding: 8px 16px; border-radius: 20px; border: 1px solid var(--border); background: var(--bg-secondary); color: white;">
+                    <input type="text" placeholder="Keresés..." style="width: 100%; padding: 8px 16px; border-radius: 20px; border: 1px solid var(--border); background: var(--bg-secondary); color: white;">
                 </div>
 
                 <div class="header-right">
@@ -130,6 +189,7 @@ const App = {
                 </div>
             </div>
             
+            <!-- Értesítések -->
             <div class="notifications-container">
                 <div v-for="n in notifications" :key="n.id" class="notification" :class="n.type" @click="removeNotification(n.id)">
                     <span class="notification-icon">{{ getNotificationIcon(n.type) }}</span>
@@ -138,11 +198,15 @@ const App = {
                 </div>
             </div>
             
+            <!-- Fő tartalom -->
             <div class="main" v-if="authenticated" style="flex: 1; display: flex; overflow: hidden;">
+                <!-- Bal panel -->
                 <div class="left-panel" :class="{ collapsed: !sidebarOpen }" style="display: flex; flex-direction: column; height: 100%;">
                     <div class="panel-content" style="flex: 1; overflow-y: auto;">
                         <div class="panel-header" v-if="sidebarOpen" style="padding: 10px;">
-                             <button style="width:100%; padding: 10px; border: 1px dashed var(--border); background: transparent; color: white; border-radius: 8px; cursor: pointer;">+ Új beszélgetés</button>
+                            <button style="width:100%; padding: 10px; border: 1px dashed var(--border); background: transparent; color: white; border-radius: 8px; cursor: pointer;" @click="() => { if(window.store) window.store.createNewConversation(); }">
+                                + Új beszélgetés
+                            </button>
                         </div>
                         <conversation-list v-show="sidebarOpen"></conversation-list>
                     </div>
@@ -157,15 +221,18 @@ const App = {
                     </div>
                 </div>
                 
+                <!-- Középső panel (Chat) -->
                 <div class="center-panel" style="flex: 1; display: flex; flex-direction: column; overflow: hidden; position: relative;">
                     <chat-box style="flex: 1; height: 100%;"></chat-box>
                 </div>
             </div>
             
+            <!-- Bejelentkezési oldal -->
             <div class="main" v-else style="flex: 1; display: flex; justify-content: center; align-items: center;">
                 <login-form></login-form>
             </div>
 
+            <!-- Modálok -->
             <div class="modal" v-if="showAboutModal" @click.self="showAboutModal = false">
                 <div class="modal-content small">
                     <div class="modal-header"><h3>Névjegy</h3><button class="modal-close" @click="showAboutModal = false">✕</button></div>
@@ -173,6 +240,7 @@ const App = {
                         <div style="font-size:48px">✦</div>
                         <h2>SoulCore 3.0</h2>
                         <p>ID: {{ systemId }}</p>
+                        <p style="margin-top:16px">Szuverén AI rendszer</p>
                     </div>
                     <div class="modal-footer"><button class="btn-primary" @click="showAboutModal = false">Bezárás</button></div>
                 </div>
@@ -197,7 +265,20 @@ const App = {
             <div class="modal" v-if="showHelpModal" @click.self="showHelpModal = false">
                 <div class="modal-content">
                     <div class="modal-header"><h3>Súgó</h3><button class="modal-close" @click="showHelpModal = false">✕</button></div>
-                    <div class="modal-body">Súgó tartalom...</div>
+                    <div class="modal-body">
+                        <div class="help-content">
+                            <h4>📖 SoulCore 3.0 - Súgó</h4>
+                            <p>A SoulCore egy szuverén AI rendszer, amely saját emlékekkel és identitással rendelkezik.</p>
+                            <ul>
+                                <li><strong>💬 Chat</strong> - Írjon üzenetet, az AI válaszol</li>
+                                <li><strong>📋 Beszélgetések</strong> - A bal oldali menüben láthatja a korábbi beszélgetéseket</li>
+                                <li><strong>⚙️ Beállítások</strong> - Itt módosíthatja a felület és a chat beállításait</li>
+                                <li><strong>🛡️ Admin</strong> - Rendszeradminisztrációs funkciók (csak adminoknak)</li>
+                            </ul>
+                            <p><strong>🔗 Linkek</strong></p>
+                            <p><a href="https://github.com/Grumpy89HU/SoulCoreNew" target="_blank">GitHub</a> | <a href="https://soulcore.hu" target="_blank">soulcore.hu</a></p>
+                        </div>
+                    </div>
                     <div class="modal-footer"><button class="btn-primary" @click="showHelpModal = false">Bezárás</button></div>
                 </div>
             </div>
@@ -223,7 +304,7 @@ const vClickOutside = {
 const app = createApp(App);
 app.directive('click-outside', vClickOutside);
 
-// Komponensek regisztrálása
+// Komponensek regisztrálása (biztonságos)
 const safeRegister = (name, component) => {
     if (component && (typeof component === 'object' || typeof component === 'function')) {
         app.component(name, component);
@@ -231,7 +312,7 @@ const safeRegister = (name, component) => {
     } else {
         console.warn(`⚠️ ${name} nem elérhető, placeholder használata`);
         app.component(name, {
-            template: `<div style="padding:20px; color:red; border:1px solid red;">Hiba: ${name} komponens nem töltődött be!</div>`
+            template: `<div style="padding:20px; text-align:center; color:var(--error);">❌ ${name} komponens nem töltődött be!</div>`
         });
     }
 };

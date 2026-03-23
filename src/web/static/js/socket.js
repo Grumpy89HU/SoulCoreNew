@@ -10,6 +10,13 @@ window.socketManager = {
     connect() {
         if (this.socket?.connected) return;
         
+        // Várjuk meg, amíg a store betöltődik
+        if (!window.store || typeof window.store.setConnected !== 'function') {
+            console.log('⏳ Várakozás a store betöltődésére...');
+            setTimeout(() => this.connect(), 200);
+            return;
+        }
+        
         this.socket = io({
             path: '/socket.io',
             transports: ['websocket', 'polling'],
@@ -24,23 +31,31 @@ window.socketManager = {
     _registerEvents() {
         this.socket.on('connect', () => {
             this.connected = true;
-            window.store.setConnected(true);
+            if (window.store && window.store.setConnected) {
+                window.store.setConnected(true);
+            }
             this.emit('auth:get_session');
             console.log('✅ WebSocket kapcsolódva');
         });
         
         this.socket.on('disconnect', () => {
             this.connected = false;
-            window.store.setConnected(false);
+            if (window.store && window.store.setConnected) {
+                window.store.setConnected(false);
+            }
             console.log('❌ WebSocket kapcsolat bontva');
         });
         
         this.socket.on('auth:session', (data) => {
-            if (data.authenticated) window.store.setAuth(data);
+            if (data.authenticated && window.store && window.store.setAuth) {
+                window.store.setAuth(data);
+            }
         });
         
         // Chat üzenet válasz
         this.socket.on('chat:response', (data) => {
+            if (!window.store) return;
+            
             const msg = {
                 id: data.id || Date.now(),
                 role: 'assistant',
@@ -49,14 +64,20 @@ window.socketManager = {
                 trace_id: data.trace_id
             };
             if (data.conversation_id) {
-                window.store.addMessage(data.conversation_id, msg);
+                if (window.store.addMessage) {
+                    window.store.addMessage(data.conversation_id, msg);
+                }
             } else if (window.store.currentConversationId) {
-                window.store.addMessage(window.store.currentConversationId, msg);
+                if (window.store.addMessage) {
+                    window.store.addMessage(window.store.currentConversationId, msg);
+                }
             }
         });
         
         // Proaktív üzenet (entitás kezdeményez)
         this.socket.on('proactive_message', (data) => {
+            if (!window.store) return;
+            
             const msg = {
                 id: data.id || Date.now(),
                 role: 'assistant',
@@ -65,57 +86,79 @@ window.socketManager = {
                 proactive: true
             };
             if (window.store.currentConversationId) {
-                window.store.addMessage(window.store.currentConversationId, msg);
-                window.store.addNotification('info', 'Proaktív üzenet érkezett', 'Kópé');
+                if (window.store.addMessage) {
+                    window.store.addMessage(window.store.currentConversationId, msg);
+                }
+                if (window.store.addNotification) {
+                    window.store.addNotification('info', 'Proaktív üzenet érkezett', 'Kópé');
+                }
             }
         });
         
         // Chat hiba
         this.socket.on('chat:error', (data) => {
-            window.store.addNotification('error', data.error || 'Hiba az üzenet küldésekor');
+            if (window.store && window.store.addNotification) {
+                window.store.addNotification('error', data.error || 'Hiba az üzenet küldésekor');
+            }
         });
         
         // Státusz frissítés
         this.socket.on('status_update', (data) => {
-            if (data.heartbeat) window.store.setHeartbeat(data.heartbeat);
-            if (data.king) window.store.setKingState(data.king);
-            if (data.modules) window.store.setModules(data.modules);
-            if (data.gpu) window.store.setGpuStatus(data.gpu);
+            if (!window.store) return;
+            
+            if (data.heartbeat && window.store.setHeartbeat) {
+                window.store.setHeartbeat(data.heartbeat);
+            }
+            if (data.king && window.store.setKingState) {
+                window.store.setKingState(data.king);
+            }
+            if (data.modules && window.store.setModules) {
+                window.store.setModules(data.modules);
+            }
+            if (data.gpu && window.store.setGpuStatus) {
+                window.store.setGpuStatus(data.gpu);
+            }
         });
         
         // Gépelés jelzés
         this.socket.on('typing_start', (data) => {
-            if (data.conversation_id === window.store.currentConversationId) {
+            if (data.conversation_id === window.store?.currentConversationId) {
                 this.typingActive = true;
             }
         });
         
         this.socket.on('typing_stop', (data) => {
-            if (data.conversation_id === window.store.currentConversationId) {
+            if (data.conversation_id === window.store?.currentConversationId) {
                 this.typingActive = false;
             }
         });
         
         // Új naplóbejegyzés
         this.socket.on('audit_entry', (data) => {
-            window.store.addAuditEntry(data);
+            if (window.store && window.store.addAuditEntry) {
+                window.store.addAuditEntry(data);
+            }
         });
         
         // Új trace
         this.socket.on('trace_entry', (data) => {
-            window.store.addTrace(data);
+            if (window.store && window.store.addTrace) {
+                window.store.addTrace(data);
+            }
         });
         
         // Modul állapot változás
         this.socket.on('module_status', (data) => {
-            if (data.name && data.status) {
+            if (data.name && data.status && window.store && window.store.updateModule) {
                 window.store.updateModule(data.name, data.status);
             }
         });
         
         // Értesítés
         this.socket.on('notification', (data) => {
-            window.store.addNotification(data.type || 'info', data.message, data.title);
+            if (window.store && window.store.addNotification) {
+                window.store.addNotification(data.type || 'info', data.message, data.title);
+            }
         });
     },
     
@@ -187,5 +230,15 @@ window.socketManager = {
     }
 };
 
-setTimeout(() => window.socketManager.connect(), 500);
+// Várjuk, amíg a store betöltődik, majd kapcsolódunk
+const initSocket = () => {
+    if (window.store && typeof window.store.setConnected === 'function') {
+        window.socketManager.connect();
+    } else {
+        console.log('⏳ Várakozás a store-ra...');
+        setTimeout(initSocket, 200);
+    }
+};
+
+setTimeout(initSocket, 500);
 console.log('✅ SocketManager modul betöltve');
