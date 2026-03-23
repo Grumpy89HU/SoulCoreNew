@@ -1,154 +1,135 @@
 // ==============================================
-// SOULCORE 3.0 - Fő Vue alkalmazás (TELJES)
+// SOULCORE 3.0 - Fő Vue alkalmazás (JAVÍTOTT)
 // ==============================================
 
-// Globális segédfüggvények (biztonsági fallback)
-if (!window.getNotificationIcon) {
-    window.getNotificationIcon = function(type) {
-        const icons = { success: '✅', error: '❌', warning: '⚠️', info: 'ℹ️' };
-        return icons[type] || '📢';
-    };
-}
+window.getNotificationIcon = function(type) {
+    const icons = { success: '✅', error: '❌', warning: '⚠️', info: 'ℹ️' };
+    return icons[type] || '📢';
+};
 
-// Vue alkalmazás létrehozása
-const { createApp, ref, computed, onMounted, onUnmounted, nextTick, watch } = Vue;
+const { createApp, ref, computed, onMounted, onUnmounted } = Vue;
 
 const App = {
     setup() {
         // ====================================================================
         // REAKTÍV ÁLLAPOTOK
         // ====================================================================
-        
-        const authenticated = computed(() => window.store.authenticated);
-        const user = computed(() => window.store.user);
+        const authenticated = computed(() => window.store?.authenticated || false);
+        const user = computed(() => window.store?.user || null);
         const isAdmin = computed(() => user.value?.role === 'admin');
-        const connected = computed(() => window.store.connected);
-        const systemId = computed(() => window.store.systemId);
-        const heartbeat = computed(() => window.store.heartbeat);
-        const kingState = computed(() => window.store.kingState);
-        const notifications = computed(() => window.store.notifications);
+        const connected = computed(() => window.store?.connected || false);
+        const systemId = computed(() => window.store?.systemId || '');
+        const heartbeat = computed(() => window.store?.heartbeat || { uptime_seconds: 0 });
+        const kingState = computed(() => window.store?.kingState || { status: 'unknown', mood: 'neutral' });
+        const notifications = computed(() => window.store?.notifications || []);
         
-        const leftPanelVisible = computed(() => window.store.leftPanelVisible);
-        const rightPanelVisible = computed(() => window.store.rightPanelVisible);
-        const isMobile = computed(() => window.store.isMobile);
+        const sidebarOpen = ref(true);
+        const isMobile = computed(() => window.innerWidth <= 768);
+        
+        const showUserMenu = ref(false);
+        const showSettingsMenu = ref(false);
+        
+        const showAboutModal = ref(false);
+        const showAdminModal = ref(false);
+        const showSettingsModal = ref(false);
+        const showHelpModal = ref(false);
         
         const currentTime = ref(new Date().toLocaleTimeString());
-        const showAboutModal = ref(false);
-        const showUserMenu = ref(false);
         
         // ====================================================================
         // SEGÉDFÜGGVÉNYEK
         // ====================================================================
-        
-        const t = (key, params = {}) => window.gettext(key, params);
+        const t = (key, params = {}) => {
+            if (window.gettext) return window.gettext(key, params);
+            return key;
+        };
         
         // ====================================================================
         // METÓDUSOK
         // ====================================================================
-        
-        const toggleLeftPanel = () => window.store.toggleLeftPanel();
-        const toggleRightPanel = () => window.store.toggleRightPanel();
-        const closeAllPanels = () => window.store.closeAllPanels();
+        const toggleSidebar = () => { sidebarOpen.value = !sidebarOpen.value; };
         
         const logout = async () => {
-            if (confirm(t('auth.confirm_logout'))) {
-                await window.api.logout();
+            if (confirm(t('auth.confirm_logout') || 'Biztosan ki akarsz jelentkezni?')) {
+                if (window.api) await window.api.logout();
+                window.location.href = '/login';
             }
         };
         
         const hideUserMenu = () => { showUserMenu.value = false; };
-        const removeNotification = (id) => window.store.removeNotification(id);
-        
-        // ====================================================================
-        // ÉLETCIKLUS - IDŐZÍTŐ CLEANUP-PAL
-        // ====================================================================
+        const hideSettingsMenu = () => { showSettingsMenu.value = false; };
+        const removeNotification = (id) => {
+            if (window.store) window.store.removeNotification(id);
+        };
         
         let timeInterval = null;
         
+        // ====================================================================
+        // ÉLETCIKLUS
+        // ====================================================================
         onMounted(async () => {
-            // Idő frissítése
             timeInterval = setInterval(() => {
                 currentTime.value = new Date().toLocaleTimeString();
             }, 1000);
             
             try {
-                await window.api.getCurrentUser();
-                
-                if (window.store.authenticated) {
-                    await window.api.loadInitialData();
+                if (window.api) {
+                    await window.api.getCurrentUser();
+                    if (window.store?.authenticated && window.api.loadInitialData) {
+                        await window.api.loadInitialData();
+                    }
                 }
             } catch (error) {
                 console.error('Init error:', error);
             }
         });
         
-        onUnmounted(() => {
-            if (timeInterval) {
-                clearInterval(timeInterval);
-                timeInterval = null;
-            }
-        });
-        
-        // ====================================================================
-        // RETURN
-        // ====================================================================
+        onUnmounted(() => { if (timeInterval) clearInterval(timeInterval); });
         
         return {
-            authenticated,
-            user,
-            isAdmin,
-            connected,
-            systemId,
-            heartbeat,
-            kingState,
-            notifications,
-            leftPanelVisible,
-            rightPanelVisible,
-            isMobile,
-            currentTime,
-            showAboutModal,
-            showUserMenu,
-            t,
-            toggleLeftPanel,
-            toggleRightPanel,
-            closeAllPanels,
-            logout,
-            hideUserMenu,
-            removeNotification,
-            formatUptime: window.formatUptime,
+            authenticated, user, isAdmin, connected, systemId, heartbeat, kingState,
+            notifications, sidebarOpen, isMobile, currentTime, showAboutModal,
+            showUserMenu, showSettingsMenu, showAdminModal, showSettingsModal, showHelpModal,
+            t, toggleSidebar, logout, hideUserMenu, hideSettingsMenu, removeNotification,
+            formatUptime: window.formatUptime || ((s) => s + 's'),
             getNotificationIcon: window.getNotificationIcon
         };
     },
     
     template: `
-        <div class="app">
-            <!-- Fejléc -->
+        <div class="app" style="display: flex; flex-direction: column; height: 100vh; overflow: hidden;">
             <div class="header">
                 <div class="header-left">
-                    <button class="menu-toggle" @click="closeAllPanels" v-if="isMobile">☰</button>
+                    <button class="menu-toggle" @click="toggleSidebar" title="Menü">
+                        <span>☰</span>
+                    </button>
                     <div class="logo">✦ SOULCORE 3.0</div>
                 </div>
+                
+                <div class="header-center" v-if="authenticated" style="flex: 1; max-width: 600px; margin: 0 20px;">
+                     <input type="text" placeholder="Keresés..." style="width: 100%; padding: 8px 16px; border-radius: 20px; border: 1px solid var(--border); background: var(--bg-secondary); color: white;">
+                </div>
+
                 <div class="header-right">
-                    <div class="status-badge">
+                    <div class="status-badge" v-if="authenticated">
                         <div class="badge">💓 {{ formatUptime(heartbeat?.uptime_seconds || 0) }}</div>
                         <div class="badge">👑 {{ kingState?.status || 'unknown' }}</div>
                     </div>
-                    <div class="user-menu" v-if="authenticated">
-                        <button class="user-menu-btn" @click="showUserMenu = !showUserMenu">
+                    <div class="user-menu">
+                        <button class="user-menu-btn" @click="showUserMenu = !showUserMenu" v-if="authenticated">
                             👤 {{ user?.username }}
                         </button>
-                        <div class="user-menu-dropdown" v-if="showUserMenu" v-click-outside="hideUserMenu">
-                            <a href="/profile" class="dropdown-item">👤 Profil</a>
-                            <a v-if="isAdmin" href="/admin" class="dropdown-item">⚙️ Admin</a>
+                        <a v-else href="/login" class="btn btn-primary">Bejelentkezés</a>
+                        <div class="user-menu-dropdown" v-if="showUserMenu && authenticated" v-click-outside="hideUserMenu">
+                            <a href="#" @click.prevent="showSettingsModal = true; showUserMenu = false" class="dropdown-item">⚙️ Beállítások</a>
+                            <a href="#" @click.prevent="showHelpModal = true; showUserMenu = false" class="dropdown-item">❓ Súgó</a>
                             <a href="#" @click.prevent="logout" class="dropdown-item">🚪 Kijelentkezés</a>
                         </div>
                     </div>
-                    <a v-else href="/login" class="btn btn-primary">Bejelentkezés</a>
                     <button class="icon-btn" @click="showAboutModal = true">ℹ️</button>
                 </div>
             </div>
             
-            <!-- Értesítések -->
             <div class="notifications-container">
                 <div v-for="n in notifications" :key="n.id" class="notification" :class="n.type" @click="removeNotification(n.id)">
                     <span class="notification-icon">{{ getNotificationIcon(n.type) }}</span>
@@ -157,64 +138,68 @@ const App = {
                 </div>
             </div>
             
-            <!-- Névjegy modal -->
+            <div class="main" v-if="authenticated" style="flex: 1; display: flex; overflow: hidden;">
+                <div class="left-panel" :class="{ collapsed: !sidebarOpen }" style="display: flex; flex-direction: column; height: 100%;">
+                    <div class="panel-content" style="flex: 1; overflow-y: auto;">
+                        <div class="panel-header" v-if="sidebarOpen" style="padding: 10px;">
+                             <button style="width:100%; padding: 10px; border: 1px dashed var(--border); background: transparent; color: white; border-radius: 8px; cursor: pointer;">+ Új beszélgetés</button>
+                        </div>
+                        <conversation-list v-show="sidebarOpen"></conversation-list>
+                    </div>
+                    
+                    <div class="sidebar-footer" v-if="sidebarOpen" style="padding: 10px; border-top: 1px solid var(--border);">
+                        <button class="dropdown-item" @click="showSettingsModal = true" style="width: 100%; background: transparent; border: none; color: white; text-align: left; cursor: pointer; padding: 10px; border-radius: 4px;">
+                            ⚙️ Beállítások
+                        </button>
+                        <button class="dropdown-item" @click="showAdminModal = true" v-if="isAdmin" style="width: 100%; background: transparent; border: none; color: white; text-align: left; cursor: pointer; padding: 10px; border-radius: 4px;">
+                            🛡️ Adminisztráció
+                        </button>
+                    </div>
+                </div>
+                
+                <div class="center-panel" style="flex: 1; display: flex; flex-direction: column; overflow: hidden; position: relative;">
+                    <chat-box style="flex: 1; height: 100%;"></chat-box>
+                </div>
+            </div>
+            
+            <div class="main" v-else style="flex: 1; display: flex; justify-content: center; align-items: center;">
+                <login-form></login-form>
+            </div>
+
             <div class="modal" v-if="showAboutModal" @click.self="showAboutModal = false">
                 <div class="modal-content small">
-                    <div class="modal-header"><h3>{{ t('ui.about') }}</h3><button class="modal-close" @click="showAboutModal = false">✕</button></div>
+                    <div class="modal-header"><h3>Névjegy</h3><button class="modal-close" @click="showAboutModal = false">✕</button></div>
                     <div class="modal-body" style="text-align:center">
                         <div style="font-size:48px">✦</div>
                         <h2>SoulCore 3.0</h2>
                         <p>ID: {{ systemId }}</p>
-                        <p style="margin-top:16px">Szuverén AI rendszer</p>
                     </div>
-                    <div class="modal-footer"><button class="btn btn-primary" @click="showAboutModal = false">{{ t('ui.close') }}</button></div>
+                    <div class="modal-footer"><button class="btn-primary" @click="showAboutModal = false">Bezárás</button></div>
                 </div>
             </div>
-            
-            <!-- Fő tartalom -->
-            <div class="main" v-if="authenticated">
-                <!-- Bal panel -->
-                <div class="left-panel" :class="{ 'mobile-visible': leftPanelVisible && isMobile }">
-                    <div class="panel-section">
-                        <div class="panel-header">{{ t('conversations.title') }}</div>
-                        <div class="panel-content"><conversation-list></conversation-list></div>
-                    </div>
-                    <div class="panel-section">
-                        <div class="panel-header">{{ t('telemetry.title') }}</div>
-                        <div class="panel-content"><telemetry-panel></telemetry-panel></div>
-                    </div>
+
+            <div class="modal" v-if="showAdminModal" @click.self="showAdminModal = false">
+                <div class="modal-content large">
+                    <div class="modal-header"><h3>Adminisztráció</h3><button class="modal-close" @click="showAdminModal = false">✕</button></div>
+                    <div class="modal-body"><admin-panel></admin-panel></div>
+                    <div class="modal-footer"><button class="btn-primary" @click="showAdminModal = false">Bezárás</button></div>
                 </div>
-                
-                <!-- Középső panel -->
-                <div class="center-panel"><chat-box></chat-box></div>
-                
-                <!-- Jobb panel (admin) -->
-                <div class="right-panel" v-if="isAdmin" :class="{ 'mobile-visible': rightPanelVisible && isMobile }">
-                    <div class="panel-section">
-                        <div class="panel-header">{{ t('admin.modules') }}</div>
-                        <div class="panel-content"><admin-panel></admin-panel></div>
-                    </div>
-                </div>
-                
-                <!-- Mobil panel toggle gombok -->
-                <button v-if="isMobile && !leftPanelVisible" class="panel-toggle left-toggle" @click="toggleLeftPanel">▶</button>
-                <button v-if="isMobile && !rightPanelVisible && isAdmin" class="panel-toggle right-toggle" @click="toggleRightPanel">◀</button>
-                <div v-if="isMobile && (leftPanelVisible || rightPanelVisible)" class="panel-overlay" @click="closeAllPanels"></div>
             </div>
-            
-            <!-- Bejelentkezési oldal (ha nincs bejelentkezve) -->
-            <div class="main" v-else style="justify-content: center; align-items: center;">
-                <login-form></login-form>
-            </div>
-            
-            <!-- Lábléc -->
-            <div class="footer">
-                <div class="footer-left">v3.0.0<span v-if="systemId"> | ID: {{ systemId }}</span></div>
-                <div class="connection-status">
-                    <span class="status-dot" :class="{ connected }"></span>
-                    {{ connected ? t('ui.connected') : t('ui.disconnected') }}
+
+            <div class="modal" v-if="showSettingsModal" @click.self="showSettingsModal = false">
+                <div class="modal-content large">
+                    <div class="modal-header"><h3>Beállítások</h3><button class="modal-close" @click="showSettingsModal = false">✕</button></div>
+                    <div class="modal-body"><settings-panel></settings-panel></div>
+                    <div class="modal-footer"><button class="btn-primary" @click="showSettingsModal = false">Bezárás</button></div>
                 </div>
-                <div>{{ currentTime }}</div>
+            </div>
+
+            <div class="modal" v-if="showHelpModal" @click.self="showHelpModal = false">
+                <div class="modal-content">
+                    <div class="modal-header"><h3>Súgó</h3><button class="modal-close" @click="showHelpModal = false">✕</button></div>
+                    <div class="modal-body">Súgó tartalom...</div>
+                    <div class="modal-footer"><button class="btn-primary" @click="showHelpModal = false">Bezárás</button></div>
+                </div>
             </div>
         </div>
     `
@@ -224,7 +209,7 @@ const App = {
 const vClickOutside = {
     beforeMount: (el, binding) => {
         el.clickOutsideEvent = (event) => {
-            if (!(el === event.target || el.contains(event.target))) {
+            if (!(el === event.target || el.contains(event.target) || event.target.closest('.user-menu-btn'))) {
                 binding.value(event);
             }
         };
@@ -235,49 +220,28 @@ const vClickOutside = {
     }
 };
 
-// Alkalmazás létrehozása
 const app = createApp(App);
 app.directive('click-outside', vClickOutside);
 
-// ========================================================================
-// KOMPONENSEK REGISZTRÁLÁSA (BIZTONSÁGOS)
-// ========================================================================
-
+// Komponensek regisztrálása
 const safeRegister = (name, component) => {
-    if (component && typeof component === 'object') {
+    if (component && (typeof component === 'object' || typeof component === 'function')) {
         app.component(name, component);
         console.log(`✅ ${name} regisztrálva`);
     } else {
-        console.warn(`⚠️ ${name} nem elérhető, dummy komponens`);
+        console.warn(`⚠️ ${name} nem elérhető, placeholder használata`);
         app.component(name, {
-            template: `<div class="component-placeholder">${name} (betöltés...)</div>`
+            template: `<div style="padding:20px; color:red; border:1px solid red;">Hiba: ${name} komponens nem töltődött be!</div>`
         });
     }
 };
 
-// Alap komponensek
 safeRegister('conversation-list', window.ConversationList);
 safeRegister('chat-box', window.ChatBox);
-safeRegister('telemetry-panel', window.TelemetryPanel);
-safeRegister('module-control', window.ModuleControl);
-safeRegister('model-selector', window.ModelSelector);
-safeRegister('prompt-editor', window.PromptEditor);
-safeRegister('personality-manager', window.PersonalityManager);
-safeRegister('settings-panel', window.SettingsPanel);
 safeRegister('admin-panel', window.AdminPanel);
+safeRegister('settings-panel', window.SettingsPanel);
 safeRegister('login-form', window.LoginForm);
 safeRegister('register-form', window.RegisterForm);
 
-// További komponensek (ha hiányoznak, dummy)
-safeRegister('audit-log', window.AuditLog);
-safeRegister('metrics-panel', window.MetricsPanel);
-safeRegister('trace-panel', window.TracePanel);
-safeRegister('vision-upload', window.VisionUpload);
-safeRegister('sandbox-editor', window.SandboxEditor);
-safeRegister('gateway-panel', window.GatewayPanel);
-safeRegister('embedding-panel', window.EmbeddingPanel);
-safeRegister('audio-panel', window.AudioPanel);
-
-console.log('✅ Vue alkalmazás elindult');
-
 app.mount('#app');
+console.log('🚀 SoulCore 3.0 elindult');

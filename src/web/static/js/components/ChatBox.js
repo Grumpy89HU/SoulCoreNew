@@ -161,21 +161,30 @@ window.ChatBox = {
         let typingTimeout = null;
         
         // ====================================================================
-        // COMPUTED PROPERTIES
+        // COMPUTED PROPERTIES (BIZTONSÁGOS)
         // ====================================================================
         
-        const currentConversation = Vue.computed(() => window.store.currentConversation);
-        const currentConversationId = Vue.computed(() => window.store.currentConversationId);
-        const messages = Vue.computed(() => window.store.messages);
-        const connected = Vue.computed(() => window.store.connected);
-        const isAdmin = Vue.computed(() => window.store.user?.role === 'admin');
-        const prompts = Vue.computed(() => window.store.prompts);
-        const userName = Vue.computed(() => window.store.user?.username || 'User');
+        const currentConversation = Vue.computed(() => {
+            const convId = window.store?.currentConversationId;
+            if (!convId) return null;
+            return window.store?.conversations?.find(c => c.id === convId);
+        });
+        
+        const currentConversationId = Vue.computed(() => window.store?.currentConversationId);
+        
+        const messages = Vue.computed(() => {
+            const convId = window.store?.currentConversationId;
+            if (!convId) return [];
+            return window.store?.messages?.[convId] || [];
+        });
+        
+        const connected = Vue.computed(() => window.store?.connected || false);
+        const isAdmin = Vue.computed(() => window.store?.user?.role === 'admin');
+        const prompts = Vue.computed(() => window.store?.prompts || []);
         
         const currentModel = Vue.computed(() => {
-            const models = window.store.models;
-            const active = models.find(m => m.is_active);
-            return active ? active : null;
+            const models = window.store?.models || [];
+            return models.find(m => m.is_active) || null;
         });
         
         const canSend = Vue.computed(() => {
@@ -189,16 +198,29 @@ window.ChatBox = {
         // KÓDBLOKK SEGÉDFÜGGVÉNYEK
         // ====================================================================
         
+        const t = (key, params = {}) => window.gettext ? window.gettext(key, params) : key;
+        
+        const formatTime = (timestamp) => {
+            if (!timestamp) return '';
+            try { return new Date(timestamp).toLocaleTimeString(); }
+            catch(e) { return ''; }
+        };
+        
+        const truncate = (text, length) => {
+            if (!text) return '';
+            return text.length > length ? text.substring(0, length) + '...' : text;
+        };
+        
         /**
          * Kód másolása a vágólapra
          */
         const copyCodeToClipboard = async (code, language) => {
             try {
                 await navigator.clipboard.writeText(code);
-                window.store.addNotification('success', `${language || 'Kód'} másolva a vágólapra`);
+                window.store?.addNotification('success', `${language || 'Kód'} másolva a vágólapra`);
             } catch (err) {
                 console.error('Másolás hiba:', err);
-                window.store.addNotification('error', 'Másolás sikertelen');
+                window.store?.addNotification('error', 'Másolás sikertelen');
             }
         };
         
@@ -217,7 +239,7 @@ window.ChatBox = {
             a.click();
             document.body.removeChild(a);
             URL.revokeObjectURL(url);
-            window.store.addNotification('success', `Kód mentve: ${filename}`);
+            window.store?.addNotification('success', `Kód mentve: ${filename}`);
         };
         
         /**
@@ -252,6 +274,18 @@ window.ChatBox = {
         };
         
         /**
+         * HTML attribútum escape (biztonság)
+         */
+        const escapeHtmlAttribute = (str) => {
+            return str
+                .replace(/&/g, '&amp;')
+                .replace(/</g, '&lt;')
+                .replace(/>/g, '&gt;')
+                .replace(/"/g, '&quot;')
+                .replace(/'/g, '&#39;');
+        };
+        
+        /**
          * Kód blokk HTML generálása másolás/letöltés gombokkal
          */
         const generateCodeBlock = (code, language) => {
@@ -280,31 +314,17 @@ window.ChatBox = {
         };
         
         /**
-         * HTML attribútum escape (biztonság)
-         */
-        const escapeHtmlAttribute = (str) => {
-            return str
-                .replace(/&/g, '&amp;')
-                .replace(/</g, '&lt;')
-                .replace(/>/g, '&gt;')
-                .replace(/"/g, '&quot;')
-                .replace(/'/g, '&#39;');
-        };
-        
-        /**
          * Kódblokk események beállítása (DOM-ba helyezés után)
          */
         const attachCodeBlockEvents = (element) => {
             if (!element) return;
             
-            // Másolás gombok
             const copyButtons = element.querySelectorAll('.code-copy-btn');
             copyButtons.forEach(btn => {
                 btn.removeEventListener('click', handleCopyClick);
                 btn.addEventListener('click', handleCopyClick);
             });
             
-            // Letöltés gombok
             const downloadButtons = element.querySelectorAll('.code-download-btn');
             downloadButtons.forEach(btn => {
                 btn.removeEventListener('click', handleDownloadClick);
@@ -322,12 +342,9 @@ window.ChatBox = {
             const lang = btn.getAttribute('data-lang');
             if (code) {
                 await copyCodeToClipboard(code, lang);
-                // Vizuális visszajelzés
                 const originalText = btn.innerHTML;
                 btn.innerHTML = '✅ Másolva!';
-                setTimeout(() => {
-                    btn.innerHTML = originalText;
-                }, 1500);
+                setTimeout(() => { btn.innerHTML = originalText; }, 1500);
             }
         };
         
@@ -344,26 +361,24 @@ window.ChatBox = {
             }
         };
         
-        // ====================================================================
-        // SEGÉDFÜGGVÉNYEK
-        // ====================================================================
-        
-        const t = (key, params = {}) => window.gettext(key, params);
-        
-        const formatTime = (timestamp) => {
-            if (!timestamp) return '';
-            return window.formatTime(timestamp);
+        /**
+         * Kódblokk események frissítése (minden üzenet változás után)
+         */
+        const refreshCodeBlockEvents = () => {
+            Vue.nextTick(() => {
+                if (messagesContainer.value) {
+                    attachCodeBlockEvents(messagesContainer.value);
+                }
+            });
         };
         
-        const truncate = (text, length) => window.truncate(text, length);
+        // ====================================================================
+        // ÜZENET FORMÁZÁS (markdown, linkek, kódblokkok)
+        // ====================================================================
         
-        /**
-         * Üzenet formázása (markdown, linkek, kódblokkok)
-         */
         const formatMessage = (content) => {
             if (!content) return '';
             
-            // Először kezeljük a kódblokkokat
             let html = content;
             
             // Kódblokkok feldolgozása (```language\ncode\n```)
@@ -413,32 +428,20 @@ window.ChatBox = {
             Vue.nextTick(() => {
                 if (messagesContainer.value) {
                     messagesContainer.value.scrollTop = messagesContainer.value.scrollHeight;
-                    // Kódblokk események csatolása az új elemekhez
                     attachCodeBlockEvents(messagesContainer.value);
                 }
             });
         };
         
-        /**
-         * Kódblokk események frissítése (minden üzenet változás után)
-         */
-        const refreshCodeBlockEvents = () => {
-            Vue.nextTick(() => {
-                if (messagesContainer.value) {
-                    attachCodeBlockEvents(messagesContainer.value);
-                }
-            });
-        };
+        // ====================================================================
+        // ÜZENET KÜLDÉS
+        // ====================================================================
         
-        /**
-         * Üzenet küldése
-         */
         const sendMessage = async () => {
             if (!canSend.value) return;
             
             const text = inputMessage.value.trim();
             
-            // Idézet hozzáadása, ha van
             let finalText = text;
             if (quotedMessage.value) {
                 const quoteAuthor = quotedMessage.value.role === 'user' ? t('chat.you') : t('chat.assistant');
@@ -447,42 +450,35 @@ window.ChatBox = {
             }
             
             isSending.value = true;
+            const convId = currentConversationId.value;
             
-            // Helyi üzenet hozzáadása (azonnali visszajelzés)
+            // Helyi üzenet hozzáadása
             const tempId = `temp_${Date.now()}`;
-            window.store.addMessage(currentConversationId.value, {
-                id: tempId,
-                role: 'user',
-                content: text,
-                timestamp: Date.now(),
-                temp: true
-            });
+            if (window.store && convId) {
+                if (!window.store.state.messages[convId]) window.store.state.messages[convId] = [];
+                window.store.state.messages[convId].push({
+                    id: tempId,
+                    role: 'user',
+                    content: text,
+                    timestamp: Date.now(),
+                    temp: true
+                });
+            }
             scrollToBottom();
             
-            // Token számláló frissítése (becslés)
             tokenCount.value += Math.ceil(text.length / 4);
-            
-            // Input mező kiürítése
             inputMessage.value = '';
-            if (inputField.value) {
-                inputField.value.style.height = 'auto';
-            }
+            if (inputField.value) inputField.value.style.height = 'auto';
             
             try {
-                // API hívás (mentés adatbázisba)
-                await window.api.sendMessage(currentConversationId.value, finalText);
-                
-                // WebSocket küldés (valós idejű válasz)
-                window.socketManager.sendMessage(finalText, currentConversationId.value);
-                
+                if (window.api) await window.api.sendMessage(convId, finalText);
+                if (window.socketManager) window.socketManager.sendMessage(finalText, convId);
             } catch (error) {
                 console.error('Hiba az üzenet küldésekor:', error);
-                window.store.addNotification('error', t('chat.send_error'));
-                
-                // Hiba esetén töröljük a helyi üzenetet
-                const msgs = window.store.state.messages[currentConversationId.value];
-                if (msgs && msgs[msgs.length - 1]?.id === tempId) {
-                    msgs.pop();
+                window.store?.addNotification('error', t('chat.send_error'));
+                if (window.store && convId && window.store.state.messages[convId]) {
+                    const msgs = window.store.state.messages[convId];
+                    if (msgs && msgs[msgs.length - 1]?.id === tempId) msgs.pop();
                 }
             } finally {
                 isSending.value = false;
@@ -494,11 +490,9 @@ window.ChatBox = {
          */
         const insertNewline = () => {
             if (!inputField.value) return;
-            
             const start = inputField.value.selectionStart;
             const end = inputField.value.selectionEnd;
             inputMessage.value = inputMessage.value.substring(0, start) + '\n' + inputMessage.value.substring(end);
-            
             Vue.nextTick(() => {
                 inputField.value.selectionStart = inputField.value.selectionEnd = start + 1;
                 inputField.value.style.height = 'auto';
@@ -511,123 +505,90 @@ window.ChatBox = {
          */
         const handleTyping = () => {
             if (typingTimeout) clearTimeout(typingTimeout);
-            
             if (!isTyping.value && currentConversationId.value) {
                 isTyping.value = true;
-                window.socketManager.startTyping(currentConversationId.value);
+                window.socketManager?.startTyping(currentConversationId.value);
             }
-            
             typingTimeout = setTimeout(() => {
                 if (isTyping.value) {
                     isTyping.value = false;
-                    window.socketManager.stopTyping(currentConversationId.value);
+                    window.socketManager?.stopTyping(currentConversationId.value);
                 }
             }, 2000);
-            
-            // Auto-resize textarea
             if (inputField.value) {
                 inputField.value.style.height = 'auto';
                 inputField.value.style.height = inputField.value.scrollHeight + 'px';
             }
         };
         
-        /**
-         * Üzenet idézése
-         */
         const quoteMessage = (msg) => {
             quotedMessage.value = msg;
             inputField.value?.focus();
         };
         
-        /**
-         * Idézet törlése
-         */
-        const clearQuote = () => {
-            quotedMessage.value = null;
-        };
-        
-        /**
-         * Input mező törlése
-         */
+        const clearQuote = () => { quotedMessage.value = null; };
         const clearInput = () => {
             inputMessage.value = '';
-            if (inputField.value) {
-                inputField.value.style.height = 'auto';
-            }
+            if (inputField.value) inputField.value.style.height = 'auto';
         };
         
-        /**
-         * Kép feltöltés
-         */
-        const uploadImage = () => {
-            fileInput.value?.click();
-        };
+        const uploadImage = () => { fileInput.value?.click(); };
         
-        /**
-         * Kép fájl kiválasztás kezelése
-         */
         const handleFileSelect = async (event) => {
             const file = event.target.files[0];
             if (!file) return;
             
-            // Kép előnézet hozzáadása
-            const previewUrl = URL.createObjectURL(file);
+            const convId = currentConversationId.value;
             const tempId = `temp_img_${Date.now()}`;
+            const previewUrl = URL.createObjectURL(file);
             
-            window.store.addMessage(currentConversationId.value, {
-                id: tempId,
-                role: 'user',
-                content: `📷 ${file.name}`,
-                timestamp: Date.now(),
-                image: previewUrl,
-                temp: true
-            });
+            if (window.store && convId) {
+                if (!window.store.state.messages[convId]) window.store.state.messages[convId] = [];
+                window.store.state.messages[convId].push({
+                    id: tempId,
+                    role: 'user',
+                    content: `📷 ${file.name}`,
+                    timestamp: Date.now(),
+                    image: previewUrl,
+                    temp: true
+                });
+            }
             scrollToBottom();
             
             try {
                 const reader = new FileReader();
                 reader.onload = async (e) => {
-                    const result = await window.api.processImage(e.target.result);
-                    
-                    // Temp üzenet eltávolítása
-                    const msgs = window.store.state.messages[currentConversationId.value];
-                    if (msgs && msgs[msgs.length - 1]?.id === tempId) {
-                        msgs.pop();
+                    if (window.api) {
+                        const result = await window.api.processImage(e.target.result);
+                        if (window.store && convId && window.store.state.messages[convId]) {
+                            const msgs = window.store.state.messages[convId];
+                            if (msgs && msgs[msgs.length - 1]?.id === tempId) msgs.pop();
+                            if (result.success) {
+                                window.store.state.messages[convId].push({
+                                    id: Date.now(),
+                                    role: 'assistant',
+                                    content: `🖼️ **Kép feldolgozás eredménye:**\n\n${result.description || result.ocr_text || 'Kép feldolgozva'}`,
+                                    timestamp: Date.now()
+                                });
+                            } else {
+                                window.store?.addNotification('error', result.error || 'Kép feldolgozása sikertelen');
+                            }
+                            scrollToBottom();
+                        }
                     }
-                    
-                    // Eredmény megjelenítése
-                    if (result.success) {
-                        const responseText = result.description || result.ocr_text || 'Kép feldolgozva';
-                        window.store.addMessage(currentConversationId.value, {
-                            id: Date.now(),
-                            role: 'assistant',
-                            content: `🖼️ **Kép feldolgozás eredménye:**\n\n${responseText}`,
-                            timestamp: Date.now()
-                        });
-                    } else {
-                        window.store.addNotification('error', result.error || 'Kép feldolgozása sikertelen');
-                    }
-                    scrollToBottom();
                 };
                 reader.readAsDataURL(file);
             } catch (error) {
                 console.error('Hiba a kép feltöltésekor:', error);
-                window.store.addNotification('error', t('chat.upload_error'));
-                
-                // Temp üzenet eltávolítása
-                const msgs = window.store.state.messages[currentConversationId.value];
-                if (msgs && msgs[msgs.length - 1]?.id === tempId) {
-                    msgs.pop();
+                window.store?.addNotification('error', t('chat.upload_error'));
+                if (window.store && convId && window.store.state.messages[convId]) {
+                    const msgs = window.store.state.messages[convId];
+                    if (msgs && msgs[msgs.length - 1]?.id === tempId) msgs.pop();
                 }
             }
-            
-            // File input reset
             event.target.value = '';
         };
         
-        /**
-         * Emoji picker (egyszerűsített)
-         */
         const openEmojiPicker = () => {
             const emojis = ['😊', '😂', '❤️', '👍', '🎉', '🔥', '💡', '🤔', '👋', '🙏', '🐍', '🚀', '✨', '💻', '🔧'];
             const emoji = prompt('Válassz egy emojit:\n\n' + emojis.join(' '));
@@ -637,12 +598,8 @@ window.ChatBox = {
             }
         };
         
-        /**
-         * Prompt betöltése
-         */
         const loadPrompt = () => {
             if (!selectedPromptId.value) return;
-            
             const prompt = prompts.value.find(p => p.id === selectedPromptId.value);
             if (prompt && prompt.content) {
                 inputMessage.value = prompt.content;
@@ -653,68 +610,44 @@ window.ChatBox = {
             }
         };
         
-        /**
-         * Chat infó megjelenítése
-         */
         const showInfo = () => {
             if (!currentConversation.value) return;
-            
-            const info = `📋 Beszélgetés adatai
-─────────────────
-Cím: ${currentConversation.value.title}
-Létrehozva: ${window.formatDateTime(currentConversation.value.created_at)}
-Üzenetek száma: ${messages.value.length}
-Utolsó üzenet: ${window.formatRelativeTime(currentConversation.value.updated_at)}`;
-            alert(info);
+            alert(`📋 Beszélgetés adatai\n─────────────────\nCím: ${currentConversation.value.title}\nÜzenetek száma: ${messages.value.length}`);
         };
         
-        /**
-         * Chat törlése (admin)
-         */
         const clearChat = async () => {
             if (!isAdmin.value || !currentConversationId.value) return;
-            
-            const confirmMsg = t('chat.confirm_clear');
-            if (!confirm(confirmMsg)) return;
-            
+            if (!confirm(t('chat.confirm_clear'))) return;
             try {
-                await window.api.deleteConversation(currentConversationId.value);
-                window.store.addNotification('success', t('chat.cleared'));
+                if (window.api) await window.api.deleteConversation(currentConversationId.value);
+                window.store?.addNotification('success', t('chat.cleared'));
             } catch (error) {
                 console.error('Hiba a chat törlésekor:', error);
-                window.store.addNotification('error', t('chat.clear_error'));
+                window.store?.addNotification('error', t('chat.clear_error'));
             }
         };
         
-        /**
-         * Görgetés kezelése (több üzenet betöltéséhez)
-         */
         const handleScroll = () => {
             if (!messagesContainer.value) return;
-            
             const { scrollTop } = messagesContainer.value;
             if (scrollTop < 100 && !loadingMore.value && hasMore.value) {
                 loadMoreMessages();
             }
         };
         
-        /**
-         * Régebbi üzenetek betöltése
-         */
         const loadMoreMessages = async () => {
             if (!currentConversationId.value) return;
-            
             loadingMore.value = true;
             try {
-                const olderMessages = await window.api.getMessages(
+                const olderMessages = await window.api?.getMessages(
                     currentConversationId.value,
                     { limit: 20, before: messages.value[0]?.timestamp }
                 );
-                
                 if (olderMessages?.messages?.length) {
-                    const currentMsgs = window.store.state.messages[currentConversationId.value] || [];
-                    const allMessages = [...olderMessages.messages, ...currentMsgs];
-                    window.store.setMessages(currentConversationId.value, allMessages);
+                    const currentMsgs = window.store?.state?.messages[currentConversationId.value] || [];
+                    if (window.store && window.store.state.messages) {
+                        window.store.state.messages[currentConversationId.value] = [...olderMessages.messages, ...currentMsgs];
+                    }
                     hasMore.value = olderMessages.messages.length === 20;
                 } else {
                     hasMore.value = false;
@@ -730,7 +663,6 @@ Utolsó üzenet: ${window.formatRelativeTime(currentConversation.value.updated_a
         // WATCHEREK
         // ====================================================================
         
-        // Új üzenet érkezésekor görgetés aljára és kódblokk események frissítése
         Vue.watch(messages, (newMessages, oldMessages) => {
             if (newMessages.length !== oldMessages.length) {
                 scrollToBottom();
@@ -738,7 +670,6 @@ Utolsó üzenet: ${window.formatRelativeTime(currentConversation.value.updated_a
             }
         }, { deep: true });
         
-        // Beszélgetés váltáskor görgetés és oldalszám reset
         Vue.watch(currentConversationId, () => {
             Vue.nextTick(() => {
                 scrollToBottom();
@@ -748,8 +679,7 @@ Utolsó üzenet: ${window.formatRelativeTime(currentConversation.value.updated_a
             hasMore.value = false;
         });
         
-        // Gépelés állapot figyelése (WebSocket-ről)
-        Vue.watch(() => window.socketManager.typingActive, (active) => {
+        Vue.watch(() => window.socketManager?.typingActive, (active) => {
             isTyping.value = active;
         });
         
@@ -760,12 +690,10 @@ Utolsó üzenet: ${window.formatRelativeTime(currentConversation.value.updated_a
         Vue.onMounted(() => {
             scrollToBottom();
             refreshCodeBlockEvents();
-            
-            // Proaktív üzenetek figyelése
             if (window.socketManager) {
-                window.socketManager.on('proactive_message', (data) => {
-                    if (window.store.currentConversationId) {
-                        window.store.addNotification('info', t('chat.proactive_received'), 'Kópé');
+                window.socketManager.on('proactive_message', () => {
+                    if (window.store?.currentConversationId) {
+                        window.store?.addNotification('info', t('chat.proactive_received'), 'Kópé');
                     }
                 });
             }
@@ -783,7 +711,6 @@ Utolsó üzenet: ${window.formatRelativeTime(currentConversation.value.updated_a
         // ====================================================================
         
         return {
-            // Állapotok
             inputMessage,
             selectedPromptId,
             quotedMessage,
@@ -791,8 +718,6 @@ Utolsó üzenet: ${window.formatRelativeTime(currentConversation.value.updated_a
             isSending,
             loadingMore,
             tokenCount,
-            
-            // Computed
             currentConversation,
             currentConversationId,
             messages,
@@ -801,16 +726,10 @@ Utolsó üzenet: ${window.formatRelativeTime(currentConversation.value.updated_a
             prompts,
             currentModel,
             canSend,
-            
-            // Refs
             messagesContainer,
             inputField,
             fileInput,
-            
-            // Fordítás
             t,
-            
-            // Metódusok
             formatTime,
             truncate,
             formatMessage,
@@ -831,4 +750,4 @@ Utolsó üzenet: ${window.formatRelativeTime(currentConversation.value.updated_a
     }
 };
 
-console.log('✅ ChatBox komponens betöltve (kódblokk támogatással)');
+console.log('✅ ChatBox komponens betöltve (teljes verzió)');

@@ -354,7 +354,13 @@ window.SettingsPanel = {
             { code: 'en', name: 'English' }
         ];
         
-        // Kategória fülek
+        // ====================================================================
+        // SEGÉDFÜGGVÉNYEK
+        // ====================================================================
+        
+        const t = (key, params = {}) => window.gettext(key, params);
+        
+        // Kategória fülek - IDE KERÜLT a setup()-on BELÜLRE!
         const tabs = [
             { id: 'appearance', name: t('settings.appearance'), icon: '🎨' },
             { id: 'language', name: t('settings.language'), icon: '🌐' },
@@ -362,12 +368,6 @@ window.SettingsPanel = {
             { id: 'system', name: t('settings.system'), icon: '⚙️' },
             { id: 'gpu', name: t('settings.gpu'), icon: '🖥️' }
         ];
-        
-        // ====================================================================
-        // SEGÉDFÜGGVÉNYEK
-        // ====================================================================
-        
-        const t = (key, params = {}) => window.gettext(key, params);
         
         /**
          * Mentett beállítások betöltése
@@ -428,7 +428,6 @@ window.SettingsPanel = {
          */
         const updateTimeFormat = () => {
             localStorage.setItem('timeFormat', timeFormat.value);
-            // Itt lehetne frissíteni a globális formázót
         };
         
         /**

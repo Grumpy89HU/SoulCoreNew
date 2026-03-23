@@ -77,7 +77,7 @@ window.AuditLog = {
                                 </th>
                                 <th @click="sortBy('user')">
                                     {{ t('audit.user') }}
-                                    <span v-if="sortField === 'user'">{{ sortOrder === 'asc' ? '↑' '↓' }}</span>
+                                    <span v-if="sortField === 'user'">{{ sortOrder === 'asc' ? '↑' : '↓' }}</span>
                                 </th>
                                 <th @click="sortBy('action')">
                                     {{ t('audit.action') }}

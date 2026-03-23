@@ -119,12 +119,31 @@ window.formatters = {
     },
     
     /**
-     * Szöveg rövidítése
+     * Szöveg rövidítése - BIZTONSÁGOS VERZIÓ!
      */
     truncate(text, length = 100, suffix = '...') {
-        if (!text) return '';
-        if (text.length <= length) return text;
-        return text.substring(0, length) + suffix;
+        // Ha nincs szöveg, üres string
+        if (!text && text !== 0) return '';
+        
+        // Ha nem string, alakítsuk stringgé
+        let str;
+        if (typeof text === 'string') {
+            str = text;
+        } else if (typeof text === 'number') {
+            str = String(text);
+        } else if (text && typeof text === 'object') {
+            // Ha objektum, próbáljuk a .toString() vagy JSON.stringify
+            try {
+                str = text.toString ? text.toString() : JSON.stringify(text);
+            } catch (e) {
+                str = '';
+            }
+        } else {
+            str = '';
+        }
+        
+        if (str.length <= length) return str;
+        return str.substring(0, length) + suffix;
     },
     
     /**
@@ -132,20 +151,17 @@ window.formatters = {
      */
     capitalize(text) {
         if (!text) return '';
-        return text.charAt(0).toUpperCase() + text.slice(1);
+        const str = String(text);
+        return str.charAt(0).toUpperCase() + str.slice(1);
     },
     
     /**
      * Modul név formázása (pl. "orchestrator" -> "Orchestrator")
-     * BIZTONSÁGOS VERZIÓ!
      */
     formatModuleName(name) {
         if (!name) return '';
-        // Ha nem string, próbáljuk stringgé alakítani
-        if (typeof name !== 'string') {
-            name = String(name);
-        }
-        return name.split('_').map(word => 
+        const str = String(name);
+        return str.split('_').map(word => 
             word.charAt(0).toUpperCase() + word.slice(1)
         ).join(' ');
     },
@@ -208,8 +224,9 @@ window.formatters = {
      */
     formatMarkdown(text) {
         if (!text) return '';
+        const str = String(text);
         
-        let html = text
+        let html = str
             .replace(/&/g, '&amp;')
             .replace(/</g, '&lt;')
             .replace(/>/g, '&gt;');
