@@ -63,17 +63,19 @@ class Database:
                 )
             """)
             
-            # Üzenetek
+            # Üzenetek (hozzáadva a user_id mező)
             conn.execute("""
                 CREATE TABLE IF NOT EXISTS messages (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     conversation_id INTEGER,
+                    user_id INTEGER,
                     role TEXT CHECK(role IN ('user', 'assistant', 'system', 'jester')),
                     content TEXT,
                     timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
                     tokens INTEGER DEFAULT 0,
                     metadata TEXT,
-                    FOREIGN KEY (conversation_id) REFERENCES conversations(id) ON DELETE CASCADE
+                    FOREIGN KEY (conversation_id) REFERENCES conversations(id) ON DELETE CASCADE,
+                    FOREIGN KEY (user_id) REFERENCES users(id)
                 )
             """)
             
@@ -153,7 +155,8 @@ class Database:
                     role TEXT DEFAULT 'user',
                     language TEXT DEFAULT 'en',
                     preferences TEXT,
-                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    last_active TIMESTAMP
                 )
             """)
             
@@ -369,14 +372,33 @@ rules: Think for yourself.
     # ========== ÜZENETEK ==========
     
     def add_message(self, conversation_id: int, role: str, content: str, 
-                   tokens: int = 0, metadata: Dict = None) -> int:
-        """Üzenet hozzáadása"""
+                   tokens: int = 0, metadata: Dict = None, user_id: int = None) -> int:
+        """
+        Üzenet hozzáadása.
+        
+        Args:
+            conversation_id: Beszélgetés azonosítója
+            role: 'user', 'assistant', 'system', 'jester'
+            content: Üzenet tartalma
+            tokens: Token szám (opcionális)
+            metadata: Extra metaadatok (opcionális)
+            user_id: Felhasználó azonosítója (opcionális, ha nincs megadva, lekérjük a beszélgetésből)
+        """
         with self.lock:
             conn = self._get_connection()
+            
+            # Ha user_id nincs megadva, próbáljuk lekérni a beszélgetésből
+            if user_id is None:
+                cursor = conn.execute("SELECT user_id FROM conversations WHERE id = ?", (conversation_id,))
+                row = cursor.fetchone()
+                if row:
+                    user_id = row[0]
+            
             cursor = conn.execute("""
-                INSERT INTO messages (conversation_id, role, content, tokens, metadata)
-                VALUES (?, ?, ?, ?, ?)
-            """, (conversation_id, role, content, tokens, json.dumps(metadata) if metadata else None))
+                INSERT INTO messages (conversation_id, user_id, role, content, tokens, metadata)
+                VALUES (?, ?, ?, ?, ?, ?)
+            """, (conversation_id, user_id, role, content, tokens, 
+                  json.dumps(metadata) if metadata else None))
             
             # Beszélgetés frissítése
             conn.execute("""
@@ -394,9 +416,11 @@ rules: Think for yourself.
         with self.lock:
             conn = self._get_connection()
             cursor = conn.execute("""
-                SELECT * FROM messages 
-                WHERE conversation_id = ? 
-                ORDER BY timestamp ASC
+                SELECT m.*, u.display_name as user_name
+                FROM messages m
+                LEFT JOIN users u ON m.user_id = u.id
+                WHERE m.conversation_id = ? 
+                ORDER BY m.timestamp ASC
                 LIMIT ?
             """, (conversation_id, limit))
             
@@ -404,7 +428,10 @@ rules: Think for yourself.
             for row in cursor.fetchall():
                 msg = dict(row)
                 if msg['metadata']:
-                    msg['metadata'] = json.loads(msg['metadata'])
+                    try:
+                        msg['metadata'] = json.loads(msg['metadata'])
+                    except:
+                        msg['metadata'] = None
                 messages.append(msg)
             
             conn.close()
@@ -588,10 +615,11 @@ rules: Think for yourself.
         with self.lock:
             conn = self._get_connection()
             cursor = conn.execute("""
-                INSERT INTO users (username, display_name, role, language, preferences)
-                VALUES (?, ?, ?, ?, ?)
+                INSERT INTO users (username, display_name, role, language, preferences, last_active)
+                VALUES (?, ?, ?, ?, ?, ?)
             """, (username, display_name, role, language, 
-                  json.dumps(preferences) if preferences else None))
+                  json.dumps(preferences) if preferences else None,
+                  time.time()))
             
             conn.commit()
             last_id = cursor.lastrowid
@@ -647,6 +675,17 @@ rules: Think for yourself.
                 """, values)
                 conn.commit()
                 conn.close()
+    
+    def update_last_active(self, user_id: int):
+        """Utolsó aktivitás frissítése"""
+        with self.lock:
+            conn = self._get_connection()
+            conn.execute("""
+                UPDATE users SET last_active = ?
+                WHERE id = ?
+            """, (time.time(), user_id))
+            conn.commit()
+            conn.close()
     
     def delete_user(self, user_id: int):
         """Felhasználó törlése"""
@@ -945,6 +984,7 @@ rules: Think for yourself.
         """Nincs mit zárni, mert minden művelet után zárjuk a kapcsolatot"""
         pass
 
+
 # Teszt
 if __name__ == "__main__":
     db = Database(":memory:")  # Teszt adatbázis
@@ -953,7 +993,7 @@ if __name__ == "__main__":
     conv_id = db.create_conversation(title="Test conversation", model="test-model")
     print(f"Conversation ID: {conv_id}")
     
-    # Üzenetek hozzáadása
+    # Üzenetek hozzáadása (user_id nélkül)
     db.add_message(conv_id, "user", "Hello!", 5)
     db.add_message(conv_id, "assistant", "Hi there!", 10)
     

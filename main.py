@@ -60,6 +60,9 @@ class SoulCore:
         # Modulok inicializálása
         self._init_modules()
         
+        # WebApp és King összekapcsolása
+        self._connect_webapp_king()
+        
         # Rendszerindulás naplózása
         self._log_system_start()
         
@@ -68,6 +71,50 @@ class SoulCore:
         signal.signal(signal.SIGTERM, self._signal_handler)
         
         print(self.translator.get('system.started'))
+    
+    def _connect_webapp_king(self):
+        """WebApp és King összekapcsolása a válaszok továbbításához"""
+        if 'web' in self.modules and 'king' in self.modules:
+            web = self.modules['web']
+            king = self.modules['king']
+            
+            # King callback beállítása a WebApp felé
+            def king_response_callback(response_text, conversation_id, trace_id):
+                """A King válaszának továbbítása a WebApp felé"""
+                if web and hasattr(web, 'socketio'):
+                    try:
+                        web.socketio.emit("chat:response", {
+                            "text": response_text,
+                            "trace_id": trace_id,
+                            "conversation_id": conversation_id
+                        })
+                        print(f"👑 King válasz küldve a WebApp felé: {response_text[:50]}...")
+                    except Exception as e:
+                        print(f"⚠️ King callback hiba: {e}")
+            
+            king.set_response_callback(king_response_callback)
+            print("🔗 King ↔ WebApp kapcsolat létrejött")
+        
+        # Orchestrator és WebApp összekapcsolása
+        if 'web' in self.modules and 'orchestrator' in self.modules:
+            orch = self.modules['orchestrator']
+            web = self.modules['web']
+            
+            # Orchestrator callback beállítása (ha van ilyen metódus)
+            if hasattr(orch, 'set_webapp_callback'):
+                def orch_response_callback(response_text, conversation_id, trace_id):
+                    if web and hasattr(web, 'socketio'):
+                        try:
+                            web.socketio.emit("chat:response", {
+                                "text": response_text,
+                                "trace_id": trace_id,
+                                "conversation_id": conversation_id
+                            })
+                        except Exception as e:
+                            print(f"⚠️ Orchestrator callback hiba: {e}")
+                
+                orch.set_webapp_callback(orch_response_callback)
+                print("🔗 Orchestrator ↔ WebApp kapcsolat létrejött")
     
     def _get_system_id(self) -> str:
         """Rendszer egyedi azonosító lekérése vagy generálása"""
@@ -179,7 +226,11 @@ class SoulCore:
 
         # ==================== CORE MODULOK ====================
         # Orchestrator (KVK parser, kontextus)
-        self.modules['orchestrator'] = Orchestrator(self.modules['scratchpad'])
+
+        self.modules['orchestrator'] = Orchestrator(self.modules['scratchpad'], modules=self.modules)
+        # Adatbázis beállítása
+        if 'database' in self.modules:
+            self.modules['orchestrator'].set_database(self.modules['database'])
         
         # Router (komunikáció)
         if self.config.get('modules', {}).get('router', {}).get('enabled', True):
@@ -316,10 +367,10 @@ class SoulCore:
             self.modules['jester'] = jester
 
         # ==================== WEB ====================
-        # WEB
+        # WEB - modulok átadása
         if self.config.get('modules', {}).get('web', {}).get('enabled', True):
             web_config = self.config['modules']['web']
-            web = WebApp(self.modules)
+            web = WebApp(self.modules)  # <-- Itt átadjuk az összes modult
             web.host = web_config.get('host', '0.0.0.0')
             web.port = web_config.get('port', 5000)
             web.translator = self.translator

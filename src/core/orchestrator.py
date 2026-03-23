@@ -47,9 +47,12 @@ class Orchestrator:
         'no_action': r'.*'
     }
     
-    def __init__(self, scratchpad):
+    def __init__(self, scratchpad, modules=None):
         self.scratchpad = scratchpad
         self.name = "orchestrator"
+        self.modules = modules or {}  # <-- HIÁNYZÓ: modulok dictionary
+        self.pending_responses = {}  # trace_id -> response callback vagy Queue
+        self.webapp_callback = None  # opcionális callback a WebApp felé
         
         # Prioritási sorok (queue per prioritás)
         self.priority_queues = {
@@ -84,7 +87,14 @@ class Orchestrator:
             'enable_uuidv7': True
         }
         
+        # Adatbázis hivatkozás (később beállítva)
+        self.db = None
+        
         print("⚙️ Orchestrator: Idegrendszer inicializálva.")
+    
+    def set_database(self, db):
+        """Adatbázis kapcsolat beállítása"""
+        self.db = db
     
     def start(self):
         """Orchestrator indítása"""
@@ -94,6 +104,10 @@ class Orchestrator:
         
         self.scratchpad.set_state('orchestrator_status', 'ready', self.name)
         print("⚙️ Orchestrator: Éber és figyel.")
+        
+    def set_webapp_callback(self, callback):
+        """Beállítja a WebApp felé küldendő válasz callbacket."""
+        self.webapp_callback = callback
     
     def stop(self):
         """Orchestrator leállítása"""
@@ -492,6 +506,77 @@ Válaszod:"""
             
             for tid in to_delete:
                 del self.active_traces[tid]
+    
+    # --- WEBBEL KAPCSOLATOS METÓDUS ---
+    
+    def process_user_message(self, text: str, conversation_id: int, user_id: int = 1) -> dict:
+        """
+        Egyszerű belépési pont a WebApp számára.
+        Létrehoz egy kérést, elindítja a feldolgozást, és szinkron módon visszaadja a választ.
+        """
+        import uuid
+        import time
+
+        trace_id = str(uuid.uuid4())
+        
+        # 1. Mentjük a felhasználói üzenetet (user_id nélkül, mert a metódus nem várja)
+        if self.db:
+            try:
+                # A Database.add_message() aláírása: add_message(conversation_id, role, content, tokens=0, metadata=None)
+                self.db.add_message(conversation_id, "user", text)
+            except Exception as e:
+                print(f"⚠️ Orchestrator: Üzenet mentési hiba: {e}")
+        
+        # 2. Összeállítjuk a belső csomagot
+        packet = {
+            "header": {
+                "trace_id": trace_id,
+                "timestamp": time.time(),
+                "version": "3.0",
+                "sender": "webapp"
+            },
+            "payload": {
+                "intent": {"class": "USER_MESSAGE", "confidence": 1.0},
+                "entities": [{"type": "TEXT", "value": text}],
+                "raw_text": text,
+                "conversation_id": conversation_id
+            }
+        }
+        
+        # 3. King hívása
+        king = None
+        if self.modules:
+            king = self.modules.get("king")
+        
+        if king:
+            try:
+                response = king.generate_response(text, trace_id, conversation_id)
+                print(f"👑 Orchestrator: King válaszolt: {response[:50]}...")
+                
+                if response and self.webapp_callback:
+                    self.webapp_callback(response, conversation_id, trace_id)
+                
+                # Asszisztens válasz mentése (user_id nélkül)
+                if self.db and response:
+                    try:
+                        self.db.add_message(conversation_id, "assistant", response)
+                    except Exception as e:
+                        print(f"⚠️ Orchestrator: Válasz mentési hiba: {e}")
+                
+                return {"response": response, "trace_id": trace_id}
+            except Exception as e:
+                print(f"❌ Orchestrator: King hiba: {e}")
+                error_response = f"Hiba a Király válaszadása közben: {e}"
+                if self.webapp_callback:
+                    self.webapp_callback(error_response, conversation_id, trace_id)
+                return {"response": error_response, "trace_id": trace_id, "error": str(e)}
+        
+        error_msg = "A Király nem elérhető."
+        print(f"❌ Orchestrator: {error_msg}")
+        if self.webapp_callback:
+            self.webapp_callback(error_msg, conversation_id, trace_id)
+        return {"response": error_msg, "trace_id": trace_id}
+
 
 # Teszt
 if __name__ == "__main__":

@@ -46,18 +46,113 @@ const App = {
         };
         
         // ====================================================================
-        // API ELÉRHETŐSÉG ELLENŐRZÉSE
+        // BESZÉLGETÉSEK BETÖLTÉSE
         // ====================================================================
-        const checkApiReady = () => {
-            if (window.api && typeof window.api.getCurrentUser === 'function') {
-                apiReady.value = true;
-                console.log('✅ API elérhető');
-                return true;
-            } else {
-                console.log('⏳ API betöltése folyamatban...');
-                setTimeout(checkApiReady, 200);
-                return false;
+        const loadConversations = async () => {
+            if (!window.store) return;
+            
+            try {
+                console.log('📋 Beszélgetések betöltése...');
+                const response = await fetch('/api/conversations');
+                const data = await response.json();
+                
+                if (data.conversations && data.conversations.length > 0) {
+                    window.store.setConversations(data.conversations);
+                    console.log(`✅ ${data.conversations.length} beszélgetés betöltve`);
+                    
+                    // Ha nincs aktuális beszélgetés, állítsuk be az elsőt
+                    if (!window.store.currentConversationId && data.conversations.length > 0) {
+                        window.store.setCurrentConversationId(data.conversations[0].id);
+                        console.log(`📌 Aktuális beszélgetés beállítva: ${data.conversations[0].id}`);
+                        
+                        // Töltsük be az üzeneteket is
+                        await loadMessages(data.conversations[0].id);
+                    }
+                } else {
+                    console.log('📝 Nincs beszélgetés, létrehozok egyet...');
+                    await createNewConversation();
+                }
+            } catch (error) {
+                console.error('❌ Hiba a beszélgetések betöltésekor:', error);
             }
+        };
+        
+        // ====================================================================
+        // ÜZENETEK BETÖLTÉSE
+        // ====================================================================
+        const loadMessages = async (conversationId) => {
+            if (!window.store || !conversationId) return;
+            
+            try {
+                console.log(`💬 Üzenetek betöltése (conv: ${conversationId})...`);
+                const response = await fetch(`/api/conversations/${conversationId}/messages`);
+                const data = await response.json();
+                
+                if (data.messages && data.messages.length > 0) {
+                    window.store.setMessages(conversationId, data.messages);
+                    console.log(`✅ ${data.messages.length} üzenet betöltve`);
+                } else {
+                    // Ha nincsenek üzenetek, üres tömb
+                    window.store.setMessages(conversationId, []);
+                }
+            } catch (error) {
+                console.error('❌ Hiba az üzenetek betöltésekor:', error);
+                window.store.setMessages(conversationId, []);
+            }
+        };
+        
+        // ====================================================================
+        // ÚJ BESZÉLGETÉS LÉTREHOZÁSA
+        // ====================================================================
+        const createNewConversation = async () => {
+            if (!window.store) return;
+            
+            try {
+                const title = `Beszélgetés ${new Date().toLocaleString()}`;
+                const response = await fetch('/api/conversations', {
+                    method: 'POST',
+                    headers: { 'Content-Type': 'application/json' },
+                    body: JSON.stringify({ title })
+                });
+                const data = await response.json();
+                
+                if (data.id) {
+                    console.log(`✅ Új beszélgetés létrehozva: ${data.id}`);
+                    // Frissítsük a beszélgetések listáját
+                    await loadConversations();
+                }
+            } catch (error) {
+                console.error('❌ Hiba az új beszélgetés létrehozásakor:', error);
+            }
+        };
+        
+        // ====================================================================
+        // INICIALIZÁLÁS
+        // ====================================================================
+        const initialize = async () => {
+            console.log('🔧 SoulCore inicializálás...');
+            
+            // Várjuk meg a store-t
+            await new Promise(resolve => {
+                const checkStore = () => {
+                    if (window.store && window.store.state) {
+                        resolve(true);
+                    } else {
+                        setTimeout(checkStore, 100);
+                    }
+                };
+                checkStore();
+            });
+            
+            // Töltsük be a beszélgetéseket
+            await loadConversations();
+            
+            // Frissítsük a store connected állapotát
+            if (window.socketManager && window.socketManager.connected) {
+                window.store.setConnected(true);
+            }
+            
+            console.log('✅ SoulCore inicializálva');
         };
         
         // ====================================================================
@@ -78,6 +173,10 @@ const App = {
             if (window.store) window.store.removeNotification(id);
         };
         
+        const handleNewConversation = async () => {
+            await createNewConversation();
+        };
+        
         let timeInterval = null;
         
         // ====================================================================
@@ -88,20 +187,23 @@ const App = {
                 currentTime.value = new Date().toLocaleTimeString();
             }, 1000);
             
-            // Várjuk meg az API betöltődését
+            // Inicializálás
+            await initialize();
+            
+            // Várjuk meg az API-t is
             await new Promise(resolve => {
-                const check = () => {
+                const checkApi = () => {
                     if (window.api && typeof window.api.getCurrentUser === 'function') {
                         apiReady.value = true;
                         resolve(true);
                     } else {
-                        setTimeout(check, 100);
+                        setTimeout(checkApi, 100);
                     }
                 };
-                check();
+                checkApi();
             });
             
-            console.log('✅ API elérhető, inicializálás...');
+            console.log('✅ API elérhető, folytatás...');
             
             try {
                 if (window.api && typeof window.api.getCurrentUser === 'function') {
@@ -149,7 +251,16 @@ const App = {
             showUserMenu, showSettingsMenu, showAdminModal, showSettingsModal, showHelpModal,
             apiReady,
             t, toggleSidebar, logout, hideUserMenu, hideSettingsMenu, removeNotification,
-            formatUptime: window.formatUptime || ((s) => s + 's'),
+            handleNewConversation,
+            formatUptime: window.formatUptime || ((s) => {
+                if (!s) return '0s';
+                const hours = Math.floor(s / 3600);
+                const minutes = Math.floor((s % 3600) / 60);
+                const seconds = Math.floor(s % 60);
+                if (hours > 0) return `${hours}h ${minutes}m`;
+                if (minutes > 0) return `${minutes}m ${seconds}s`;
+                return `${seconds}s`;
+            }),
             getNotificationIcon: window.getNotificationIcon
         };
     },
@@ -204,7 +315,7 @@ const App = {
                 <div class="left-panel" :class="{ collapsed: !sidebarOpen }" style="display: flex; flex-direction: column; height: 100%;">
                     <div class="panel-content" style="flex: 1; overflow-y: auto;">
                         <div class="panel-header" v-if="sidebarOpen" style="padding: 10px;">
-                            <button style="width:100%; padding: 10px; border: 1px dashed var(--border); background: transparent; color: white; border-radius: 8px; cursor: pointer;" @click="() => { if(window.store) window.store.createNewConversation(); }">
+                            <button style="width:100%; padding: 10px; border: 1px dashed var(--border); background: transparent; color: white; border-radius: 8px; cursor: pointer;" @click="handleNewConversation">
                                 + Új beszélgetés
                             </button>
                         </div>

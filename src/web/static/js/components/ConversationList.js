@@ -90,17 +90,33 @@ window.ConversationList = {
             }
         };
         
-        const deleteConv = async (id) => {
-            if (!confirm(t('conversations.confirm_delete'))) return;
-            
-            try {
-                await window.api.deleteConversation(id);
-                window.store.addNotification('success', t('conversations.deleted'));
-            } catch (error) {
-                console.error('Hiba a beszélgetés törlésekor:', error);
-                window.store.addNotification('error', t('conversations.delete_error'));
-            }
-        };
+        // ConversationList.js-ben a deleteConv metódus
+		const deleteConv = async (convId) => {
+			if (!confirm('Biztosan törli ezt a beszélgetést?')) return;
+			
+			try {
+				if (window.api && window.api.deleteConversation) {
+					await window.api.deleteConversation(convId);
+				}
+				
+				// Store frissítés
+				if (window.store && window.store.removeConversation) {
+					window.store.removeConversation(convId);
+				}
+				
+				// Értesítés
+				if (window.store && window.store.addNotification) {
+					window.store.addNotification('success', 'Beszélgetés törölve');
+				} else {
+					console.log('✅ Beszélgetés törölve');
+				}
+			} catch (error) {
+				console.error('Hiba a beszélgetés törlésekor:', error);
+				if (window.store && window.store.addNotification) {
+					window.store.addNotification('error', 'Hiba a törlés során');
+				}
+			}
+		};
         
         Vue.onMounted(load);
         

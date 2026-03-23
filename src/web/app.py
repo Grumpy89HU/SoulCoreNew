@@ -1010,55 +1010,66 @@ class WebApp:
                 "email": user["email"]
             })
         
+
         @self.socketio.on("chat:message")
         def handle_chat_message(data):
-            text = data.get("text", "").strip() if data else ""
-            conv_id = data.get("conversation_id") if data else None
+            text = data.get("text", "").strip()
+            conv_id = data.get("conversation_id")
             
             if not text or not conv_id:
-                emit("chat:error", {"error": "Missing data"})
+                emit("chat:error", {"error": "Missing text or conversation_id"})
                 return
             
             orch = self.modules.get("orchestrator")
-            
             if not orch:
                 emit("chat:error", {"error": "Orchestrator not available"})
                 return
             
-            username = session.get("username", "User")
-            packet = f"INTENT:UNKNOWN|USER:{username}|MESSAGE:{text}"
-            result = orch.process_raw_packet(packet)
+            print(f"📨 WebApp: Üzenet érkezett: '{text}' (conv: {conv_id})")
             
-            if result and isinstance(result, dict) and "trace_id" in result:
-                king = self.modules.get("king")
-                if king:
-                    response = king.process({
-                        "header": {
-                            "trace_id": result["trace_id"],
-                            "timestamp": time.time(),
-                            "sender": "web"
-                        },
-                        "payload": {
-                            "intent": {
-                                "class": result.get("packet", {}).get("INTENT", "unknown")
-                            },
-                            "text": text
-                        }
+            # Mentés
+            db = self.modules.get("database")
+            if db:
+                try:
+                    db.add_message(conv_id, "user", text)
+                    print(f"💾 WebApp: Üzenet elmentve (conv: {conv_id})")
+                except Exception as e:
+                    print(f"⚠️ WebApp: Üzenet mentési hiba: {e}")
+            
+            # Callback definiálása - EZ KÜLDI EL A VÁLASZT (csak egyszer)
+            def on_response(response_text, conv_id, trace_id):
+                print(f"📤 WebApp: Callback meghívva, válasz küldése frontendnek: {response_text[:50]}...")
+                try:
+                    self.socketio.emit("chat:response", {
+                        "text": response_text,
+                        "trace_id": trace_id,
+                        "conversation_id": conv_id
                     })
-                    
-                    if response:
-                        emit("chat:response", {
-                            "text": response.get("payload", {}).get("response", ""),
-                            "trace_id": result["trace_id"],
-                            "conversation_id": conv_id
-                        })
-                        
-                        db = self.modules.get("database")
-                        if db:
-                            db.add_message(conv_id, "user", text)
-                            db.add_message(conv_id, "assistant", response.get("payload", {}).get("response", ""))
+                    print(f"✅ WebApp: chat:response elküldve")
+                except Exception as e:
+                    print(f"❌ WebApp: Hiba a válasz küldésekor: {e}")
+            
+            # Beállítjuk a callbacket az Orchestratorban
+            if hasattr(orch, 'set_webapp_callback'):
+                orch.set_webapp_callback(on_response)
+                print(f"🔗 WebApp: Callback beállítva az Orchestratorban")
+            
+            # Elindítjuk a feldolgozást - NEM KÜLDÜNK ITT MÉG VÁLASZT!
+            try:
+                result = orch.process_user_message(text, conv_id)
+                print(f"🔄 WebApp: Orchestrator.process_user_message visszatért")
+                
+                # MEGJEGYZÉS: Itt NEM küldünk chat:response-t, mert a callback fogja!
+                # Ha a callback nem működik, akkor ez a biztonsági mentés:
+                # if result and result.get("response") and not hasattr(orch, '_callback_called'):
+                #     emit("chat:response", {...})
+                
+            except Exception as e:
+                print(f"❌ WebApp: Orchestrator hiba: {e}")
+                emit("chat:error", {"error": f"Processing error: {e}"})
             
             emit("chat:ack", {"received": True})
+            print(f"✅ WebApp: chat:ack elküldve")
         
         @self.socketio.on("chat:typing_start")
         def handle_typing_start(data):

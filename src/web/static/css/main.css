@@ -1629,3 +1629,20 @@ body {
         padding: 6px;
     }
 }
+
+.message .message-header {
+    display: flex;
+    justify-content: space-between;
+    align-items: center;
+    margin-bottom: 0.5rem;
+    font-size: 0.85rem;
+    opacity: 0.8;
+}
+
+.message .sender {
+    font-weight: bold;
+}
+
+.message .message-time {
+    font-size: 0.75rem;
+}

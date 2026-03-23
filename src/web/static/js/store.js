@@ -16,8 +16,9 @@ window.store = {
         
         // === BESZÉLGETÉSEK ===
         conversations: [],
-		currentConversationId: null,
-		messages: {}, 
+        currentConversationId: null,
+        messages: {},
+        _updateTrigger: 0,  // Force frissítéshez
         
         // === MODELLEK ===
         models: [],
@@ -89,12 +90,13 @@ window.store = {
         
         // === UI ÁLLAPOTOK ===
         ui: {
-            leftPanelVisible: window.innerWidth > 768,
-            rightPanelVisible: window.innerWidth > 768,
-            isMobile: window.innerWidth <= 768,
-            theme: localStorage.getItem('theme') || 'dark',
-            language: localStorage.getItem('language') || 'hu'
-        }
+			leftPanelVisible: window.innerWidth > 768,
+			rightPanelVisible: window.innerWidth > 768,
+			isMobile: window.innerWidth <= 768,
+			theme: localStorage.getItem('theme') || 'dark',
+			language: localStorage.getItem('language') || 'hu',
+			notifications: []
+		}
     }),
     
     // ========================================================================
@@ -107,8 +109,16 @@ window.store = {
     get systemId() { return this.state.systemId; },
     get conversations() { return this.state.conversations; },
     get currentConversationId() { return this.state.currentConversationId; },
-    get currentConversation() { return this.state.conversations.find(c => c.id === this.state.currentConversationId); },
-    get messages() { return this.state.messages[this.state.currentConversationId] || []; },
+    get currentConversation() { 
+        if (!this.state.currentConversationId) return null;
+        return this.state.conversations.find(c => c.id === this.state.currentConversationId); 
+    },
+    get messages() { 
+        const id = this.state.currentConversationId;
+        if (!id) return [];
+        const msgs = this.state.messages[id];
+        return msgs ? msgs : [];
+    },
     get models() { return this.state.models; },
     get prompts() { return this.state.prompts; },
     get personalities() { return this.state.personalities; },
@@ -158,6 +168,7 @@ window.store = {
     
     setConnected(status) {
         this.state.connected = status;
+        console.log('🔌 Kapcsolat állapot:', status);
     },
     
     // ========================================================================
@@ -174,33 +185,120 @@ window.store = {
     
     setConversations(convs) {
         this.state.conversations = convs;
+        console.log('📋 Beszélgetések betöltve:', convs.length);
     },
     
     setCurrentConversationId(id) {
+        console.log('🔄 Aktuális beszélgetés váltás:', id);
         this.state.currentConversationId = id;
+        // Force frissítés
+        this.state._updateTrigger++;
     },
     
     setMessages(id, msgs) {
-		if (!this.state.messages) this.state.messages = {};
-		this.state.messages[id] = msgs;
-	},
+        if (!this.state.messages) this.state.messages = {};
+        // Új objektum létrehozása a reaktivitáshoz
+        this.state.messages = {
+            ...this.state.messages,
+            [id]: msgs
+        };
+        console.log(`💬 Üzenetek beállítva conv ${id}:`, msgs.length);
+    },
     
     addMessage(id, msg) {
-        if (!this.state.messages[id]) this.state.messages[id] = [];
-        this.state.messages[id].push(msg);
-        this.state.metrics.total_messages++;
+        console.log('📝 store.addMessage hívva:', { id, msgPreview: msg.content?.substring(0, 50) });
+        
+        // Biztosítjuk, hogy a messages objektum létezik
+        if (!this.state.messages) {
+            this.state.messages = {};
+        }
+        
+        // Aktuális üzenetek lekérése
+        const currentMessages = this.state.messages[id] || [];
+        
+        // Új tömb létrehozása
+        const newMessages = [...currentMessages, msg];
+        
+        // Reaktív frissítés - teljesen új messages objektum
+        this.state.messages = {
+            ...this.state.messages,
+            [id]: newMessages
+        };
+        
+        // Statisztika frissítés
+        this.state.metrics.total_messages = (this.state.metrics.total_messages || 0) + 1;
         if (msg.role === 'assistant') {
-            this.state.kingState.response_count++;
+            this.state.kingState.response_count = (this.state.kingState.response_count || 0) + 1;
+        }
+        
+        // Force frissítés
+        this.state._updateTrigger++;
+        
+        console.log(`✅ Üzenet hozzáadva conv ${id}, most ${newMessages.length} üzenet`);
+        
+        // Ha ez az aktuális beszélgetés, scroll trigger
+        if (id === this.state.currentConversationId) {
+            Vue.nextTick(() => {
+                const container = document.querySelector('.chat-messages');
+                if (container) container.scrollTop = container.scrollHeight;
+            });
         }
     },
     
     removeConversation(id) {
-        this.state.conversations = this.state.conversations.filter(c => c.id !== id);
-        delete this.state.messages[id];
-        if (this.state.currentConversationId === id) {
-            this.state.currentConversationId = null;
-        }
-    },
+		console.log(`🗑️ Beszélgetés törlése: ${id}`);
+		
+		// Töröljük a beszélgetést a listából
+		const newConversations = this.state.conversations.filter(c => c.id !== id);
+		this.state.conversations = newConversations;
+		
+		// Töröljük az üzeneteket
+		const newMessages = { ...this.state.messages };
+		delete newMessages[id];
+		this.state.messages = newMessages;
+		
+		// Ha az aktuális beszélgetést töröltük
+		if (this.state.currentConversationId === id) {
+			if (newConversations.length > 0) {
+				// Van másik beszélgetés, válasszuk az elsőt
+				this.state.currentConversationId = newConversations[0].id;
+				console.log(`📌 Új aktuális beszélgetés: ${this.state.currentConversationId}`);
+			} else {
+				// Nincs több beszélgetés, állítsuk null-ra (ne hozzunk létre automatikusan)
+				this.state.currentConversationId = null;
+				console.log('📌 Nincs aktuális beszélgetés');
+			}
+		}
+		
+		// Force frissítés
+		this.state._updateTrigger = (this.state._updateTrigger || 0) + 1;
+	}, 
+
+	createNewConversation() {
+		const newId = Date.now();
+		const newConv = {
+			id: newId,
+			title: `Új beszélgetés`,
+			created_at: Date.now(),
+			updated_at: Date.now(),
+			message_count: 0,
+			last_message: null
+		};
+		
+		this.state.conversations = [...this.state.conversations, newConv];
+		this.state.messages = {
+			...this.state.messages,
+			[newId]: []
+		};
+		this.state.currentConversationId = newId;
+		
+		console.log(`✅ Új beszélgetés létrehozva: ${newId}`);
+		
+		// Force frissítés
+		this.state._updateTrigger = (this.state._updateTrigger || 0) + 1;
+		
+		return newId;
+	},
     
     // ========================================================================
     // MODELL MUTÁCIÓK
@@ -392,13 +490,22 @@ window.store = {
     // ========================================================================
     
     addNotification(type, message, title = null) {
-        const id = Date.now();
-        this.state.ui.notifications.push({ id, type, message, title });
-        setTimeout(() => {
-            this.state.ui.notifications = this.state.ui.notifications.filter(n => n.id !== id);
-        }, 5000);
-        return id;
-    },
+		// Biztosítjuk, hogy a notifications tömb létezik
+		if (!this.state.ui.notifications || !Array.isArray(this.state.ui.notifications)) {
+			this.state.ui.notifications = [];
+		}
+		
+		const id = Date.now();
+		const newNotifications = [...this.state.ui.notifications, { id, type, message, title }];
+		this.state.ui.notifications = newNotifications;
+		
+		setTimeout(() => {
+			if (this.state.ui.notifications && Array.isArray(this.state.ui.notifications)) {
+				this.state.ui.notifications = this.state.ui.notifications.filter(n => n.id !== id);
+			}
+		}, 5000);
+		return id;
+	},
     
     removeNotification(id) {
         this.state.ui.notifications = this.state.ui.notifications.filter(n => n.id !== id);
@@ -465,6 +572,8 @@ window.store = {
     // ========================================================================
     
     init() {
+        console.log('🔧 Store inicializálás...');
+        
         const savedTheme = localStorage.getItem('theme');
         if (savedTheme) this.setTheme(savedTheme);
         else this.setTheme('dark');
@@ -474,9 +583,9 @@ window.store = {
         
         window.addEventListener('resize', () => this.handleResize());
         
-        // ========== ALAPÉRTELMEZETT BESZÉLGETÉS ==========
-        // Ha nincs beszélgetés, hozzunk létre egyet
-        if (this.state.conversations.length === 0) {
+        // ========== BIZTOSÍTSUK, HOGY VAN BESZÉLGETÉS ==========
+        if (!this.state.conversations || this.state.conversations.length === 0) {
+            console.log('📝 Nincs beszélgetés, létrehozok egyet...');
             const defaultConv = {
                 id: 1,
                 title: 'Új beszélgetés',
@@ -486,14 +595,36 @@ window.store = {
                 last_message: null
             };
             this.state.conversations = [defaultConv];
-            this.state.currentConversationId = 1;
-            this.state.messages[1] = [];
-            console.log('✅ Alapértelmezett beszélgetés létrehozva');
         }
         
-        console.log('✅ Store inicializálva');
+        // Biztosítsuk, hogy a messages objektum létezik
+        if (!this.state.messages) {
+            this.state.messages = {};
+        }
+        
+        // Biztosítsuk, hogy van aktuális beszélgetés kiválasztva
+        if (!this.state.currentConversationId && this.state.conversations.length > 0) {
+            this.state.currentConversationId = this.state.conversations[0].id;
+            console.log('✅ Aktuális beszélgetés beállítva:', this.state.currentConversationId);
+        }
+        
+        // Biztosítsuk, hogy a kiválasztott beszélgetéshez van üzenet tömb
+        if (this.state.currentConversationId && !this.state.messages[this.state.currentConversationId]) {
+            this.state.messages[this.state.currentConversationId] = [];
+        }
+        
+        console.log('✅ Store inicializálva', {
+            conversations: this.state.conversations.length,
+            currentId: this.state.currentConversationId,
+            hasMessages: this.state.currentConversationId ? !!this.state.messages[this.state.currentConversationId] : false,
+            messagesKeys: Object.keys(this.state.messages)
+        });
+        
+        // Force frissítés
+        this.state._updateTrigger++;
     }
-};  // <-- ITT KELL ZÁRÓJELEM A window.store OBJEKTUMHOZ!
+};
 
+// Store inicializálása
 window.store.init();
 console.log('✅ Store modul betöltve');

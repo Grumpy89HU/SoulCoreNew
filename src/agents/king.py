@@ -9,6 +9,7 @@ import json
 import threading
 import random
 import hashlib
+import uuid
 from typing import Dict, Any, Optional, List
 from collections import deque
 
@@ -40,11 +41,12 @@ class King:
         'technical': 4   # Technikai, precíz
     }
     
-    def __init__(self, scratchpad, model_wrapper=None):
+    def __init__(self, scratchpad, orchestrator=None, model_wrapper=None):
         self.scratchpad = scratchpad
         self.model = model_wrapper
         self.valet = None
         self.queen = None
+        self.orchestrator = orchestrator
         self.name = "king"
         
         # Fordító (később állítjuk be a felhasználó nyelvére)
@@ -93,11 +95,78 @@ class King:
             'presence_penalty': 0.0
         }
         
+        # Válasz callback a WebApp felé
+        self.response_callback = None
+        
         # Ha van modell, elindítjuk a betöltést háttérben
         if self.model:
             threading.Thread(target=self._load_model, daemon=True).start()
         
         print("👑 King: Király trónra lépett.")
+    
+    # ======================================================================
+    # ÚJ METÓDUS A WEBAPP SZÁMÁRA
+    # ======================================================================
+    
+    def generate_response(self, user_text: str, trace_id: str = None, conversation_id: int = None) -> str:
+        """
+        Egyszerű belépési pont a WebApp számára.
+        Létrehoz egy intent packetet és feldolgozza.
+        
+        Args:
+            user_text: A felhasználó üzenete
+            trace_id: Opcionális nyomkövetési azonosító
+            conversation_id: Opcionális beszélgetés azonosító
+        
+        Returns:
+            str: A generált válasz szövege
+        """
+        if not trace_id:
+            trace_id = str(uuid.uuid4())
+        
+        # Intent packet összeállítása
+        intent_packet = {
+            'header': {
+                'trace_id': trace_id,
+                'timestamp': time.time(),
+                'version': '3.0',
+                'sender': 'webapp'
+            },
+            'payload': {
+                'intent': {
+                    'class': 'USER_MESSAGE',
+                    'target': 'king',
+                    'confidence': 1.0
+                },
+                'text': user_text,
+                'raw_text': user_text,
+                'conversation_id': conversation_id
+            }
+        }
+        
+        # Feldolgozás a meglévő process metódussal
+        response_packet = self.process(intent_packet)
+        
+        # Válasz szöveg kinyerése
+        if response_packet and isinstance(response_packet, dict):
+            payload = response_packet.get('payload', {})
+            if isinstance(payload, dict):
+                return payload.get('response', '')
+            elif isinstance(payload, str):
+                return payload
+        
+        return "A Király nem válaszolt."
+    
+    def set_response_callback(self, callback):
+        """
+        Beállítja a válasz callbacket a WebApp felé.
+        A callback függvény: callback(response_text, conversation_id, trace_id)
+        """
+        self.response_callback = callback
+    
+    # ======================================================================
+    # MEGLÉVŐ METÓDUSOK
+    # ======================================================================
     
     def set_language(self, language: str):
         """Nyelv beállítása (i18n)"""
@@ -172,7 +241,7 @@ class King:
     def process(self, intent_packet: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         """
         Intent JSON feldolgozása, response JSON visszaadása.
-        Ez az egyetlen publikus metódus.
+        Ez az egyetlen publikus metódus (a generate_response ezt hívja).
         """
         start_time = time.time()
         trace_id = intent_packet.get('header', {}).get('trace_id', 'unknown')
@@ -226,6 +295,11 @@ class King:
             self.recent_responses.append(hashlib.md5(response.encode()).hexdigest()[:8])
             self._update_state(intent_packet, response_packet, start_time)
             
+            # 7. Callback hívás (ha van)
+            if self.response_callback:
+                conv_id = intent_packet.get('payload', {}).get('conversation_id')
+                self.response_callback(response, conv_id, trace_id)
+            
             return response_packet
             
         except Exception as e:
@@ -234,7 +308,7 @@ class King:
             self.state['status'] = 'error'
             
             # Hibacsomag vissza
-            return {
+            error_response = {
                 'header': {
                     'trace_id': trace_id,
                     'timestamp': time.time(),
@@ -248,6 +322,13 @@ class King:
                     'status': 'error'
                 }
             }
+            
+            # Hibát is továbbítjuk callback-en
+            if self.response_callback:
+                conv_id = intent_packet.get('payload', {}).get('conversation_id')
+                self.response_callback(f"Hiba: {error}", conv_id, trace_id)
+            
+            return error_response
     
     def _load_identity(self):
         """Identitás betöltése a scratchpadből"""
@@ -288,6 +369,10 @@ class King:
         
         # Fontos rendszer üzenetek
         if intent_class in ['SYSTEM_ALERT', 'ERROR']:
+            return True
+        
+        # USER_MESSAGE (WebApp-ból jön)
+        if intent_class == 'USER_MESSAGE':
             return True
         
         return False
@@ -337,7 +422,7 @@ class King:
     def _build_prompt(self, intent_packet: Dict) -> str:
         """
         Prompt összeállítása az intent packetből.
-        Optimalizált, rövidebb változat.
+        Optimalizált, rövidebb változat - CSAK AZ AKTUÁLIS ÜZENET.
         """
         payload = intent_packet.get('payload', {})
         if not isinstance(payload, dict):
@@ -367,35 +452,25 @@ class King:
                     if context.get('summary'):
                         valet_context = f"📌 {context['summary']}\n"
                     if context.get('facts'):
-                        facts = context['facts'][:2]  # Csak 2 tény
+                        facts = context['facts'][:2]
                         if facts:
                             valet_context += "📋 " + " | ".join(facts) + "\n"
-                    if context.get('emotional_context'):
-                        ec = context['emotional_context']
-                        valet_context += f"😊 {ec.get('charge', 0):.1f}\n"
             except Exception as e:
                 print(f"👑 King: Valet error: {e}")
-        
-        # Queen logika (ha van)
-        queen_logic = ""
-        if hasattr(self, 'queen') and self.queen is not None:
-            try:
-                queen_result = self.queen.think(intent_packet, None)
-                if isinstance(queen_result, dict) and queen_result.get('conclusion'):
-                    queen_logic = f"🧠 {queen_result['conclusion'][:100]}\n"
-            except Exception as e:
-                print(f"👑 King: Queen error: {e}")
-        
-        # Ismétlés elkerülés
-        no_repeat = ""
-        if self.recent_responses and random.random() < 0.2:
-            no_repeat = "🔄 (no repetition)\n"
         
         # Stílus alapú prompt előtag
         style_prefix = self._get_style_prefix(style, language)
         
-        # Prompt összeállítása (tömörített)
+        # Prompt összeállítása (tömörített) - CSAK AZ AKTUÁLIS ÜZENET
         prompt_parts = []
+        
+        # Instrukció a modellnek, hogy ne ismételje vissza a felhasználó üzenetét
+        if language == 'hu':
+            prompt_parts.append("Figyelem: Csak a saját válaszodat írd le, ne ismételd vissza a felhasználó üzenetét!")
+            prompt_parts.append("Ne írd ki, hogy 'User:' vagy 'King:'!")
+        else:
+            prompt_parts.append("Note: Only write your own response, do not repeat the user's message!")
+            prompt_parts.append("Do not write 'User:' or 'King:'!")
         
         if style_prefix:
             prompt_parts.append(style_prefix)
@@ -403,13 +478,7 @@ class King:
         if valet_context:
             prompt_parts.append(valet_context)
         
-        if queen_logic:
-            prompt_parts.append(queen_logic)
-        
-        if no_repeat:
-            prompt_parts.append(no_repeat)
-        
-        # Utolsó üzenet
+        # Csak az aktuális üzenet
         prompt_parts.append(f"{user_name}: {text}")
         prompt_parts.append(f"{self.identity['name']}:")
         
@@ -448,9 +517,18 @@ class King:
                 
                 def generate_thread():
                     try:
+                        # Csak a ModelWrapper által támogatott paramétereket adjuk át
+                        # A ModelWrapper.generate() a következőket várja:
+                        # prompt, max_tokens, temperature, top_p, top_k, repeat_penalty, stop, stream
                         response = self.model.generate(
                             prompt=prompt,
-                            **self.generation_params
+                            max_tokens=self.generation_params.get('max_tokens', 256),
+                            temperature=self.generation_params.get('temperature', 0.7),
+                            top_p=self.generation_params.get('top_p', 0.9),
+                            top_k=self.generation_params.get('top_k', 40),
+                            repeat_penalty=self.generation_params.get('repeat_penalty', 1.1),
+                            stop=None,
+                            stream=False
                         )
                         result_queue.put(('success', response))
                     except Exception as e:
@@ -630,6 +708,7 @@ class King:
             'style': self.identity.get('style', 'default')
         }
 
+
 # Teszt
 if __name__ == "__main__":
     from scratchpad import Scratchpad
@@ -640,6 +719,11 @@ if __name__ == "__main__":
     
     king = King(s)
     
+    # Új metódus tesztelése
+    response = king.generate_response("Hello, how are you?")
+    print(f"Response: {response}")
+    
+    # Régi process metódus tesztelése
     test_intent = {
         'header': {
             'trace_id': 'test-123',
@@ -656,8 +740,8 @@ if __name__ == "__main__":
         }
     }
     
-    response = king.process(test_intent)
-    print(json.dumps(response, indent=2))
+    response_packet = king.process(test_intent)
+    print(json.dumps(response_packet, indent=2))
     print("\nKing state:", king.get_state())
     print("King mood:", king.get_mood())
     print("King metrics:", king.get_metrics())
