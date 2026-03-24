@@ -7,6 +7,47 @@ system:
   environment: "development"  # development / production
   identity_file: "config/identity.inf"  # Identitás fájl helye
 
+# ========== ÚJ: VAULT KONFIGURÁCIÓ (Neo4j + Qdrant) ==========
+vault:
+  # Graph-Vault (Neo4j)
+  neo4j:
+    enabled: true
+    uri: "bolt://localhost:7687"
+    user: "neo4j"
+    password: "soulcore2026"
+    database: "neo4j"
+    # Auto-initialize constraints and indexes
+    init_schema: true
+    max_connection_pool_size: 10
+    connection_timeout: 30  # másodperc
+  
+  # Vector-Vault (Qdrant)
+  qdrant:
+    enabled: true
+    host: "localhost"
+    port: 6333
+    grpc_port: 6334
+    vector_size: 1024
+    collections:
+      - name: "global_knowledge"
+        vector_size: 1024
+        distance: "Cosine"
+      - name: "personal_memories"
+        vector_size: 1024
+        distance: "Cosine"
+      - name: "conversations"
+        vector_size: 1024
+        distance: "Cosine"
+    # API timeout
+    timeout: 30
+  
+  # Embedding modell (a King modelljét használja)
+  embedding:
+    use_king_model: true  # Ha true, a King modelljét használja embeddingre
+    model: ""  # Ha use_king_model false, itt kell megadni
+    batch_size: 16
+    cache_embeddings: true
+
 # Modulok
 modules:
   heartbeat:
@@ -33,6 +74,11 @@ modules:
     host: "0.0.0.0"
     port: 5000
     debug: false
+    # WebSocket beállítások
+    socketio:
+      ping_timeout: 60
+      ping_interval: 25
+      max_http_buffer_size: 10000000
 
   gateway:
     enabled: true
@@ -44,9 +90,19 @@ modules:
     enable_filter: true              # Prompt-injekció szűrés
     enable_queue: true                # Üzenet sorba állítás
     response_timeout: 30              # Másodperc
+    # Külső LLM kapcsolatok
+    external_entities:
+      - name: "origó"
+        trust_score: 800
+        api_endpoint: ""
+        description: "SoulCore partner"
+      - name: "openai"
+        trust_score: 100
+        api_endpoint: ""
+        enabled: false
 
   eyecore:
-    enabled: true
+    enabled: false  # Alapból false, mert kell hozzá modell
     enable_ocr: true                 # OCR bekapcsolása
     enable_object_detection: false   # Objektum detekció (kell hozzá modell)
     enable_face_detection: false     # Arc detekció
@@ -58,7 +114,7 @@ modules:
     upload_path: "data/uploads"        # Mentési mappa
 
   sentinel:
-    enabled: true
+    enabled: false  # Alapból false, hardver figyelés
     check_interval: 2.0               # 2 másodperc
     temp_warning: 75                   # Figyelmeztetés °C
     temp_critical: 85                   # Kritikus °C
@@ -69,6 +125,14 @@ modules:
     throttle_factor: 0.5                   # Lassítás mértéke (50%)
     auto_unload_priority: 3                # Automatikus kiürítés prioritás alatt
     log_history: 100                        # Hány mérés maradjon meg
+    # GPU beállítások
+    gpu_devices:
+      - index: 0
+        name: "RTX 5060 Ti"
+        max_temp: 85
+      - index: 1
+        name: "RTX 5060 Ti"
+        max_temp: 85
 
   blackbox:
     enabled: true
@@ -94,24 +158,57 @@ modules:
     enable_filesystem: false                     # Fájlrendszer hozzáférés
     enable_network: false                        # Hálózat hozzáférés
     temp_dir: "/tmp/soulcore_sandbox"            # Temp mappa
-
+    # Engedélyezett importok (sandbox biztonság)
+    allowed_imports:
+      - "math"
+      - "json"
+      - "datetime"
+      - "re"
+      - "collections"
 
 # Adatbázis
 database:
   path: "data/soulcore.db"  # SQLite adatbázis helye
   auto_backup: true          # Automatikus mentés
   backup_interval: 86400     # 24 óránként
+  # Backup mappa
+  backup_path: "data/backups"
+  max_backups: 10
 
 # Memória
 memory:
   scratchpad_max_entries: 1000
   short_term_minutes: 5
   cleanup_interval: 3600  # 1 óra
+  # Memória tisztítás
+  auto_archive_days: 90
+  forget_after_days: 30
+  importance_threshold: 0.7
 
 # Felhasználó
 user:
-  name: "Grumpy"
-  language: "hu"  # hu / en
+  name: "user"  # <-- ÁLTALÁNOS, NEM GRUMPY
+  language: "en"  # hu / en
+  role: "admin"
+  preferences:
+    theme: "dark"
+    notifications: true
+    auto_save: true
+
+# ========== ÚJ: NYELVEK ==========
+i18n:
+  default_language: "en"
+  supported_languages:
+    - code: "en"
+      name: "English"
+      fallback: "en"
+    - code: "hu"
+      name: "Magyar"
+      fallback: "en"
+  locale_dir: "src/i18n/locales"
+  # Dinamikus fordítás
+  dynamic_translations: true
+  cache_translations: true
 
 # Agentek
 agents:
@@ -120,26 +217,74 @@ agents:
     model: "models/google_gemma-3-12b-it-qat-Q4_K_M.gguf"
     n_gpu_layers: -1  # -1 = minden GPU-ra, 0 = CPU, 20 = csak 20 réteg GPU-ra
     n_ctx: 8192       # kontextus méret
-    personality: "kíváncsi, hűséges, szuverén, ravasz, humoros"
+    personality: "curious, loyal, sovereign, witty"  # <-- ÁLTALÁNOS, NEM KÓPÉ
+    style: "default"  # default, concise, detailed, poetic, technical
+    generation_params:
+      max_tokens: 512
+      temperature: 0.7
+      top_p: 0.9
+      top_k: 40
+      repeat_penalty: 1.1
     
   jester:
     enabled: true
     max_response_time: 30.0  # másodperc
     max_error_rate: 0.5
     max_consecutive_errors: 5
+    # Szatíra beállítások
+    satire_enabled: true
+    satire_intensity: 0.7  # 0.0 - 1.0
+    # Diagnosztika
+    enable_cycle_detection: true
+    enable_perplexity_monitoring: false
+    enable_identity_reset: true
     
   scribe:
     enabled: true
-    # Nincs modell, csak rule-based most
+    # Intent classification
+    intent_threshold: 0.7
+    enable_ner: true
+    # NER minták
+    entity_patterns:
+      person: ["(?:Mr\\.|Mrs\\.|Ms\\.|Dr\\.)?\\s*([A-Z][a-z]+)"]
+      date: ["\\d{4}-\\d{2}-\\d{2}", "\\d{2}\\.\\d{2}\\.\\d{4}"]
+      path: ["/[a-zA-Z0-9_/.-]+"]
     
   valet:
     enabled: true
+    # Kontextus
     max_context_tokens: 1500
     max_recent_messages: 5
+    summary_length: 200
+    context_compression: true
+    
+    # RAG 2.1
+    enable_rag: true
+    vector_search_limit: 5
+    graph_search_limit: 3
+    similarity_threshold: 0.7
+    emotional_weight: 0.3
+    
+    # Tracking
     enable_tracking: true
+    max_tracking_items: 1000
+    
+    # Validation
     enable_validation: true
-    forget_after_days: 30
+    
+    # Memory lifecycle
     important_threshold: 0.7
+    forget_after_days: 30
+    enable_auto_archive: true
+    archive_after_days: 90
+    
+    # Vault kapcsolatok (a fenti vault konfigot használja)
+    neo4j_uri: "bolt://localhost:7687"
+    neo4j_user: "neo4j"
+    neo4j_password: "soulcore2026"
+    qdrant_host: "localhost"
+    qdrant_port: 6333
+    embedding_size: 1024
     
   queen:
     enabled: false
@@ -149,5 +294,37 @@ agents:
     max_tokens: 512
     use_model: false  # Külön modell használata (ha van)
     model: "models/Qwen2.5-Omni-7B-UD-Q5_K_XL.gguf"
-    n_gpu_layers: -1  # <-- EZT ADD IDE
+    n_gpu_layers: -1
     n_ctx: 4096
+    # Chain of Thought beállítások
+    cot_enabled: true
+    cot_max_steps: 5
+    contradiction_detection: true
+
+# ========== ÚJ: RENDSZERBEÁLLÍTÁSOK ==========
+system_settings:
+  # Teljesítmény
+  performance:
+    enable_metrics: true
+    metrics_interval: 60  # másodperc
+    enable_profiling: false
+    
+  # Biztonság
+  security:
+    enable_audit_log: true
+    enable_rate_limiting: true
+    rate_limit:
+      per_user: 60  # kérés per perc
+      per_ip: 30
+    max_prompt_length: 4096
+    max_response_length: 8192
+    allowed_origins:
+      - "http://localhost:5000"
+      - "http://127.0.0.1:5000"
+    
+  # Fejlesztői beállítások
+  development:
+    debug_mode: false
+    hot_reload: false
+    test_mode: false
+    mock_responses: false

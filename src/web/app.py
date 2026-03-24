@@ -83,7 +83,6 @@ class WebApp:
         def handle_404(e):
             if request.path.startswith('/api/'):
                 return jsonify({"error": "Not found"}), 404
-            # Ha nincs 404.html, visszaadjuk a base.html-t
             try:
                 return render_template("404.html"), 404
             except:
@@ -95,7 +94,7 @@ class WebApp:
             cors_allowed_origins="*",
             ping_timeout=60,
             ping_interval=25,
-            manage_session=False  # Fontos a session kezeléshez!
+            manage_session=False
         )
         
         # --- ALAPÉRTELMEZETT FELHASZNÁLÓK ---
@@ -353,15 +352,24 @@ class WebApp:
             heartbeat = self.modules.get("heartbeat", {})
             sentinel = self.modules.get("sentinel")
             
+            uptime = 0
+            if heartbeat and hasattr(heartbeat, 'get_state'):
+                hb_state = heartbeat.get_state()
+                uptime = hb_state.get("uptime_seconds", 0)
+            
+            gpu_data = []
+            if sentinel and hasattr(sentinel, 'get_gpu_status'):
+                gpu_data = sentinel.get_gpu_status()
+            
             return jsonify({
                 "status": "running",
                 "system_id": self.system_id,
                 "time": time.time(),
-                "uptime": heartbeat.get_state().get("uptime_seconds", 0) if heartbeat else 0,
+                "uptime": uptime,
                 "version": "3.0",
                 "modules": list(self.modules.keys()),
                 "clients": len(self.sessions),
-                "gpu": sentinel.get_gpu_status() if sentinel else []
+                "gpu": gpu_data
             })
         
         @self.app.route("/api/king/state")
@@ -371,18 +379,116 @@ class WebApp:
                 return jsonify({"error": "King module not available"}), 404
             return jsonify(king.get_state())
         
+        # ========== SENTINEL ENDPOINTOK (HOZZÁADVA) ==========
+        
         @self.app.route("/api/sentinel/status")
         def api_sentinel_status():
+            """Sentinel állapot lekérése"""
             sentinel = self.modules.get("sentinel")
+            
             if not sentinel:
-                return jsonify({"error": "Sentinel module not available"}), 404
+                return jsonify({
+                    "available": False,
+                    "status": "unavailable",
+                    "temperature": 0,
+                    "vram_usage": 0,
+                    "utilization": 0,
+                    "throttle_active": False,
+                    "throttle_factor": 1.0,
+                    "recovery_mode": False,
+                    "warnings": [],
+                    "message": "Sentinel modul nincs betöltve"
+                })
+            
+            try:
+                gpu_status = sentinel.get_gpu_status() if hasattr(sentinel, 'get_gpu_status') else []
+                state = sentinel.get_state() if hasattr(sentinel, 'get_state') else {}
+                
+                if gpu_status and len(gpu_status) > 0:
+                    main_gpu = gpu_status[0]
+                    return jsonify({
+                        "available": True,
+                        "status": state.get('status', 'idle'),
+                        "temperature": main_gpu.get('temperature', 0),
+                        "vram_usage": main_gpu.get('vram_percent', 0),
+                        "vram_used_mb": main_gpu.get('vram_used', 0),
+                        "vram_total_mb": main_gpu.get('vram_total', 0),
+                        "utilization": main_gpu.get('utilization', 0),
+                        "throttle_active": sentinel.is_throttled() if hasattr(sentinel, 'is_throttled') else False,
+                        "throttle_factor": sentinel.get_throttle_factor() if hasattr(sentinel, 'get_throttle_factor') else 1.0,
+                        "recovery_mode": state.get('recovery_mode', False),
+                        "warnings": state.get('warnings', []),
+                        "gpus": gpu_status
+                    })
+                else:
+                    return jsonify({
+                        "available": True,
+                        "status": state.get('status', 'idle'),
+                        "temperature": 0,
+                        "vram_usage": 0,
+                        "message": "No GPU data available"
+                    })
+                    
+            except Exception as e:
+                print(f"⚠️ Sentinel status hiba: {e}")
+                return jsonify({
+                    "available": False,
+                    "status": "error",
+                    "error": str(e),
+                    "message": f'Hiba a Sentinel lekérésében: {e}'
+                }), 500
+        
+        @self.app.route("/api/sentinel/gpus")
+        def api_sentinel_gpus():
+            """Összes GPU állapot lekérése"""
+            sentinel = self.modules.get("sentinel")
+            
+            if not sentinel:
+                return jsonify({"error": "Sentinel not available"}), 404
+            
+            try:
+                return jsonify({
+                    "gpus": sentinel.get_gpu_status() if hasattr(sentinel, 'get_gpu_status') else [],
+                    "state": sentinel.get_state() if hasattr(sentinel, 'get_state') else {}
+                })
+            except Exception as e:
+                return jsonify({"error": str(e)}), 500
+        
+        @self.app.route("/api/sentinel/slots")
+        def api_sentinel_slots():
+            """Modell slotok lekérése"""
+            sentinel = self.modules.get("sentinel")
+            
+            if not sentinel:
+                return jsonify({"error": "Sentinel not available"}), 404
+            
+            try:
+                return jsonify({
+                    "slots": sentinel.get_slots() if hasattr(sentinel, 'get_slots') else []
+                })
+            except Exception as e:
+                return jsonify({"error": str(e)}), 500
+        
+        @self.app.route("/api/sentinel/throttle", methods=['GET', 'POST'])
+        def api_sentinel_throttle():
+            """Throttle állapot lekérése vagy módosítása"""
+            sentinel = self.modules.get("sentinel")
+            
+            if not sentinel:
+                return jsonify({"error": "Sentinel not available"}), 404
+            
+            if request.method == 'POST':
+                data = request.get_json() or {}
+                # Itt lehetne módosítani a throttle beállításokat
+                return jsonify({"throttle_active": sentinel.is_throttled() if hasattr(sentinel, 'is_throttled') else False})
             
             return jsonify({
-                "gpus": sentinel.get_gpu_status(),
-                "slots": sentinel.get_slots(),
-                "state": sentinel.get_state(),
-                "throttle_factor": sentinel.get_throttle_factor()
+                "throttle_active": sentinel.is_throttled() if hasattr(sentinel, 'is_throttled') else False,
+                "throttle_factor": sentinel.get_throttle_factor() if hasattr(sentinel, 'get_throttle_factor') else 1.0,
+                "recovery_mode": sentinel.get_state().get('recovery_mode', False) if hasattr(sentinel, 'get_state') else False
             })
+        
+        # ========== TÖBBI API ENDPOINTOK ==========
         
         # --- API: BESZÉLGETÉSEK ---
         
@@ -644,12 +750,11 @@ class WebApp:
         def api_test_embedding():
             data = request.get_json() or {}
             text = data.get("text", "")
-            settings = data.get("settings", self.settings.get("embedding", {}))
             
             if not text:
                 return jsonify({"error": "Text required"}), 400
             
-            # Demo válasz (valós implementáció később)
+            # Demo válasz
             return jsonify({
                 "dimension": 384,
                 "vector": [0.1, 0.2, 0.3, 0.4, 0.5] + [0.0] * 379
@@ -685,23 +790,19 @@ class WebApp:
             if 'audio' not in request.files:
                 return jsonify({"error": "No audio file"}), 400
             
-            file = request.files['audio']
-            # Demo válasz (valós implementáció később)
-            return jsonify({"text": "Ez egy demo beszédfelismerési eredmény."})
+            # Demo válasz
+            return jsonify({"text": "Demo speech recognition result."})
         
         @self.app.route("/api/audio/synthesize", methods=["POST"])
         @self.login_required
         def api_synthesize_speech():
             data = request.get_json() or {}
             text = data.get("text", "")
-            settings = data.get("settings", self.settings.get("tts", {}))
             
             if not text:
                 return jsonify({"error": "Text required"}), 400
             
-            # Demo válasz (valós implementáció később)
-            # Itt egy üres audio fájlt adunk vissza
-            return jsonify({"success": True, "message": "Audio szintézis (demo)"})
+            return jsonify({"success": True, "message": "Audio synthesis (demo)"})
         
         # --- API: VISION ---
         
@@ -710,16 +811,14 @@ class WebApp:
         def api_process_image():
             data = request.get_json() or {}
             image = data.get("image", "")
-            settings = data.get("settings", {})
             
             if not image:
                 return jsonify({"error": "No image data"}), 400
             
-            # Demo válasz (valós implementáció később)
             return jsonify({
                 "success": True,
-                "description": "Ez egy demo képfeldolgozási eredmény.",
-                "ocr_text": "Demo OCR szöveg",
+                "description": "Demo image processing result.",
+                "ocr_text": "Demo OCR text",
                 "entities": ["demo", "entity"]
             })
         
@@ -731,16 +830,12 @@ class WebApp:
             data = request.get_json() or {}
             code = data.get("code", "")
             language = data.get("language", "python")
-            timeout = data.get("timeout", 30)
-            memory_limit = data.get("memory_limit", 512)
-            network_access = data.get("network_access", False)
             
             if not code:
                 return jsonify({"error": "No code to execute"}), 400
             
-            # Demo válasz (valós implementáció később)
             return jsonify({
-                "output": f"Demo kimenet a {language} kódhoz:\n{code[:100]}...",
+                "output": f"Demo output for {language} code:\n{code[:100]}...",
                 "error": None,
                 "execution_time": 0.1,
                 "memory_used": 10
@@ -806,7 +901,6 @@ class WebApp:
             if not gateway:
                 return jsonify({"error": "Gateway not found"}), 404
             
-            # Demo válasz
             gateway["status"] = "online"
             gateway["last_communication"] = time.time()
             gateway["trust_score"] = min(gateway.get("trust_score", 500) + 50, 1000)
@@ -823,9 +917,8 @@ class WebApp:
             if not gateway_id or not message:
                 return jsonify({"error": "Gateway ID and message required"}), 400
             
-            # Demo válasz
             return jsonify({
-                "text": f"Demo válasz a(z) {gateway_id} gateway-től: {message}"
+                "text": f"Demo response from gateway {gateway_id}: {message}"
             })
         
         # --- API: BEÁLLÍTÁSOK ---
@@ -844,14 +937,13 @@ class WebApp:
             self.settings[category] = {**self.settings.get(category, {}), **data}
             return jsonify({"success": True})
         
-        # --- API: AUDIT LOG (demo) ---
+        # --- API: AUDIT LOG ---
         
         @self.app.route("/api/audit", methods=["GET"])
         @self.admin_required
         def api_get_audit_log():
             limit = request.args.get("limit", 100, type=int)
             
-            # Demo audit log
             logs = []
             for i in range(min(limit, 50)):
                 logs.append({
@@ -873,11 +965,8 @@ class WebApp:
         @self.admin_required
         def api_get_metrics():
             period = request.args.get("period", "day")
-            limit = request.args.get("limit", 100, type=int)
-            
             points = 24 if period == "day" else (7 if period == "week" else 30)
             
-            # Demo metrikák
             timestamps = [time.time() - i * 3600 for i in range(points, 0, -1)]
             
             return jsonify({
@@ -910,7 +999,6 @@ class WebApp:
             query = request.args.get("q", "")
             limit = request.args.get("limit", 100, type=int)
             
-            # Demo trace-ek
             traces = []
             modules = ["orchestrator", "king", "queen", "scribe", "valet", "jester"]
             levels = ["info", "debug", "warning", "error"]
@@ -1010,7 +1098,6 @@ class WebApp:
                 "email": user["email"]
             })
         
-
         @self.socketio.on("chat:message")
         def handle_chat_message(data):
             text = data.get("text", "").strip()
@@ -1036,7 +1123,7 @@ class WebApp:
                 except Exception as e:
                     print(f"⚠️ WebApp: Üzenet mentési hiba: {e}")
             
-            # Callback definiálása - EZ KÜLDI EL A VÁLASZT (csak egyszer)
+            # Callback definiálása
             def on_response(response_text, conv_id, trace_id):
                 print(f"📤 WebApp: Callback meghívva, válasz küldése frontendnek: {response_text[:50]}...")
                 try:
@@ -1049,21 +1136,15 @@ class WebApp:
                 except Exception as e:
                     print(f"❌ WebApp: Hiba a válasz küldésekor: {e}")
             
-            # Beállítjuk a callbacket az Orchestratorban
+            # Callback beállítása
             if hasattr(orch, 'set_webapp_callback'):
                 orch.set_webapp_callback(on_response)
                 print(f"🔗 WebApp: Callback beállítva az Orchestratorban")
             
-            # Elindítjuk a feldolgozást - NEM KÜLDÜNK ITT MÉG VÁLASZT!
+            # Feldolgozás indítása
             try:
                 result = orch.process_user_message(text, conv_id)
                 print(f"🔄 WebApp: Orchestrator.process_user_message visszatért")
-                
-                # MEGJEGYZÉS: Itt NEM küldünk chat:response-t, mert a callback fogja!
-                # Ha a callback nem működik, akkor ez a biztonsági mentés:
-                # if result and result.get("response") and not hasattr(orch, '_callback_called'):
-                #     emit("chat:response", {...})
-                
             except Exception as e:
                 print(f"❌ WebApp: Orchestrator hiba: {e}")
                 emit("chat:error", {"error": f"Processing error: {e}"})
@@ -1085,15 +1166,28 @@ class WebApp:
         
         @self.socketio.on("get_status")
         def handle_get_status():
+            king_state = {}
+            if self.modules.get("king") and hasattr(self.modules["king"], 'get_state'):
+                king_state = self.modules["king"].get_state()
+            
+            hb_state = {}
+            if self.modules.get("heartbeat") and hasattr(self.modules["heartbeat"], 'get_state'):
+                hb_state = self.modules["heartbeat"].get_state()
+            
+            gpu_data = []
+            sentinel = self.modules.get("sentinel")
+            if sentinel and hasattr(sentinel, 'get_gpu_status'):
+                gpu_data = sentinel.get_gpu_status()
+            
             emit("status_update", {
-                "heartbeat": self.modules.get("heartbeat", {}).get_state() if self.modules.get("heartbeat") else {},
-                "king": self.modules.get("king", {}).get_state() if self.modules.get("king") else {},
+                "heartbeat": hb_state,
+                "king": king_state,
                 "modules": list(self.modules.keys()),
-                "gpu": self.modules.get("sentinel", {}).get_gpu_status() if self.modules.get("sentinel") else []
+                "gpu": gpu_data
             })
     
     # ----------------------------------------------------------------------
-    # INDIÍTÁS / LEÁLLÍTÁS
+    # INDÍTÁS / LEÁLLÍTÁS
     # ----------------------------------------------------------------------
     
     def start(self, host="0.0.0.0", port=5000, debug=False):

@@ -16,6 +16,7 @@ except ImportError:
     LLAMA_AVAILABLE = False
     print("⚠️ llama-cpp-python nem elérhető. Dummy módban futok.")
 
+
 class ModelWrapper:
     """
     Modell betöltő és futtató.
@@ -25,6 +26,7 @@ class ModelWrapper:
     - GPU használat (több GPU támogatás)
     - Állapot figyelés (Jesternek)
     - Split modellek támogatása (pl. 00001-of-00002)
+    - Embedding támogatás (ha a modell embedding=True-val lett betöltve)
     """
     
     def __init__(self, model_path: str, config: Dict = None):
@@ -34,6 +36,9 @@ class ModelWrapper:
         self.llama_available = LLAMA_AVAILABLE
         self.is_split = False
         self.split_parts = []
+        
+        # Embedding támogatás jelző
+        self.embedding_enabled = self.config.get('embedding', False)
         
         # Állapot
         self.state = {
@@ -45,7 +50,9 @@ class ModelWrapper:
             'average_speed': 0,  # token/sec
             'error': None,
             'gpu_layers': 0,
-            'gpu_devices': []
+            'gpu_devices': [],
+            'n_ctx': 0,
+            'embedding_available': False
         }
         
         # Lock a thread safetyhez
@@ -57,6 +64,8 @@ class ModelWrapper:
         print(f"📦 ModelWrapper: {os.path.basename(model_path)}")
         if self.is_split:
             print(f"   Split modell: {len(self.split_parts)} rész")
+        if self.embedding_enabled:
+            print(f"   Embedding támogatás: bekapcsolva")
     
     def _check_split_model(self):
         """
@@ -102,6 +111,11 @@ class ModelWrapper:
             n_ctx = self.config.get('n_ctx', 4096)
             print(f"   Kontextus: {n_ctx}")
             
+            # Embedding támogatás
+            embedding = self.config.get('embedding', False)
+            print(f"   Embedding: {embedding}")
+            self.embedding_enabled = embedding
+            
             # Split modell kezelés
             if self.is_split:
                 model_path = self.split_parts[0]  # Az első rész
@@ -119,7 +133,7 @@ class ModelWrapper:
                 'n_batch': self.config.get('n_batch', 512),
                 'mul_mat_q': self.config.get('mul_mat_q', True),
                 'logits_all': self.config.get('logits_all', False),
-                'embedding': self.config.get('embedding', False),
+                'embedding': embedding,
                 'offload_kqv': self.config.get('offload_kqv', True)
             }
             
@@ -165,9 +179,12 @@ class ModelWrapper:
             self.state['loaded'] = True
             self.state['loading_time'] = load_time
             self.state['n_ctx'] = n_ctx
+            self.state['embedding_available'] = embedding
             
             print(f"✅ Modell betöltve: {load_time:.1f} másodperc")
             print(f"   Kontextus: {n_ctx} token")
+            if embedding:
+                print(f"   Embedding: elérhető")
             return True
             
         except Exception as e:
@@ -209,7 +226,6 @@ class ModelWrapper:
                     return "[Modell nem elérhető]"
             
             start = time.time()
-            start_tokens = self.state['total_tokens']
             
             try:
                 if self.llama_available and self.model:
@@ -239,7 +255,7 @@ class ModelWrapper:
                         tokens_used = 0
                 else:
                     # Dummy mód (teszteléshez)
-                    time.sleep(0.1 * (max_tokens / 100))  # Szimulált számolás
+                    time.sleep(0.1 * (max_tokens / 100))
                     text = f"Ezt kaptam: {prompt[:50]}... (dummy válasz)"
                     tokens_used = len(text.split())
                 
@@ -276,7 +292,6 @@ class ModelWrapper:
         """
         try:
             if self.llama_available and self.model:
-                # Streamezett generálás
                 for chunk in self.model(
                     prompt,
                     max_tokens=max_tokens,
@@ -292,7 +307,6 @@ class ModelWrapper:
                         if token:
                             yield token
             else:
-                # Dummy stream
                 words = prompt.split()
                 for word in words[:10]:
                     time.sleep(0.05)
@@ -337,9 +351,21 @@ class ModelWrapper:
     
     def embed(self, text: str) -> List[float]:
         """
-        Szöveg embedding vektorának lekérése (ha támogatja).
+        Szöveg embedding vektorának lekérése.
+        
+        Fontos: A modellt embedding=True paraméterrel kell betölteni!
         """
-        if not self.model or not hasattr(self.model, 'embed'):
+        # Ellenőrizzük, hogy a modell támogatja-e az embeddinget
+        if not self.model:
+            print("📦 Embedding: modell nincs betöltve")
+            return []
+        
+        if not self.embedding_enabled:
+            print("📦 Embedding: a modell embedding támogatás nélkül lett betöltve")
+            return []
+        
+        if not hasattr(self.model, 'embed'):
+            print("📦 Embedding: a modell nem támogatja az embed metódust")
             return []
         
         try:
@@ -381,6 +407,7 @@ class ModelWrapper:
                 del self.model
                 self.model = None
             self.state['loaded'] = False
+            self.state['embedding_available'] = False
             print("📦 Modell kiürítve")
     
     def get_state(self) -> Dict:
@@ -394,6 +421,8 @@ class ModelWrapper:
             'average_speed': round(self.state['average_speed'], 2),
             'gpu_layers': self.state['gpu_layers'],
             'gpu_devices': self.state['gpu_devices'],
+            'n_ctx': self.state.get('n_ctx', 0),
+            'embedding_available': self.state.get('embedding_available', False),
             'error': self.state['error'],
             'is_split': self.is_split,
             'split_parts': len(self.split_parts) if self.is_split else 0
@@ -401,14 +430,38 @@ class ModelWrapper:
     
     def get_metrics(self) -> Dict:
         """Részletes metrikák lekérése (UI-nak)"""
+        last_inference_ago = None
+        if self.state['last_inference']:
+            last_inference_ago = time.time() - self.state['last_inference']
+        
         return {
             'inference_count': self.state['inference_count'],
             'total_tokens': self.state['total_tokens'],
-            'average_speed': self.state['average_speed'],
-            'last_inference_ago': time.time() - self.state['last_inference'] if self.state['last_inference'] else None,
+            'average_speed': round(self.state['average_speed'], 2),
+            'last_inference_ago': last_inference_ago,
             'gpu_usage': self.state.get('gpu_usage', {}),
-            'vram_usage': self.state.get('vram_usage', 0)
+            'vram_usage': self.state.get('vram_usage', 0),
+            'embedding_available': self.state.get('embedding_available', False)
         }
+    
+    def set_embedding(self, enabled: bool):
+        """
+        Embedding támogatás beállítása (modell újratöltés szükséges).
+        """
+        self.embedding_enabled = enabled
+        if enabled:
+            self.config['embedding'] = True
+        else:
+            self.config['embedding'] = False
+        
+        # Ha a modell be van töltve, jelezzük, hogy újratöltés kell
+        if self.state['loaded']:
+            print("📦 Figyelem: embedding beállítás megváltozott, modell újratöltése szükséges!")
+    
+    def is_embedding_available(self) -> bool:
+        """Embedding elérhetőségének lekérése"""
+        return self.state.get('embedding_available', False)
+
 
 # Teszt
 if __name__ == "__main__":
@@ -419,6 +472,10 @@ if __name__ == "__main__":
     response = mw.generate("Szia, hogy vagy?")
     print(f"Válasz: {response}")
     print(f"Állapot: {mw.get_state()}")
+    
+    # Embedding teszt
+    embedding = mw.embed("Teszt szöveg")
+    print(f"Embedding: {embedding[:5] if embedding else 'üres'}")
     
     # Teszt split modellel
     mw2 = ModelWrapper("model-00001-of-00002.gguf")

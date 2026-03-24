@@ -174,7 +174,7 @@ class Heartbeat:
         
         # Utolsó interakció ellenőrzése
         last_interaction = self.scratchpad.get_state('last_interaction')
-        if last_interaction:
+        if last_interaction is not None:
             self.state['last_interaction'] = last_interaction
             idle = now - last_interaction
             self.state['idle_seconds'] = int(idle)
@@ -186,6 +186,11 @@ class Heartbeat:
                     {'idle_seconds': int(idle), 'idle_formatted': self.state['idle_formatted']}, 
                     'idle_start'
                 )
+        else:
+            # Ha nincs last_interaction, akkor nullázzuk
+            self.state['last_interaction'] = None
+            self.state['idle_seconds'] = 0
+            self.state['idle_formatted'] = '0s'
         
         # Események futtatása
         self._run_events(now)
@@ -257,31 +262,67 @@ class Heartbeat:
         Állapot snapshot mentése (XVI. fejezet - Lélek-lenyomat)
         5 percenként menti a rendszer állapotát.
         """
+        # Biztonságos lekérés - minden érték legyen string vagy szám, ne None
+        king_status = self.scratchpad.get_state('king_status', 'unknown')
+        if king_status is None:
+            king_status = 'unknown'
+        
+        jester_status = self.scratchpad.get_state('jester_status', 'unknown')
+        if jester_status is None:
+            jester_status = 'unknown'
+        
+        orchestrator_status = self.scratchpad.get_state('orchestrator_status', 'unknown')
+        if orchestrator_status is None:
+            orchestrator_status = 'unknown'
+        
+        active_traces = self.scratchpad.get_state('active_traces', 0)
+        if active_traces is None:
+            active_traces = 0
+        
+        last_interaction = self.state.get('last_interaction')
+        if last_interaction is None:
+            last_interaction = 0
+        
         snapshot = {
             'timestamp': time.time(),
-            'uptime': self.state['uptime_seconds'],
-            'last_interaction': self.state['last_interaction'],
-            'idle': self.state['idle_seconds'],
-            'proactive_count': self.state['proactive_count'],
-            'reminder_count': self.state['reminder_count'],
-            'king_status': self.scratchpad.get_state('king_status', 'unknown'),
-            'jester_status': self.scratchpad.get_state('jester_status', 'unknown'),
-            'active_traces': self.scratchpad.get_state('active_traces', 0)
+            'uptime': self.state.get('uptime_seconds', 0),
+            'last_interaction': last_interaction,
+            'idle': self.state.get('idle_seconds', 0),
+            'proactive_count': self.state.get('proactive_count', 0),
+            'reminder_count': self.state.get('reminder_count', 0),
+            'king_status': king_status,
+            'jester_status': jester_status,
+            'orchestrator_status': orchestrator_status,
+            'active_traces': active_traces,
+            'time_of_day': self.state.get('time_of_day', 'unknown'),
+            'beats': self.state.get('beats', 0)
         }
         
-        self.scratchpad.write_note(self.name, f"snapshot_{int(time.time())}", snapshot)
+        # Snapshot mentése
+        snapshot_key = f"snapshot_{int(time.time())}"
+        self.scratchpad.write_note(self.name, snapshot_key, snapshot)
         
         # Csak az utolsó 10 snapshotot tartjuk meg
         self._cleanup_old_snapshots(10)
     
     def _cleanup_old_snapshots(self, keep: int = 10):
         """Régi snapshotok törlése"""
-        notes = self.scratchpad.read_all_notes(self.name)
-        snapshots = [(k, v) for k, v in notes.items() if k.startswith('snapshot_')]
-        snapshots.sort(key=lambda x: x[1].get('timestamp', 0))
-        
-        for key, _ in snapshots[:-keep]:
-            self.scratchpad.write_note(self.name, key, None)  # Törlés
+        try:
+            notes = self.scratchpad.read_all_notes(self.name)
+            if not notes:
+                return
+            
+            snapshots = []
+            for k, v in notes.items():
+                if k and k.startswith('snapshot_') and isinstance(v, dict):
+                    snapshots.append((k, v.get('timestamp', 0)))
+            
+            snapshots.sort(key=lambda x: x[1])
+            
+            for key, _ in snapshots[:-keep]:
+                self.scratchpad.write_note(self.name, key, None)
+        except Exception as e:
+            print(f"💓 Snapshot cleanup hiba: {e}")
     
     # --- PROAKTÍV ÉRDEKLŐDÉS (nem zaklatás!) ---
     
@@ -354,9 +395,17 @@ class Heartbeat:
         notes = self.scratchpad.read_all_notes()
         today = datetime.now().strftime("%Y%m%d")
         user_language = self.scratchpad.get_state('user_language', 'en')
+        if user_language is None:
+            user_language = 'en'
         
         for module, notes_dict in notes.items():
+            if not isinstance(notes_dict, dict):
+                continue
+                
             for key, note in notes_dict.items():
+                if not key or not isinstance(key, str):
+                    continue
+                    
                 # Csak az emlékeztetőket nézzük
                 if not key.startswith('reminder_'):
                     continue
@@ -373,7 +422,9 @@ class Heartbeat:
                     # Ha ma van az esemény, ÉS még nem küldtük el
                     if date_str == today and reminder_id not in self.state['reminders_sent']:
                         topic = parts[2] if len(parts) > 2 else 'event'
-                        note_text = note.get('value', '')
+                        note_text = ''
+                        if isinstance(note, dict):
+                            note_text = note.get('value', '')
                         
                         self._send_proactive({
                             'type': 'reminder',
@@ -394,7 +445,8 @@ class Heartbeat:
         last_intent = self.scratchpad.read_last('intent')
         if last_intent:
             content = last_intent.get('content', {})
-            return content.get('intent', {}).get('class', '')
+            if isinstance(content, dict):
+                return content.get('intent', {}).get('class', '')
         return ''
     
     def _send_proactive(self, data: Dict):
@@ -404,6 +456,8 @@ class Heartbeat:
         
         now = datetime.now()
         user_language = data.get('language', self.scratchpad.get_state('user_language', 'en'))
+        if user_language is None:
+            user_language = 'en'
         
         # Alap KVK csomag
         packet = {

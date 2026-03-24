@@ -102,11 +102,21 @@ window.api = {
     },
     
     async getSentinelStatus() {
-        const data = await this.fetch('/api/sentinel/status');
-        window.store.setGpuStatus(data.gpus || []);
-        window.store.setSentinelState(data);
-        return data;
-    },
+		try {
+			const response = await this.fetch('/api/sentinel/status');
+			return response;
+		} catch (error) {
+			// Sentinel nem elérhető - visszaadunk egy alapértelmezett állapotot
+			console.warn('⚠️ Sentinel modul nem elérhető, dummy adatokkal dolgozom');
+			return {
+				available: false,
+				status: 'unavailable',
+				temperature: 0,
+				vram_usage: 0,
+				message: 'Sentinel modul nincs betöltve'
+			};
+		}
+	},
     
     async getBlackboxStats() {
         const data = await this.fetch('/api/blackbox/stats');

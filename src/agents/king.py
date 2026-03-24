@@ -2,6 +2,11 @@
 King - A Király, aki éppen uralkodik.
 Lehet Gemma, Llama, bármi. A rendszer nem tudja, nem is akarja tudni, hogy melyik.
 A Király feladata: válaszolni, ha kell.
+
+RAG integráció:
+- Valet-től kapott kontextussal dolgozik
+- Graph-Vault (Neo4j) és Vector-Vault (Qdrant) adatokat építi be
+- Érzelmi kontextus alapján hangolja a választ
 """
 
 import time
@@ -21,6 +26,7 @@ except ImportError:
     I18N_AVAILABLE = False
     print("⚠️ King: i18n nem elérhető, angol alapértelmezettel futok.")
 
+
 class King:
     """
     A Király.
@@ -30,6 +36,7 @@ class King:
     - Kap egy intent JSON-t, visszaad egy response JSON-t
     - A Jester figyeli az állapotát
     - Identitását a scratchpadből kapja (oda a main tölti)
+    - Valet-től kapott RAG kontextust épít be a válaszába
     """
     
     # Prompt verziók (különböző stílusokhoz)
@@ -44,7 +51,7 @@ class King:
     def __init__(self, scratchpad, orchestrator=None, model_wrapper=None):
         self.scratchpad = scratchpad
         self.model = model_wrapper
-        self.valet = None
+        self.valet = None      # Valet hivatkozás (később beállítva)
         self.queen = None
         self.orchestrator = orchestrator
         self.name = "king"
@@ -66,12 +73,14 @@ class King:
             'model_loaded': False,
             'total_tokens_generated': 0,
             'total_processing_time': 0,
-            'last_mood': 'neutral'
+            'last_mood': 'neutral',
+            'rag_used': False,           # RAG használat jelző
+            'last_context_summary': None  # Utolsó használt kontextus
         }
         
         # Identitás (scratchpadből jön)
         self.identity = {
-            'name': 'King',
+            'name': 'assistant',
             'title': 'The Sovereign',
             'personality': 'wise, curious, sovereign',
             'style': 'default'
@@ -104,19 +113,32 @@ class King:
         
         print("👑 King: Király trónra lépett.")
     
-    # ======================================================================
-    # ÚJ METÓDUS A WEBAPP SZÁMÁRA
-    # ======================================================================
+    def set_valet(self, valet):
+        """Valet modul beállítása (memória logisztika)"""
+        self.valet = valet
+        print("👑 King: Valet kapcsolat beállítva")
     
-    def generate_response(self, user_text: str, trace_id: str = None, conversation_id: int = None) -> str:
+    def set_queen(self, queen):
+        """Queen modul beállítása (CoT logika)"""
+        self.queen = queen
+        print("👑 King: Queen kapcsolat beállítva")
+    
+    # ========== FŐ BELÉPÉSI PONT (WebApp + Valet kontextus) ==========
+    
+    def generate_response(self, user_text: str, trace_id: str = None, 
+                         conversation_id: int = None,
+                         conversation_history: List[Dict] = None,
+                         rag_context: Dict = None) -> str:
         """
         Egyszerű belépési pont a WebApp számára.
-        Létrehoz egy intent packetet és feldolgozza.
+        Létrehoz egy intent packetet, és feldolgozza a Valet kontextussal.
         
         Args:
             user_text: A felhasználó üzenete
             trace_id: Opcionális nyomkövetési azonosító
             conversation_id: Opcionális beszélgetés azonosító
+            conversation_history: Előzmények listája (opcionális)
+            rag_context: Valet-től kapott RAG kontextus (opcionális)
         
         Returns:
             str: A generált válasz szövege
@@ -140,7 +162,9 @@ class King:
                 },
                 'text': user_text,
                 'raw_text': user_text,
-                'conversation_id': conversation_id
+                'conversation_id': conversation_id,
+                'conversation_history': conversation_history or [],
+                'rag_context': rag_context or {}
             }
         }
         
@@ -155,7 +179,7 @@ class King:
             elif isinstance(payload, str):
                 return payload
         
-        return "A Király nem válaszolt."
+        return self._get_error_message("No response generated")
     
     def set_response_callback(self, callback):
         """
@@ -164,9 +188,7 @@ class King:
         """
         self.response_callback = callback
     
-    # ======================================================================
-    # MEGLÉVŐ METÓDUSOK
-    # ======================================================================
+    # ========== MEGLÉVŐ METÓDUSOK (kibővítve) ==========
     
     def set_language(self, language: str):
         """Nyelv beállítása (i18n)"""
@@ -257,13 +279,17 @@ class King:
             # 2. Identitás betöltése a scratchpadből
             self._load_identity()
             
-            # 3. Prompt összeállítása (cache-elve)
-            prompt = self._build_prompt_cached(intent_packet)
+            # 3. RAG kontextus kinyerése az intent_packet-ből (Valet-től jött)
+            rag_context = intent_packet.get('payload', {}).get('rag_context', {})
+            self.state['rag_used'] = bool(rag_context)
             
-            # 4. Válasz generálása
+            # 4. Prompt összeállítása (cache-elve, RAG kontextussal)
+            prompt = self._build_prompt_cached(intent_packet, rag_context)
+            
+            # 5. Válasz generálása
             response = self._generate_response(prompt)
             
-            # 5. Válasz csomag összeállítása
+            # 6. Válasz csomag összeállítása
             tokens_used = len(response.split())
             processing_time = time.time() - start_time
             
@@ -279,7 +305,8 @@ class King:
                     'confidence': self._calculate_confidence(intent_packet),
                     'response_time_ms': int(processing_time * 1000),
                     'tokens_used': tokens_used,
-                    'mood': self._get_current_mood()
+                    'mood': self._get_current_mood(),
+                    'rag_used': self.state['rag_used']
                 },
                 'state': {
                     'status': 'success',
@@ -288,14 +315,15 @@ class King:
                 }
             }
             
-            # 6. Állapot frissítés
+            # 7. Állapot frissítés
             self.state['last_response_text'] = response[:200]
             self.state['total_tokens_generated'] += tokens_used
             self.state['total_processing_time'] += processing_time
+            self.state['last_context_summary'] = rag_context.get('summary', '')[:100]
             self.recent_responses.append(hashlib.md5(response.encode()).hexdigest()[:8])
             self._update_state(intent_packet, response_packet, start_time)
             
-            # 7. Callback hívás (ha van)
+            # 8. Callback hívás (ha van)
             if self.response_callback:
                 conv_id = intent_packet.get('payload', {}).get('conversation_id')
                 self.response_callback(response, conv_id, trace_id)
@@ -307,7 +335,6 @@ class King:
             self.state['errors'].append(error)
             self.state['status'] = 'error'
             
-            # Hibacsomag vissza
             error_response = {
                 'header': {
                     'trace_id': trace_id,
@@ -323,7 +350,6 @@ class King:
                 }
             }
             
-            # Hibát is továbbítjuk callback-en
             if self.response_callback:
                 conv_id = intent_packet.get('payload', {}).get('conversation_id')
                 self.response_callback(f"Hiba: {error}", conv_id, trace_id)
@@ -377,9 +403,10 @@ class King:
         
         return False
     
-    def _build_prompt_cached(self, intent_packet: Dict) -> str:
+    def _build_prompt_cached(self, intent_packet: Dict, rag_context: Dict = None) -> str:
         """
         Prompt összeállítása cache-eléssel a gyorsításért.
+        RAG kontextust is beépíti.
         """
         # Cache kulcs generálása
         payload = intent_packet.get('payload', {})
@@ -387,8 +414,14 @@ class King:
         intent_class = payload.get('intent', {}).get('class', 'unknown')
         language = self.scratchpad.get_state('user_language', 'en')
         
+        # RAG kontextus hash-e (ha van)
+        rag_hash = ''
+        if rag_context:
+            rag_str = f"{rag_context.get('summary', '')}_{rag_context.get('facts', [])}"
+            rag_hash = hashlib.md5(rag_str.encode()).hexdigest()[:8]
+        
         cache_key = hashlib.md5(
-            f"{text}_{intent_class}_{language}_{self.identity['style']}".encode()
+            f"{text}_{intent_class}_{language}_{self.identity['style']}_{rag_hash}".encode()
         ).hexdigest()
         
         # Cache ellenőrzés
@@ -398,7 +431,7 @@ class King:
                 return cached_prompt
         
         # Új prompt építés
-        prompt = self._build_prompt(intent_packet)
+        prompt = self._build_prompt(intent_packet, rag_context)
         
         # Cache mentés
         self.context_cache[cache_key] = (time.time(), prompt)
@@ -419,10 +452,10 @@ class King:
         for key in to_delete:
             del self.context_cache[key]
     
-    def _build_prompt(self, intent_packet: Dict) -> str:
+    def _build_prompt(self, intent_packet: Dict, rag_context: Dict = None) -> str:
         """
-        Prompt összeállítása az intent packetből.
-        Optimalizált, rövidebb változat - CSAK AZ AKTUÁLIS ÜZENET.
+        Prompt összeállítása az intent packetből és RAG kontextusból.
+        A prompt tömör, csak az aktuális üzenet + releváns kontextus.
         """
         payload = intent_packet.get('payload', {})
         if not isinstance(payload, dict):
@@ -433,7 +466,7 @@ class King:
             text = str(text)
         
         # Felhasználó neve
-        user_name = self.scratchpad.get_state('user_name', 'User')
+        user_name = self.scratchpad.get_state('user_name', 'user')
         
         # Nyelv
         language = self.scratchpad.get_state('user_language', 'en')
@@ -443,43 +476,61 @@ class King:
         # Stílus alapú prompt építés
         style = self.identity.get('style', 'default')
         
-        # Valet kontextus (ha van)
-        valet_context = ""
-        if hasattr(self, 'valet') and self.valet is not None:
-            try:
-                context = self.valet.prepare_context(intent_packet)
-                if isinstance(context, dict):
-                    if context.get('summary'):
-                        valet_context = f"📌 {context['summary']}\n"
-                    if context.get('facts'):
-                        facts = context['facts'][:2]
-                        if facts:
-                            valet_context += "📋 " + " | ".join(facts) + "\n"
-            except Exception as e:
-                print(f"👑 King: Valet error: {e}")
-        
-        # Stílus alapú prompt előtag
-        style_prefix = self._get_style_prefix(style, language)
-        
-        # Prompt összeállítása (tömörített) - CSAK AZ AKTUÁLIS ÜZENET
+        # Prompt részek
         prompt_parts = []
         
         # Instrukció a modellnek, hogy ne ismételje vissza a felhasználó üzenetét
         if language == 'hu':
             prompt_parts.append("Figyelem: Csak a saját válaszodat írd le, ne ismételd vissza a felhasználó üzenetét!")
-            prompt_parts.append("Ne írd ki, hogy 'User:' vagy 'King:'!")
+            prompt_parts.append("Ne írd ki, hogy 'User:' vagy 'Assistant:'!")
         else:
             prompt_parts.append("Note: Only write your own response, do not repeat the user's message!")
-            prompt_parts.append("Do not write 'User:' or 'King:'!")
+            prompt_parts.append("Do not write 'User:' or 'Assistant:'!")
         
+        # Stílus prefix
+        style_prefix = self._get_style_prefix(style, language)
         if style_prefix:
             prompt_parts.append(style_prefix)
         
-        if valet_context:
-            prompt_parts.append(valet_context)
+        # ========== RAG KONTEXTUS BEÉPÍTÉSE ==========
+        if rag_context:
+            # Összefoglaló
+            summary = rag_context.get('summary', '')
+            if summary:
+                prompt_parts.append(f"\n## Összefoglaló\n{summary}")
+            
+            # Tények
+            facts = rag_context.get('facts', [])
+            if facts:
+                facts_text = "\n".join([f"• {f}" for f in facts[:3]])
+                prompt_parts.append(f"\n## Ismert tények\n{facts_text}")
+            
+            # Gráf kontextus (kapcsolatok)
+            graph_context = rag_context.get('graph_context', [])
+            if graph_context and isinstance(graph_context, list):
+                if graph_context:
+                    graph_text = "\n".join([f"• {g}" for g in graph_context[:3]])
+                    prompt_parts.append(f"\n## Kapcsolatok\n{graph_text}")
+            
+            # Vektor kontextus (globális tudás)
+            vector_context = rag_context.get('vector_context', [])
+            if vector_context and isinstance(vector_context, list):
+                if vector_context:
+                    vector_text = "\n".join([f"• {v}" for v in vector_context[:2]])
+                    prompt_parts.append(f"\n## Tudás\n{vector_text}")
+            
+            # Érzelmi kontextus
+            emotional = rag_context.get('emotional_context', {})
+            if emotional.get('recent_mood'):
+                mood = emotional['recent_mood']
+                if language == 'hu':
+                    mood_text = {"positive": "pozitív", "negative": "negatív", "neutral": "semleges"}
+                    prompt_parts.append(f"\n## Hangulat\nA beszélgetés hangulata: {mood_text.get(mood, mood)}")
+                else:
+                    prompt_parts.append(f"\n## Mood\nThe conversation mood is: {mood}")
         
         # Csak az aktuális üzenet
-        prompt_parts.append(f"{user_name}: {text}")
+        prompt_parts.append(f"\n{user_name}: {text}")
         prompt_parts.append(f"{self.identity['name']}:")
         
         return "\n".join(prompt_parts)
@@ -511,15 +562,11 @@ class King:
         # Ha van modell és be van töltve
         if self.model and self.state.get('model_loaded'):
             try:
-                # Timeout kezelés
                 import queue
                 result_queue = queue.Queue()
                 
                 def generate_thread():
                     try:
-                        # Csak a ModelWrapper által támogatott paramétereket adjuk át
-                        # A ModelWrapper.generate() a következőket várja:
-                        # prompt, max_tokens, temperature, top_p, top_k, repeat_penalty, stop, stream
                         response = self.model.generate(
                             prompt=prompt,
                             max_tokens=self.generation_params.get('max_tokens', 256),
@@ -577,7 +624,7 @@ class King:
         """Időtúllépés üzenet"""
         if self.translator:
             return self.translator.get('prompts.king.timeout')
-        return "⏳ The King is thinking deeply... please wait."
+        return "⏳ I'm thinking deeply... please wait."
     
     def _get_error_message(self, error: str) -> str:
         """Hibaüzenet"""
@@ -589,12 +636,12 @@ class King:
         """Modell töltés üzenet"""
         if self.translator:
             return self.translator.get('prompts.king.loading')
-        return "🤔 The King is awakening..."
+        return "🤔 I'm awakening..."
     
     def _get_dummy_response(self, prompt: str) -> str:
         """Dummy válasz (ha nincs modell)"""
         prompt_lower = prompt.lower()
-        user_name = self.scratchpad.get_state('user_name', 'User')
+        user_name = self.scratchpad.get_state('user_name', 'user')
         
         if "hello" in prompt_lower or "hi" in prompt_lower or "szia" in prompt_lower:
             if self.translator:
@@ -621,11 +668,15 @@ class King:
         if self.state['errors']:
             base *= max(0.5, 1.0 - (len(self.state['errors']) * 0.1))
         
-        # Ha van Valet kontextus
+        # RAG használat növeli a bizalmat
+        if self.state.get('rag_used'):
+            base += 0.03
+        
+        # Ha van Valet
         if hasattr(self, 'valet') and self.valet is not None:
             base += 0.02
         
-        # Ha van Queen logika
+        # Ha van Queen
         if hasattr(self, 'queen') and self.queen is not None:
             base += 0.03
         
@@ -705,7 +756,8 @@ class King:
             'errors': len(self.state['errors']),
             'model_loaded': self.state['model_loaded'],
             'mood': self._get_current_mood(),
-            'style': self.identity.get('style', 'default')
+            'style': self.identity.get('style', 'default'),
+            'rag_used': self.state.get('rag_used', False)
         }
 
 
@@ -714,7 +766,7 @@ if __name__ == "__main__":
     from scratchpad import Scratchpad
     
     s = Scratchpad()
-    s.set_state('user_name', 'TestUser')
+    s.set_state('user_name', 'user')
     s.write_note('king', 'personality', 'curious, helpful, witty')
     
     king = King(s)
@@ -722,6 +774,21 @@ if __name__ == "__main__":
     # Új metódus tesztelése
     response = king.generate_response("Hello, how are you?")
     print(f"Response: {response}")
+    
+    # Teszt RAG kontextussal
+    rag_context = {
+        'summary': 'User asked about the weather yesterday',
+        'facts': ['Weather was sunny', 'Temperature was 25°C'],
+        'graph_context': ['User likes sunny weather'],
+        'vector_context': ['Climate data shows summer approaching'],
+        'emotional_context': {'recent_mood': 'positive'}
+    }
+    
+    response_with_rag = king.generate_response(
+        "What's the weather like?",
+        rag_context=rag_context
+    )
+    print(f"\nResponse with RAG: {response_with_rag}")
     
     # Régi process metódus tesztelése
     test_intent = {
@@ -736,7 +803,8 @@ if __name__ == "__main__":
                 'target': 'king',
                 'confidence': 0.9
             },
-            'text': 'Hello!'
+            'text': 'Hello!',
+            'rag_context': rag_context
         }
     }
     
