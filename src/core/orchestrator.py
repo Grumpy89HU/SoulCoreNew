@@ -1,31 +1,33 @@
 """
 Orchestrator - A Vár központi idegrendszere.
 
+KOMMUNIKÁCIÓS PROTOKOLL:
+- Az Orchestrator a KERNEL - központi ZMQ_ROUTER
+- Bejövő JSON csomagokat fogad, szétosztja a slotoknak
+- Prioritási sorok kezelése (0: Rendszer-riasztás, 1: Felhasználói parancs, 2: Heartbeat)
+- Backpressure handling (ha tele a sor, "Várj egy pillanatot" üzenet)
+
 Feladata:
-1. Bejövő RawPacket (KVK formátum) fogadása
-2. KVK parsing: "INTENT:GREET|USER:GRUMPY" -> dict
-3. Kontextus összeállítása a modellnek (tiszta szöveg)
-4. Prioritási sorok kezelése (0: Rendszer-riasztás, 1: Felhasználói parancs, 2: Heartbeat)
-5. Backpressure handling (ha tele a sor, "Várj egy pillanatot" üzenet)
-6. Trace ID generálás (UUIDv7)
-7. Válasz fogadása a modelltől és akciók detektálása
-8. Valet kontextus integráció (RAG 2.1)
+1. Bejövő JSON csomagok fogadása
+2. Prioritási sorok kezelése
+3. Broadcast küldése a buszon
+4. Válaszok fogadása a slotoktól
+5. Trace ID generálás (UUIDv7)
 """
 
 import time
 import uuid
-import re
+import threading
+import queue
 from typing import Dict, List, Any, Optional, Tuple
 from collections import deque, defaultdict
 from datetime import datetime
-import threading
-import queue
 
 
 class Orchestrator:
     """
-    Az Orchestrator egy aktív állapotgép.
-    Minden beérkező inger egy életciklust indít el.
+    Az Orchestrator egy aktív állapotgép - a KERNEL.
+    ZMQ_ROUTER szerepben működik, szétosztja az üzeneteket.
     """
     
     # Prioritási szintek
@@ -36,27 +38,14 @@ class Orchestrator:
         'PROACTIVE': 2           # Szintén alacsony
     }
     
-    # KVK separator-ök
-    KVK_PAIR_SEP = '|'
-    KVK_KEY_VALUE_SEP = ':'
-    
-    # Akció detektáló minták (a válasz végén)
-    ACTION_PATTERNS = {
-        'save_note': r'//save$',
-        'delete_note': r'//delete$',
-        'search': r'//search',
-        'execute': r'//run',
-        'no_action': r'.*'
-    }
-    
-    def __init__(self, scratchpad, modules: Dict = None, config: Dict = None):
+    def __init__(self, scratchpad, message_bus, modules: Dict = None, config: Dict = None):
         self.scratchpad = scratchpad
+        self.bus = message_bus
         self.name = "orchestrator"
-        self.modules = modules or {}  # modulok dictionary (king, valet, stb.)
-        self.pending_responses = {}   # trace_id -> response callback vagy Queue
-        self.webapp_callback = None   # opcionális callback a WebApp felé
+        self.modules = modules or {}  # <-- HIÁNYZOTT!
+        self.config = config or {}
         
-        # Prioritási sorok (queue per prioritás)
+        # Prioritási sorok
         self.priority_queues = {
             0: queue.Queue(maxsize=10),   # Rendszer-riasztás
             1: queue.Queue(maxsize=50),   # Felhasználói parancs
@@ -64,28 +53,34 @@ class Orchestrator:
         }
         
         # Aktív trace-ek
-        self.active_traces = {}  # trace_id -> state
-        self.recent_packets = deque(maxlen=100)  # utolsó 100 csomag
+        self.active_traces: Dict[str, Dict] = {}
+        self.recent_packets = deque(maxlen=100)
+        self.lock = threading.RLock()
         
         # Feldolgozó szál
         self.processing_thread = None
         self.running = False
-        self.lock = threading.RLock()
         
-        # Konfiguráció (alapértékek, felülírható)
+        # WebApp callback
+        self.webapp_callback = None
+        
+        # Valet hivatkozás
+        self.valet = None
+        
+        # Konfiguráció
         default_config = {
             'short_term_memory_minutes': 5,
-            'max_context_length': 4096,      # token
+            'max_context_length': 4096,
             'backpressure_message': "Várj egy pillanatot, gondolkodom...",
             'enable_uuidv7': True,
-            'enable_rag': True,               # RAG keresés bekapcsolása
-            'max_history_messages': 10,       # Kontextusba kerülő üzenetek száma
-            'response_timeout': 30,           # Válasz timeout másodpercben
+            'enable_rag': True,
+            'max_history_messages': 10,
+            'response_timeout': 30
         }
         
-        self.config = default_config.copy()
-        if config:
-            self.config.update(config)
+        for key, value in default_config.items():
+            if key not in self.config:
+                self.config[key] = value
         
         # Statisztikák
         self.stats = {
@@ -95,55 +90,296 @@ class Orchestrator:
             'avg_processing_time': 0,
             'queue_sizes': {0: 0, 1: 0, 2: 0},
             'rag_queries': 0,
-            'context_builds': 0
+            'context_builds': 0,
+            'broadcasts': 0
         }
         
-        # Adatbázis hivatkozás (később beállítva)
+        # Adatbázis hivatkozás
         self.db = None
         
-        # Valet hivatkozás (könnyebb elérés)
-        self.valet = self.modules.get('valet')
+        # Feliratkozás a buszra (hogy hallja a válaszokat)
+        if self.bus:
+            self.bus.subscribe(self.name, self._on_message)
         
-        print("⚙️ Orchestrator: Idegrendszer inicializálva.")
+        print("⚙️ Orchestrator: Kernel inicializálva. ZMQ_ROUTER módban.")
     
-    def set_database(self, db):
-        """Adatbázis kapcsolat beállítása"""
-        self.db = db
+    # ========== BUSZ KOMMUNIKÁCIÓ ==========
     
-    def set_valet(self, valet):
-        """Valet modul beállítása"""
-        self.valet = valet
-        if valet:
-            self.modules['valet'] = valet
-    
-    def start(self):
-        """Orchestrator indítása"""
-        self.running = True
-        self.processing_thread = threading.Thread(target=self._processing_loop, daemon=True)
-        self.processing_thread.start()
+    def _on_message(self, message: Dict):
+        """
+        Hallja a buszon érkező üzeneteket.
+        A slotok válaszait dolgozza fel.
+        """
+        header = message.get('header', {})
+        payload = message.get('payload', {})
         
-        self.scratchpad.set_state('orchestrator_status', 'ready', self.name)
-        print("⚙️ Orchestrator: Éber és figyel.")
-    
-    def set_webapp_callback(self, callback):
-        """Beállítja a WebApp felé küldendő válasz callbacket."""
-        self.webapp_callback = callback
-    
-    def stop(self):
-        """Orchestrator leállítása"""
-        self.running = False
-        if self.processing_thread:
-            self.processing_thread.join(timeout=2.0)
+        # Válasz a King-től
+        if header.get('sender') == 'king' and payload.get('type') == 'king_response':
+            trace_id = header.get('in_response_to', '')
+            if trace_id and trace_id in self.active_traces:
+                self._handle_king_response(trace_id, payload)
         
-        self.scratchpad.set_state('orchestrator_status', 'stopped', self.name)
-        print("⚙️ Orchestrator: Leállt.")
+        # Válasz a Valet-től
+        elif header.get('sender') == 'valet' and payload.get('type') == 'context_response':
+            trace_id = header.get('in_response_to', '')
+            if trace_id and trace_id in self.active_traces:
+                self.active_traces[trace_id]['rag_context'] = payload.get('context', {})
+        
+        # Válasz a Queen-től
+        elif header.get('sender') == 'queen' and payload.get('type') == 'logic_response':
+            trace_id = header.get('in_response_to', '')
+            if trace_id and trace_id in self.active_traces:
+                self.active_traces[trace_id]['logic'] = payload.get('logic', {})
+        
+        # Válasz a Jester-től
+        elif header.get('sender') == 'jester' and payload.get('type') == 'jester_report':
+            trace_id = header.get('in_response_to', '')
+            if trace_id and trace_id in self.active_traces:
+                self.active_traces[trace_id]['jester_observation'] = payload
     
-    # ========== BEJÖVŐ CSOMAGOK FELDOLGOZÁSA ==========
+    def _handle_king_response(self, trace_id: str, payload: Dict):
+        """King válaszának feldolgozása"""
+        response_text = payload.get('response', '')
+        conversation_id = self.active_traces[trace_id].get('conversation_id')
+        
+        # Válasz mentése adatbázisba
+        if self.db and response_text and conversation_id:
+            try:
+                self.db.add_message(conversation_id, "assistant", response_text)
+            except Exception as e:
+                print(f"⚠️ Orchestrator: Válasz mentési hiba: {e}")
+        
+        # WebApp callback
+        if self.webapp_callback:
+            self.webapp_callback(response_text, conversation_id, trace_id)
+        
+        # Állapot frissítés
+        with self.lock:
+            if trace_id in self.active_traces:
+                self.active_traces[trace_id]['status'] = 'completed'
+                self.active_traces[trace_id]['response'] = response_text
+        
+        print(f"⚙️ Orchestrator: Válasz elküldve a WebApp-nek ({trace_id[:8]})")
+    
+    # ========== FŐ BELÉPÉSI PONT (WEBBŐL) ==========
+    
+    def process_user_message(self, text: str, conversation_id: int, user_id: int = None) -> dict:
+        """
+        Egyszerű belépési pont a WebApp számára.
+        Közvetlenül hívja a King-et (bus nélkül a hibaelhárításhoz).
+        """
+        trace_id = self._generate_uuidv7()
+        
+        # 1. Felhasználói üzenet mentése
+        if self.db:
+            try:
+                self.db.add_message(conversation_id, "user", text)
+            except Exception as e:
+                print(f"⚠️ Orchestrator: Üzenet mentési hiba: {e}")
+        
+        # 2. Beszélgetés előzmények lekérése
+        conversation_history = []
+        if self.db:
+            try:
+                messages = self.db.get_messages(conversation_id, limit=self.config.get('max_history_messages', 10))
+                conversation_history = [
+                    {"role": m.get("role", "user"), "content": m.get("content", "")}
+                    for m in messages
+                ]
+            except Exception as e:
+                print(f"⚠️ Orchestrator: Előzmények lekérési hiba: {e}")
+        
+        # 3. King közvetlen hívása
+        king = self.modules.get("king") if self.modules else None
+        if not king:
+            error_msg = "King module not available"
+            print(f"❌ Orchestrator: {error_msg}")
+            if self.webapp_callback:
+                self.webapp_callback(error_msg, conversation_id, trace_id)
+            return {"response": error_msg, "trace_id": trace_id}
+        
+        try:
+            print(f"👑 Orchestrator: King hívása: '{text[:50]}...' (conv: {conversation_id})")
+            
+            # King válasz generálása
+            response = king.generate_response(
+                user_text=text,
+                trace_id=trace_id,
+                conversation_id=conversation_id,
+                conversation_history=conversation_history,
+                rag_context={}  # RAG kontextus később
+            )
+            
+            print(f"✅ Orchestrator: King válaszolt: {response[:50]}...")
+            
+            # Válasz mentése
+            if self.db and response:
+                try:
+                    self.db.add_message(conversation_id, "assistant", response)
+                except Exception as e:
+                    print(f"⚠️ Orchestrator: Válasz mentési hiba: {e}")
+            
+            # WebApp callback
+            if self.webapp_callback:
+                self.webapp_callback(response, conversation_id, trace_id)
+            
+            # Valet tracking (ha van)
+            if self.valet:
+                try:
+                    intent_packet = {
+                        'payload': {
+                            'text': text,
+                            'intent': {'class': 'USER_MESSAGE'},
+                            'entities': []
+                        }
+                    }
+                    self.valet.track_message(intent_packet)
+                except Exception as e:
+                    print(f"⚠️ Orchestrator: Valet tracking hiba: {e}")
+            
+            return {"response": response, "trace_id": trace_id}
+            
+        except Exception as e:
+            print(f"❌ Orchestrator: King hiba: {e}")
+            import traceback
+            traceback.print_exc()
+            error_response = f"Hiba a válaszadás közben: {e}"
+            if self.webapp_callback:
+                self.webapp_callback(error_response, conversation_id, trace_id)
+            return {"response": error_response, "trace_id": trace_id, "error": str(e)}
+    
+    def _create_royal_decree(self, trace_id: str, text: str, conversation_history: List) -> Dict:
+        """
+        Királyi rendelet összeállítása - ezt hallja minden slot.
+        """
+        # Intent és entities meghatározása (egyszerű heurisztika)
+        intent_class = self._detect_intent(text)
+        
+        return {
+            "header": {
+                "trace_id": trace_id,
+                "timestamp": time.time(),
+                "version": "3.0",
+                "sender": self.name,
+                "target": "kernel",
+                "broadcast": True
+            },
+            "payload": {
+                "type": "royal_decree",
+                "user_message": text,
+                "interpretation": {
+                    "intent": {"class": intent_class, "confidence": 0.8},
+                    "entities": self._extract_entities(text),
+                    "language": self._detect_language(text)
+                },
+                "conversation_history": conversation_history,
+                "order": "prepare_context",
+                "required_agents": self._determine_required_agents(intent_class),
+                "optional_agents": ["jester"]
+            },
+            "telemetry": {
+                "source": "webapp",
+                "conversation_id": self.active_traces.get(trace_id, {}).get('conversation_id')
+            }
+        }
+    
+    def _detect_intent(self, text: str) -> str:
+        """Egyszerű intent detektálás (alapértelmezett)"""
+        text_lower = text.lower()
+        
+        if any(word in text_lower for word in ['hello', 'hi', 'szia', 'jó reggelt']):
+            return 'greeting'
+        elif any(word in text_lower for word in ['bye', 'viszlát', 'később']):
+            return 'farewell'
+        elif '?' in text or any(word in text_lower for word in ['mi', 'ki', 'hol', 'mikor', 'hogyan']):
+            return 'question'
+        elif any(word in text_lower for word in ['csinálj', 'írj', 'mutasd', 'add', 'create', 'write']):
+            return 'command'
+        elif any(word in text_lower for word in ['kösz', 'thank', 'köszi']):
+            return 'gratitude'
+        
+        return 'unknown'
+    
+    def _extract_entities(self, text: str) -> List[Dict]:
+        """Egyszerű entitás kinyerés"""
+        entities = []
+        
+        # Egyszerű minták
+        patterns = [
+            (r'\b\d{4}[-/]\d{1,2}[-/]\d{1,2}\b', 'DATE'),
+            (r'\b\d{1,2}[:.]\d{2}\b', 'TIME'),
+            (r'\b[\w\-]+\.\w+\b', 'FILE'),
+            (r'\bhttps?://[^\s]+\b', 'URL'),
+            (r'[\w\.-]+@[\w\.-]+\.\w+', 'EMAIL')
+        ]
+        
+        import re
+        for pattern, etype in patterns:
+            matches = re.findall(pattern, text)
+            for match in matches:
+                entities.append({'type': etype, 'value': match, 'confidence': 0.7})
+        
+        return entities
+    
+    def _detect_language(self, text: str) -> str:
+        """Egyszerű nyelvdetektálás"""
+        for char in text:
+            code = ord(char)
+            if 0x4E00 <= code <= 0x9FFF or 0x3040 <= code <= 0x30FF or 0xAC00 <= code <= 0xD7AF:
+                return 'cjk'
+            if 0x0400 <= code <= 0x04FF:
+                return 'cyrillic'
+        
+        # Magyar karakterek ellenőrzése
+        hungarian_chars = ['á', 'é', 'í', 'ó', 'ö', 'ő', 'ú', 'ü', 'ű']
+        if any(c in text.lower() for c in hungarian_chars):
+            return 'hu'
+        
+        return 'en'
+    
+    def _determine_required_agents(self, intent_class: str) -> List[str]:
+        """Meghatározza, kikre van szükség"""
+        required = ['scribe', 'king']
+        
+        if intent_class in ['question', 'command', 'knowledge']:
+            required.append('valet')
+        
+        if intent_class == 'knowledge':
+            required.append('queen')
+        
+        return required
+    
+    def _wait_for_response(self, trace_id: str, timeout: float = 30.0):
+        """Vár a King válaszára (timeout-tal)"""
+        start_time = time.time()
+        
+        while time.time() - start_time < timeout:
+            with self.lock:
+                if trace_id in self.active_traces:
+                    if self.active_traces[trace_id].get('status') == 'completed':
+                        return
+            
+            time.sleep(0.1)
+        
+        # Timeout esetén
+        print(f"⚠️ Orchestrator: Timeout a válaszra ({trace_id[:8]})")
+        with self.lock:
+            if trace_id in self.active_traces:
+                self.active_traces[trace_id]['status'] = 'timeout'
+        
+        if self.webapp_callback:
+            self.webapp_callback(
+                self.config['backpressure_message'],
+                self.active_traces.get(trace_id, {}).get('conversation_id'),
+                trace_id
+            )
+    
+    # ========== BEJÖVŐ CSOMAGOK FELDOLGOZÁSA (KVK kompatibilitás) ==========
     
     def process_raw_packet(self, raw_packet: str, priority: int = 1) -> Optional[Dict]:
         """
-        Fő belépési pont.
-        raw_packet formátum: "INTENT:GREET|USER:user|TIME:MORNING"
+        Régi KVK formátumú csomagok feldolgozása (kompatibilitás).
+        Átalakítja JSON formátumba és broadcast-olja.
         """
         start_time = time.time()
         
@@ -165,14 +401,14 @@ class Orchestrator:
         else:
             priority = self.PRIORITY['USER_COMMAND']
         
-        # 3. Trace ID generálás (UUIDv7)
+        # 3. Trace ID
         if 'TRACE' not in packet_dict:
             trace_id = self._generate_uuidv7()
             packet_dict['TRACE'] = trace_id
         else:
             trace_id = packet_dict['TRACE']
         
-        # 4. Sorba helyezés prioritás alapján
+        # 4. Sorba helyezés
         try:
             self.priority_queues[priority].put({
                 'packet': packet_dict,
@@ -190,11 +426,24 @@ class Orchestrator:
             self.stats['packets_dropped'] += 1
             return None
         
-        # 5. Naplózás
-        self.scratchpad.write(self.name, 
-            {'trace_id': trace_id, 'intent': packet_dict.get('INTENT'), 'priority': priority},
-            'packet_queued'
-        )
+        # 5. Feldolgozás indítása
+        self._process_item({
+            'packet': packet_dict,
+            'trace_id': trace_id,
+            'timestamp': time.time(),
+            'priority': priority,
+            'raw': raw_packet
+        })
+        
+        processing_time = time.time() - start_time
+        self.stats['packets_processed'] += 1
+        
+        if self.stats['avg_processing_time'] == 0:
+            self.stats['avg_processing_time'] = processing_time
+        else:
+            self.stats['avg_processing_time'] = (
+                self.stats['avg_processing_time'] * 0.9 + processing_time * 0.1
+            )
         
         return {'trace_id': trace_id, 'status': 'queued', 'priority': priority}
     
@@ -205,14 +454,14 @@ class Orchestrator:
         if not raw or not isinstance(raw, str):
             return result
         
-        pairs = raw.split(self.KVK_PAIR_SEP)
+        pairs = raw.split('|')
         
         for pair in pairs:
             if not pair:
                 continue
             
-            if self.KVK_KEY_VALUE_SEP in pair:
-                key, value = pair.split(self.KVK_KEY_VALUE_SEP, 1)
+            if ':' in pair:
+                key, value = pair.split(':', 1)
                 key = key.strip().upper()
                 value = value.strip()
                 if key and value:
@@ -220,8 +469,72 @@ class Orchestrator:
         
         return result
     
+    def _process_item(self, item: Dict):
+        """Egy feldolgozási elem feldolgozása"""
+        packet = item['packet']
+        trace_id = item['trace_id']
+        
+        # Aktív trace-ek közé felvétel
+        with self.lock:
+            self.active_traces[trace_id] = {
+                'trace_id': trace_id,
+                'packet': packet,
+                'timestamp': time.time(),
+                'priority': item['priority'],
+                'status': 'processing'
+            }
+            self.recent_packets.append({
+                'time': time.time(),
+                'trace_id': trace_id,
+                'packet': packet,
+                'priority': item['priority']
+            })
+        
+        # JSON csomaggá alakítás és broadcast
+        decree = self._kvk_to_decree(packet, trace_id)
+        if self.bus:
+            self.bus.broadcast(decree)
+        self.stats['broadcasts'] += 1
+    
+    def _kvk_to_decree(self, packet: Dict, trace_id: str) -> Dict:
+        """KVK csomag átalakítása royal_decree-vé"""
+        intent = packet.get('INTENT', 'unknown')
+        user = packet.get('USER', '')
+        message = packet.get('MESSAGE', '')
+        
+        return {
+            "header": {
+                "trace_id": trace_id,
+                "timestamp": time.time(),
+                "sender": self.name,
+                "target": "kernel",
+                "broadcast": True
+            },
+            "payload": {
+                "type": "royal_decree",
+                "user_message": message or user,
+                "interpretation": {
+                    "intent": {"class": intent.lower(), "confidence": 0.8},
+                    "entities": [],
+                    "language": "en"
+                },
+                "order": "prepare_context",
+                "required_agents": self._determine_required_agents(intent.lower())
+            }
+        }
+    
+    def _handle_backpressure(self, priority: int):
+        """Backpressure kezelés"""
+        print(f"⚙️ Backpressure: {priority} prioritású sor tele")
+        self.scratchpad.write(self.name, 
+            {'message': self.config['backpressure_message'], 'priority': priority},
+            'backpressure'
+        )
+    
+    # ========== SEGÉDFÜGGVÉNYEK ==========
+    
     def _generate_uuidv7(self) -> str:
-        """UUIDv7 generálás (időbeli sorrendet is kódol)"""
+        """UUIDv7 generálás"""
         if self.config['enable_uuidv7']:
             timestamp = int(time.time() * 1000)
             random_part = uuid.uuid4().hex[:8]
@@ -229,19 +542,42 @@ class Orchestrator:
         else:
             return str(uuid.uuid4())
     
-    def _handle_backpressure(self, priority: int):
-        """Backpressure kezelés: ha tele a sor, küldünk egy "várj" üzenetet."""
-        print(f"⚙️ Backpressure: {priority} prioritású sor tele")
-        
-        self.scratchpad.write(self.name, 
-            {'message': self.config['backpressure_message'], 'priority': priority},
-            'backpressure'
-        )
+    # ========== ADATBÁZIS ÉS CALLBACK BEÁLLÍTÁS ==========
     
-    # ========== FELDOLGOZÓ CIKLUS ==========
+    def set_database(self, db):
+        """Adatbázis kapcsolat beállítása"""
+        self.db = db
+    
+    def set_webapp_callback(self, callback):
+        """WebApp callback beállítása"""
+        self.webapp_callback = callback
+    
+    def set_valet(self, valet):
+        """Valet modul beállítása"""
+        self.valet = valet
+    
+    # ========== INDIÍTÁS ÉS LEÁLLÍTÁS ==========
+    
+    def start(self):
+        """Orchestrator indítása"""
+        self.running = True
+        self.processing_thread = threading.Thread(target=self._processing_loop, daemon=True)
+        self.processing_thread.start()
+        
+        self.scratchpad.set_state('orchestrator_status', 'ready', self.name)
+        print("⚙️ Orchestrator: Éber és figyel. ZMQ_ROUTER módban.")
+    
+    def stop(self):
+        """Orchestrator leállítása"""
+        self.running = False
+        if self.processing_thread:
+            self.processing_thread.join(timeout=2.0)
+        
+        self.scratchpad.set_state('orchestrator_status', 'stopped', self.name)
+        print("⚙️ Orchestrator: Leállt.")
     
     def _processing_loop(self):
-        """Fő feldolgozó ciklus - prioritási sorokból dolgozik."""
+        """Feldolgozó ciklus"""
         while self.running:
             try:
                 for priority in [0, 1, 2]:
@@ -258,314 +594,14 @@ class Orchestrator:
             except Exception as e:
                 print(f"⚙️ Feldolgozási hiba: {e}")
     
-    def _process_item(self, item: Dict):
-        """Egy feldolgozási elem feldolgozása."""
-        start_time = time.time()
-        packet = item['packet']
-        trace_id = item['trace_id']
-        
-        # 1. Context Injection - rövid távú memória lekérése
-        short_term = self._get_short_term_context()
-        
-        # 2. Teljes állapot összeállítása
-        state = {
-            'trace_id': trace_id,
-            'packet': packet,
-            'short_term': short_term,
-            'timestamp': time.time(),
-            'priority': item['priority'],
-            'status': 'processing'
-        }
-        
-        # 3. Aktív trace-ek közé felvétel
-        with self.lock:
-            self.active_traces[trace_id] = state
-            self.recent_packets.append({
-                'time': time.time(),
-                'trace_id': trace_id,
-                'packet': packet,
-                'priority': item['priority']
-            })
-        
-        self.scratchpad.write(self.name, 
-            {'trace_id': trace_id, 'intent': packet.get('INTENT')},
-            'packet_processing'
-        )
-        
-        processing_time = time.time() - start_time
-        self.stats['packets_processed'] += 1
-        
-        if self.stats['avg_processing_time'] == 0:
-            self.stats['avg_processing_time'] = processing_time
-        else:
-            self.stats['avg_processing_time'] = (
-                self.stats['avg_processing_time'] * 0.9 + processing_time * 0.1
-            )
-        
-        with self.lock:
-            if trace_id in self.active_traces:
-                self.active_traces[trace_id]['status'] = 'processed'
-    
-    def _get_short_term_context(self) -> Dict:
-        """Rövid távú kontextus lekérése."""
-        five_minutes_ago = time.time() - (self.config['short_term_memory_minutes'] * 60)
-        
-        recent = [
-            p for p in self.recent_packets 
-            if p['time'] > five_minutes_ago
-        ]
-        
-        king_state = self.scratchpad.read_note('king', 'state', {})
-        jester_state = self.scratchpad.read_note('jester', 'state', {})
-        
-        return {
-            'recent_packets_count': len(recent),
-            'recent_intents': [p['packet'].get('INTENT') for p in recent if p['packet'].get('INTENT')],
-            'recent_priorities': [p.get('priority') for p in recent],
-            'king_status': king_state.get('status', 'unknown'),
-            'jester_warnings': len(jester_state.get('warnings', [])) if jester_state else 0,
-            'uptime': time.time() - self.scratchpad.get_state('start_time', time.time())
-        }
-    
-    # ========== MODELL BEMENET ÖSSZEÁLLÍTÁSA ==========
-    
-    def build_model_input(self, state: Dict, rag_context: Dict = None) -> str:
-        """
-        KVK állapotból tiszta szöveges bemenet készítése a modellnek.
-        RAG kontextussal bővítve (ha van).
-        """
-        packet = state.get('packet', {})
-        intent = packet.get('INTENT', 'UNKNOWN')
-        user = packet.get('USER', self.scratchpad.get_state('user_name', 'user'))
-        message = packet.get('MESSAGE', '')
-        
-        # Idő kontextus
-        hour = time.localtime().tm_hour
-        if hour < 6:
-            time_of_day = "éjszaka"
-        elif hour < 12:
-            time_of_day = "reggel"
-        elif hour < 18:
-            time_of_day = "délután"
-        else:
-            time_of_day = "este"
-        
-        # Rövid távú memória összefoglaló
-        short = state.get('short_term', {})
-        recent_intents = short.get('recent_intents', [])
-        recent_summary = ""
-        if recent_intents:
-            recent_summary = f"Az utóbbi időben ezekről beszéltetek: {', '.join(recent_intents[-3:])}."
-        
-        # RAG kontextus beillesztése (ha van)
-        rag_section = ""
-        if rag_context and self.config['enable_rag']:
-            rag_parts = []
-            
-            if rag_context.get('graph_context'):
-                rag_parts.append(f"## Kapcsolatok\n{rag_context['graph_context']}")
-            
-            if rag_context.get('vector_context'):
-                rag_parts.append(f"## Ismert tények\n{rag_context['vector_context']}")
-            
-            if rag_context.get('emotional_context', {}).get('recent_mood'):
-                mood = rag_context['emotional_context']['recent_mood']
-                rag_parts.append(f"## Hangulat\nAz előző beszélgetések alapján a hangulat: {mood}")
-            
-            if rag_parts:
-                rag_section = "\n".join(rag_parts) + "\n\n"
-                self.stats['rag_queries'] += 1
-        
-        # Bemenet összeállítása
-        model_input = f"""{rag_section}Idő: {time_of_day}.
-Felhasználó: {user}.
-Szándék: {intent}.
-{recent_summary}
-
-{user}: {message}
-
-Válaszod:"""
-        
-        # Token limit ellenőrzés
-        estimated_tokens = len(model_input.split())
-        if estimated_tokens > self.config['max_context_length']:
-            model_input = model_input[:self.config['max_context_length'] * 4] + "..."
-        
-        return model_input.strip()
-    
-    # ========== MODELL VÁLASZ FELDOLGOZÁSA ==========
-    
-    def process_model_response(self, trace_id: str, response: str) -> Dict:
-        """Modell válaszának feldolgozása."""
-        state = self.active_traces.get(trace_id)
-        if not state:
-            return {'ERROR': f'Unknown trace_id: {trace_id}'}
-        
-        action, clean_response = self._detect_action(response)
-        
-        result_packet = {
-            'TRACE': trace_id,
-            'RESPONSE': clean_response,
-            'ACTION': action if action != 'no_action' else 'NONE',
-            'STATUS': 'success'
-        }
-        
-        with self.lock:
-            state['status'] = 'completed'
-            state['response'] = clean_response
-            state['action'] = action
-        
-        self.scratchpad.write(self.name, 
-            {'trace_id': trace_id, 'action': action, 'response_length': len(clean_response)},
-            'response_processed'
-        )
-        
-        return result_packet
-    
-    def _detect_action(self, response: str) -> Tuple[str, str]:
-        """Akció detektálás a válasz végén."""
-        response = response.strip()
-        
-        for action, pattern in self.ACTION_PATTERNS.items():
-            if re.search(pattern, response):
-                if action != 'no_action':
-                    clean = re.sub(pattern, '', response).strip()
-                    return action, clean
-                break
-        
-        return 'no_action', response
-    
-    # ========== WEBBEL KAPCSOLATOS METÓDUS (FŐ BELÉPÉSI PONT) ==========
-    
-    def process_user_message(self, text: str, conversation_id: int, user_id: int = None) -> dict:
-        """
-        Egyszerű belépési pont a WebApp számára.
-        Létrehoz egy kérést, összeállítja a kontextust a Valet segítségével,
-        és elindítja a King feldolgozást.
-        """
-        trace_id = self._generate_uuidv7()
-        
-        # 1. Felhasználói üzenet mentése
-        if self.db:
-            try:
-                self.db.add_message(conversation_id, "user", text)
-            except Exception as e:
-                print(f"⚠️ Orchestrator: Üzenet mentési hiba: {e}")
-        
-        # 2. Belső csomag összeállítása
-        packet = {
-            "header": {
-                "trace_id": trace_id,
-                "timestamp": time.time(),
-                "version": "3.0",
-                "sender": "webapp"
-            },
-            "payload": {
-                "intent": {"class": "USER_MESSAGE", "confidence": 1.0},
-                "entities": [{"type": "TEXT", "value": text}],
-                "raw_text": text,
-                "conversation_id": conversation_id
-            }
-        }
-        
-        # 3. Beszélgetés előzmények lekérése
-        conversation_history = []
-        if self.db:
-            try:
-                messages = self.db.get_messages(conversation_id, limit=self.config['max_history_messages'])
-                conversation_history = [
-                    {"role": m.get("role", "user"), "content": m.get("content", "")}
-                    for m in messages
-                ]
-            except Exception as e:
-                print(f"⚠️ Orchestrator: Előzmények lekérési hiba: {e}")
-        
-        # 4. RAG kontextus lekérése a Valet-től
-        rag_context = {}
-        if self.valet and self.config['enable_rag']:
-            try:
-                context_result = self.valet.prepare_context(packet)
-                rag_context = {
-                    'graph_context': context_result.get('graph_context', []),
-                    'vector_context': context_result.get('vector_context', []),
-                    'emotional_context': context_result.get('emotional_context', {}),
-                    'summary': context_result.get('summary', ''),
-                    'facts': context_result.get('facts', [])
-                }
-                self.stats['context_builds'] += 1
-            except Exception as e:
-                print(f"⚠️ Orchestrator: Valet kontextus hiba: {e}")
-        
-        # 5. King hívása a kontextussal
-        king = self.modules.get("king")
-        
-        if king:
-            try:
-                # King generálás (átadjuk a kontextust is)
-                response = king.generate_response(
-                    user_text=text,
-                    trace_id=trace_id,
-                    conversation_id=conversation_id,
-                    conversation_history=conversation_history,
-                    rag_context=rag_context
-                )
-                
-                print(f"👑 Orchestrator: King válaszolt: {response[:50]}...")
-                
-                # Válasz mentése
-                if self.db and response:
-                    try:
-                        self.db.add_message(conversation_id, "assistant", response)
-                    except Exception as e:
-                        print(f"⚠️ Orchestrator: Válasz mentési hiba: {e}")
-                
-                # WebApp callback
-                if self.webapp_callback:
-                    self.webapp_callback(response, conversation_id, trace_id)
-                
-                # Valet tracking frissítés (ha van)
-                if self.valet:
-                    try:
-                        self.valet.track_message(packet)
-                    except Exception as e:
-                        print(f"⚠️ Orchestrator: Valet tracking hiba: {e}")
-                
-                return {"response": response, "trace_id": trace_id}
-                
-            except Exception as e:
-                print(f"❌ Orchestrator: King hiba: {e}")
-                error_response = f"Hiba a válaszadás közben: {e}"
-                if self.webapp_callback:
-                    self.webapp_callback(error_response, conversation_id, trace_id)
-                return {"response": error_response, "trace_id": trace_id, "error": str(e)}
-        
-        error_msg = "A modell nem elérhető."
-        print(f"❌ Orchestrator: {error_msg}")
-        if self.webapp_callback:
-            self.webapp_callback(error_msg, conversation_id, trace_id)
-        return {"response": error_msg, "trace_id": trace_id}
-    
-    # ========== KVK CSOMAG KÉSZÍTÉS ==========
-    
-    def build_kvk_packet(self, data: Dict) -> str:
-        """Dict -> KVK string"""
-        pairs = []
-        for key, value in data.items():
-            if value is not None and value != '':
-                key = str(key).strip().upper()
-                value = str(value).strip()
-                pairs.append(f"{key}{self.KVK_KEY_VALUE_SEP}{value}")
-        
-        return self.KVK_PAIR_SEP.join(pairs)
-    
     # ========== LEKÉRDEZÉSEK ==========
     
     def get_active_traces(self) -> Dict:
-        """Aktív trace-ek listája (admin felületnek)"""
+        """Aktív trace-ek listája"""
         with self.lock:
             return {
                 trace_id: {
-                    'intent': state['packet'].get('INTENT'),
+                    'intent': state.get('packet', {}).get('INTENT', state.get('user_text', '')[:30]),
                     'age': time.time() - state['timestamp'],
                     'status': state['status'],
                     'priority': state.get('priority', 1)
@@ -585,7 +621,8 @@ Válaszod:"""
                 'active_traces': len([s for s in self.active_traces.values() if s['status'] != 'completed']),
                 'queue_sizes': self.stats['queue_sizes'],
                 'rag_queries': self.stats['rag_queries'],
-                'context_builds': self.stats['context_builds']
+                'context_builds': self.stats['context_builds'],
+                'broadcasts': self.stats['broadcasts']
             }
     
     def cleanup_old_traces(self, max_age_seconds: int = 3600):
@@ -605,15 +642,18 @@ Válaszod:"""
 # Teszt
 if __name__ == "__main__":
     from scratchpad import Scratchpad
+    from src.bus.message_bus import MessageBus
     
     s = Scratchpad()
-    s.set_state('start_time', time.time())
-    s.set_state('user_name', 'user')
+    bus = MessageBus()
+    bus.start()
     
-    orch = Orchestrator(s)
+    orch = Orchestrator(s, bus)
+    orch.start()
+    
+    print("\n--- Orchestrator teszt ---")
     
     # Teszt KVK parsing
-    print("--- KVK parsing teszt ---")
     test_packets = [
         "INTENT:GREET|USER:user",
         "INTENT:QUESTION|USER:user|MESSAGE:Mi a helyzet?",
@@ -622,10 +662,13 @@ if __name__ == "__main__":
     ]
     
     for p in test_packets:
-        print(f"\nBemenet: {p}")
+        print(f"\n📥 Bemenet: {p}")
         result = orch.process_raw_packet(p)
         if result:
-            print(f"Trace ID: {result['trace_id']}")
-            print(f"Prioritás: {result['priority']}")
+            print(f"   Trace ID: {result['trace_id']}")
+            print(f"   Prioritás: {result['priority']}")
     
-    print(f"\nStatisztikák: {orch.get_stats()}")
+    print(f"\n📊 Statisztikák: {orch.get_stats()}")
+    
+    orch.stop()
+    bus.stop()

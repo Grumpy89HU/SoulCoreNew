@@ -6,7 +6,10 @@
         "farewell": "Goodbye {user}!",
         "thinking": "Let me think about that...",
         "dont_know": "I don't know the answer to that.",
-        "error": "Sorry, I encountered an error: {error}"
+        "error": "Sorry, I encountered an error: {error}",
+		"timeout": "⏳ I'm thinking... please wait.",
+		"loading": "🤔 I'm awakening...",
+		"acknowledge": "I understand."
     },
     "queen": {
         "system": "You are the Queen, the logical layer.",

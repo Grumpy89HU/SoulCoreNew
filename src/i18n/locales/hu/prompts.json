@@ -4,9 +4,12 @@
         "personality": "Személyiséged: {personality}",
         "greeting": "Szia {user}! Hogy vagy?",
         "farewell": "Viszlát {user}!",
-        "thinking": "Gondolkodom ezen...",
+        "thinking": "Hadd gondolkodjak ezen...",
         "dont_know": "Nem tudom a választ.",
-        "error": "Sajnálom, hiba történt: {error}"
+        "error": "Sajnálom, hiba történt: {error}",
+		"timeout": "⏳ Gondolkodom... egy pillanat türelmet.",
+		"loading": "🤔 Ébredek...",
+		"acknowledge": "Értem."
     },
     "queen": {
         "system": "Te vagy a Királynő, a logikai réteg.",

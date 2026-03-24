@@ -8,6 +8,7 @@ import time
 import json
 import uuid
 import hashlib
+import threading
 import traceback
 from datetime import datetime, timedelta
 from functools import wraps
@@ -37,9 +38,11 @@ def hash_password(password: str) -> str:
         100000
     ).hex()
 
+
 def verify_password(password: str, hashed: str) -> bool:
     """Jelszó ellenőrzése"""
     return hash_password(password) == hashed
+
 
 # ----------------------------------------------------------------------
 # FŐ WEBAPP OSZTÁLY
@@ -113,8 +116,9 @@ class WebApp:
         # Aktív session-ök (socket kapcsolatok)
         self.sessions = {}
         
-        # Szál
+        # Szálak
         self.thread = None
+        self.telemetry_thread = None
         self.running = False
         
         # FEJLESZTŐI MÓD
@@ -150,6 +154,10 @@ class WebApp:
             "gateways": []
         }
         
+        # Telemetria cache
+        self.last_telemetry = {}
+        self.telemetry_clients = set()
+        
         # Útvonalak regisztrálása
         self._register_routes()
         
@@ -157,6 +165,120 @@ class WebApp:
         self._register_socket_events()
         
         print(f"🌐 WebApp inicializálva (system_id: {self.system_id})")
+    
+    # ----------------------------------------------------------------------
+    # TELEMETRIA
+    # ----------------------------------------------------------------------
+    
+    def _collect_telemetry(self) -> Dict:
+        """Telemetria adatok összegyűjtése"""
+        data = {
+            "timestamp": time.time(),
+            "gpu": [],
+            "king": {},
+            "orchestrator": {},
+            "heartbeat": {},
+            "system": {
+                "clients": len(self.sessions),
+                "uptime": time.time() - self.last_telemetry.get("start_time", time.time())
+            }
+        }
+        
+        # GPU adatok (Sentinel)
+        sentinel = self.modules.get("sentinel")
+        if sentinel:
+            try:
+                if hasattr(sentinel, 'get_gpu_status'):
+                    data["gpu"] = sentinel.get_gpu_status()
+                elif hasattr(sentinel, 'get_state'):
+                    state = sentinel.get_state()
+                    data["gpu"] = state.get("gpus", [])
+            except Exception as e:
+                print(f"⚠️ Telemetria: Sentinel hiba: {e}")
+        
+        # King állapot
+        king = self.modules.get("king")
+        if king:
+            try:
+                if hasattr(king, 'get_state'):
+                    state = king.get_state()
+                    data["king"] = {
+                        "status": state.get("status", "unknown"),
+                        "response_count": state.get("response_count", 0),
+                        "average_response_time": state.get("average_response_time", 0),
+                        "model_loaded": state.get("model_loaded", False),
+                        "last_mood": state.get("last_mood", "neutral"),
+                        "temperature": state.get("temperature", 0.7)
+                    }
+                elif hasattr(king, 'get_metrics'):
+                    metrics = king.get_metrics()
+                    data["king"] = metrics
+            except Exception as e:
+                print(f"⚠️ Telemetria: King hiba: {e}")
+        
+        # Orchestrator statisztikák
+        orch = self.modules.get("orchestrator")
+        if orch:
+            try:
+                if hasattr(orch, 'get_stats'):
+                    data["orchestrator"] = orch.get_stats()
+                elif hasattr(orch, 'stats'):
+                    data["orchestrator"] = orch.stats
+            except Exception as e:
+                print(f"⚠️ Telemetria: Orchestrator hiba: {e}")
+        
+        # Heartbeat adatok
+        hb = self.modules.get("heartbeat")
+        if hb:
+            try:
+                if hasattr(hb, 'get_state'):
+                    data["heartbeat"] = hb.get_state()
+                elif hasattr(hb, 'state'):
+                    data["heartbeat"] = hb.state
+            except Exception as e:
+                print(f"⚠️ Telemetria: Heartbeat hiba: {e}")
+        
+        # Jester diagnózis
+        jester = self.modules.get("jester")
+        if jester:
+            try:
+                if hasattr(jester, 'get_diagnosis'):
+                    diag = jester.get_diagnosis()
+                    data["jester"] = {
+                        "king_mood": diag.get("king_mood", "neutral"),
+                        "warnings": len(diag.get("current_issues", [])),
+                        "interventions": diag.get("stats", {}).get("interventions", 0)
+                    }
+            except Exception as e:
+                pass
+        
+        return data
+    
+    def _telemetry_loop(self):
+        """Telemetria adatok küldése a feliratkozott klienseknek"""
+        self.last_telemetry["start_time"] = time.time()
+        
+        while self.running:
+            try:
+                time.sleep(2)  # 2 másodpercenként
+                
+                # Telemetria adatok összegyűjtése
+                telemetry_data = self._collect_telemetry()
+                self.last_telemetry = telemetry_data
+                
+                # Küldés a feliratkozott klienseknek
+                for client_id in list(self.telemetry_clients):
+                    try:
+                        self.socketio.emit("telemetry_update", telemetry_data, room=client_id)
+                    except Exception as e:
+                        print(f"⚠️ Telemetria küldési hiba {client_id}: {e}")
+                        # Ha hiba van, eltávolítjuk a klienst
+                        if client_id in self.telemetry_clients:
+                            self.telemetry_clients.remove(client_id)
+                            
+            except Exception as e:
+                print(f"⚠️ Telemetria ciklus hiba: {e}")
+                time.sleep(5)
     
     # ----------------------------------------------------------------------
     # DEKORÁTOROK
@@ -377,9 +499,11 @@ class WebApp:
             king = self.modules.get("king")
             if not king:
                 return jsonify({"error": "King module not available"}), 404
-            return jsonify(king.get_state())
+            if hasattr(king, 'get_state'):
+                return jsonify(king.get_state())
+            return jsonify({"error": "get_state not available"}), 500
         
-        # ========== SENTINEL ENDPOINTOK (HOZZÁADVA) ==========
+        # ========== SENTINEL ENDPOINTOK ==========
         
         @self.app.route("/api/sentinel/status")
         def api_sentinel_status():
@@ -479,7 +603,6 @@ class WebApp:
             
             if request.method == 'POST':
                 data = request.get_json() or {}
-                # Itt lehetne módosítani a throttle beállításokat
                 return jsonify({"throttle_active": sentinel.is_throttled() if hasattr(sentinel, 'is_throttled') else False})
             
             return jsonify({
@@ -488,7 +611,7 @@ class WebApp:
                 "recovery_mode": sentinel.get_state().get('recovery_mode', False) if hasattr(sentinel, 'get_state') else False
             })
         
-        # ========== TÖBBI API ENDPOINTOK ==========
+        # ========== TÖBBI API ENDPOINTOK (maradnak) ==========
         
         # --- API: BESZÉLGETÉSEK ---
         
@@ -504,11 +627,14 @@ class WebApp:
                 limit = request.args.get("limit", 50, type=int)
                 offset = request.args.get("offset", 0, type=int)
                 
-                conversations = db.get_conversations(
-                    user_id=user_id,
-                    limit=limit,
-                    offset=offset
-                )
+                if hasattr(db, 'get_conversations'):
+                    conversations = db.get_conversations(
+                        user_id=user_id,
+                        limit=limit,
+                        offset=offset
+                    )
+                else:
+                    conversations = []
                 
                 return jsonify({
                     "conversations": conversations,
@@ -530,13 +656,16 @@ class WebApp:
             data = request.get_json() or {}
             user_id = session["user_id"]
             
-            conv_id = db.create_conversation(
-                title=data.get("title", f"Beszélgetés {datetime.now().strftime('%Y-%m-%d %H:%M')}"),
-                model=data.get("model"),
-                system_prompt=data.get("system_prompt"),
-                metadata=data.get("metadata"),
-                user_id=user_id
-            )
+            if hasattr(db, 'create_conversation'):
+                conv_id = db.create_conversation(
+                    title=data.get("title", f"Beszélgetés {datetime.now().strftime('%Y-%m-%d %H:%M')}"),
+                    model=data.get("model"),
+                    system_prompt=data.get("system_prompt"),
+                    metadata=data.get("metadata"),
+                    user_id=user_id
+                )
+            else:
+                conv_id = int(time.time())
             
             return jsonify({"id": conv_id, "success": True})
         
@@ -548,7 +677,10 @@ class WebApp:
                 return jsonify({"error": "Database not available"}), 500
             
             limit = request.args.get("limit", 100, type=int)
-            messages = db.get_messages(conv_id, limit=limit)
+            if hasattr(db, 'get_messages'):
+                messages = db.get_messages(conv_id, limit=limit)
+            else:
+                messages = []
             
             return jsonify({
                 "messages": messages,
@@ -564,13 +696,16 @@ class WebApp:
             
             data = request.get_json() or {}
             
-            msg_id = db.add_message(
-                conversation_id=conv_id,
-                role=data.get("role", "user"),
-                content=data.get("content", ""),
-                tokens=data.get("tokens", 0),
-                metadata=data.get("metadata")
-            )
+            if hasattr(db, 'add_message'):
+                msg_id = db.add_message(
+                    conversation_id=conv_id,
+                    role=data.get("role", "user"),
+                    content=data.get("content", ""),
+                    tokens=data.get("tokens", 0),
+                    metadata=data.get("metadata")
+                )
+            else:
+                msg_id = int(time.time())
             
             return jsonify({"id": msg_id, "success": True})
         
@@ -581,7 +716,9 @@ class WebApp:
             if not db:
                 return jsonify({"error": "Database not available"}), 500
             
-            db.delete_conversation(conv_id)
+            if hasattr(db, 'delete_conversation'):
+                db.delete_conversation(conv_id)
+            
             return jsonify({"success": True})
         
         # --- API: MODELLEK ---
@@ -592,7 +729,11 @@ class WebApp:
             if not db:
                 return jsonify({"models": []})
             
-            models = db.get_models()
+            if hasattr(db, 'get_models'):
+                models = db.get_models()
+            else:
+                models = []
+            
             return jsonify({"models": models})
         
         @self.app.route("/api/models/<int:model_id>/activate", methods=["POST"])
@@ -602,7 +743,8 @@ class WebApp:
             if not db:
                 return jsonify({"error": "Database not available"}), 500
             
-            db.set_active_model(model_id)
+            if hasattr(db, 'set_active_model'):
+                db.set_active_model(model_id)
             
             king = self.modules.get("king")
             if king and hasattr(king, "reload_model"):
@@ -619,14 +761,17 @@ class WebApp:
             
             data = request.get_json() or {}
             
-            model_id = db.add_model(
-                name=data.get("name"),
-                path=data.get("path"),
-                quantization=data.get("quantization"),
-                context_length=data.get("context_length", 4096),
-                n_gpu_layers=data.get("n_gpu_layers", -1),
-                description=data.get("description")
-            )
+            if hasattr(db, 'add_model'):
+                model_id = db.add_model(
+                    name=data.get("name"),
+                    path=data.get("path"),
+                    quantization=data.get("quantization"),
+                    context_length=data.get("context_length", 4096),
+                    n_gpu_layers=data.get("n_gpu_layers", -1),
+                    description=data.get("description")
+                )
+            else:
+                model_id = int(time.time())
             
             return jsonify({"id": model_id, "success": True})
         
@@ -637,7 +782,9 @@ class WebApp:
             if not db:
                 return jsonify({"error": "Database not available"}), 500
             
-            db.delete_model(model_id)
+            if hasattr(db, 'delete_model'):
+                db.delete_model(model_id)
+            
             return jsonify({"success": True})
         
         # --- API: PROMPTOK ---
@@ -648,7 +795,11 @@ class WebApp:
             if not db:
                 return jsonify({"prompts": []})
             
-            prompts = db.get_prompts()
+            if hasattr(db, 'get_prompts'):
+                prompts = db.get_prompts()
+            else:
+                prompts = []
+            
             return jsonify({"prompts": prompts})
         
         @self.app.route("/api/prompts", methods=["POST"])
@@ -660,13 +811,16 @@ class WebApp:
             
             data = request.get_json() or {}
             
-            prompt_id = db.save_prompt(
-                name=data.get("name"),
-                content=data.get("content"),
-                description=data.get("description", ""),
-                category=data.get("category", "general"),
-                is_default=data.get("is_default", False)
-            )
+            if hasattr(db, 'save_prompt'):
+                prompt_id = db.save_prompt(
+                    name=data.get("name"),
+                    content=data.get("content"),
+                    description=data.get("description", ""),
+                    category=data.get("category", "general"),
+                    is_default=data.get("is_default", False)
+                )
+            else:
+                prompt_id = int(time.time())
             
             return jsonify({"id": prompt_id, "success": True})
         
@@ -677,7 +831,9 @@ class WebApp:
             if not db:
                 return jsonify({"error": "Database not available"}), 500
             
-            db.delete_prompt(prompt_id)
+            if hasattr(db, 'delete_prompt'):
+                db.delete_prompt(prompt_id)
+            
             return jsonify({"success": True})
         
         # --- API: SZEMÉLYISÉGEK ---
@@ -688,7 +844,11 @@ class WebApp:
             if not db:
                 return jsonify({"personalities": []})
             
-            personalities = db.get_personalities()
+            if hasattr(db, 'get_personalities'):
+                personalities = db.get_personalities()
+            else:
+                personalities = []
+            
             return jsonify({"personalities": personalities})
         
         @self.app.route("/api/personalities", methods=["POST"])
@@ -700,15 +860,18 @@ class WebApp:
             
             data = request.get_json() or {}
             
-            personality_id = db.save_personality(
-                name=data.get("name"),
-                motto=data.get("motto"),
-                description=data.get("description"),
-                traits=data.get("traits", []),
-                relationships=data.get("relationships", []),
-                content=data.get("content"),
-                is_default=data.get("is_default", False)
-            )
+            if hasattr(db, 'save_personality'):
+                personality_id = db.save_personality(
+                    name=data.get("name"),
+                    motto=data.get("motto"),
+                    description=data.get("description"),
+                    traits=data.get("traits", []),
+                    relationships=data.get("relationships", []),
+                    content=data.get("content"),
+                    is_default=data.get("is_default", False)
+                )
+            else:
+                personality_id = int(time.time())
             
             return jsonify({"id": personality_id, "success": True})
         
@@ -719,7 +882,9 @@ class WebApp:
             if not db:
                 return jsonify({"error": "Database not available"}), 500
             
-            db.activate_personality(personality_id)
+            if hasattr(db, 'activate_personality'):
+                db.activate_personality(personality_id)
+            
             return jsonify({"success": True})
         
         @self.app.route("/api/personalities/<int:personality_id>", methods=["DELETE"])
@@ -729,7 +894,9 @@ class WebApp:
             if not db:
                 return jsonify({"error": "Database not available"}), 500
             
-            db.delete_personality(personality_id)
+            if hasattr(db, 'delete_personality'):
+                db.delete_personality(personality_id)
+            
             return jsonify({"success": True})
         
         # --- API: EMBEDDING ---
@@ -754,7 +921,6 @@ class WebApp:
             if not text:
                 return jsonify({"error": "Text required"}), 400
             
-            # Demo válasz
             return jsonify({
                 "dimension": 384,
                 "vector": [0.1, 0.2, 0.3, 0.4, 0.5] + [0.0] * 379
@@ -790,7 +956,6 @@ class WebApp:
             if 'audio' not in request.files:
                 return jsonify({"error": "No audio file"}), 400
             
-            # Demo válasz
             return jsonify({"text": "Demo speech recognition result."})
         
         @self.app.route("/api/audio/synthesize", methods=["POST"])
@@ -1054,7 +1219,8 @@ class WebApp:
             self.sessions[client_id] = {
                 "connected_at": time.time(),
                 "user_id": user_id,
-                "ip": request.remote_addr
+                "ip": request.remote_addr,
+                "telemetry_subscribed": False
             }
             
             emit("connected", {
@@ -1067,6 +1233,9 @@ class WebApp:
         def handle_disconnect():
             client_id = request.sid
             if client_id in self.sessions:
+                # Ha telemetriára volt feliratkozva, eltávolítjuk
+                if client_id in self.telemetry_clients:
+                    self.telemetry_clients.remove(client_id)
                 del self.sessions[client_id]
         
         @self.socketio.on("auth:get_session")
@@ -1118,12 +1287,13 @@ class WebApp:
             db = self.modules.get("database")
             if db:
                 try:
-                    db.add_message(conv_id, "user", text)
+                    if hasattr(db, 'add_message'):
+                        db.add_message(conv_id, "user", text)
                     print(f"💾 WebApp: Üzenet elmentve (conv: {conv_id})")
                 except Exception as e:
                     print(f"⚠️ WebApp: Üzenet mentési hiba: {e}")
             
-            # Callback definiálása
+            # Callback definiálása - ez lesz meghívva a King válasza után
             def on_response(response_text, conv_id, trace_id):
                 print(f"📤 WebApp: Callback meghívva, válasz küldése frontendnek: {response_text[:50]}...")
                 try:
@@ -1136,18 +1306,19 @@ class WebApp:
                 except Exception as e:
                     print(f"❌ WebApp: Hiba a válasz küldésekor: {e}")
             
-            # Callback beállítása
+            # Callback beállítása az Orchestratorban (minden üzenet előtt)
             if hasattr(orch, 'set_webapp_callback'):
                 orch.set_webapp_callback(on_response)
                 print(f"🔗 WebApp: Callback beállítva az Orchestratorban")
             
-            # Feldolgozás indítása
+            # Feldolgozás indítása (a válasz aszinkron jön a callback-en keresztül)
             try:
                 result = orch.process_user_message(text, conv_id)
-                print(f"🔄 WebApp: Orchestrator.process_user_message visszatért")
+                print(f"🔄 WebApp: Orchestrator.process_user_message meghívva")
             except Exception as e:
                 print(f"❌ WebApp: Orchestrator hiba: {e}")
                 emit("chat:error", {"error": f"Processing error: {e}"})
+                return
             
             emit("chat:ack", {"received": True})
             print(f"✅ WebApp: chat:ack elküldve")
@@ -1163,6 +1334,30 @@ class WebApp:
             room = data.get("conversation_id") if data else None
             if room:
                 emit("chat:typing_stop", {"user": session.get("username", "User")}, room=room)
+        
+        # --- TELEMETRIA ESEMÉNYEK ---
+        
+        @self.socketio.on("subscribe_telemetry")
+        def handle_subscribe_telemetry():
+            client_id = request.sid
+            if client_id in self.sessions:
+                self.sessions[client_id]["telemetry_subscribed"] = True
+                self.telemetry_clients.add(client_id)
+                emit("telemetry_subscribed", {"status": "ok"})
+                # Azonnal küldjünk egy friss telemetriát
+                telemetry = self._collect_telemetry()
+                emit("telemetry_update", telemetry)
+        
+        @self.socketio.on("unsubscribe_telemetry")
+        def handle_unsubscribe_telemetry():
+            client_id = request.sid
+            if client_id in self.sessions:
+                self.sessions[client_id]["telemetry_subscribed"] = False
+            if client_id in self.telemetry_clients:
+                self.telemetry_clients.remove(client_id)
+            emit("telemetry_unsubscribed", {"status": "ok"})
+        
+        # --- ÁLLAPOT LEKÉRÉS ---
         
         @self.socketio.on("get_status")
         def handle_get_status():
@@ -1185,6 +1380,50 @@ class WebApp:
                 "modules": list(self.modules.keys()),
                 "gpu": gpu_data
             })
+        
+        @self.socketio.on("get_metrics")
+        def handle_get_metrics():
+            """Részletes metrikák lekérése"""
+            metrics = {
+                "king": {},
+                "orchestrator": {},
+                "heartbeat": {},
+                "sentinel": {}
+            }
+            
+            king = self.modules.get("king")
+            if king:
+                if hasattr(king, 'get_metrics'):
+                    metrics["king"] = king.get_metrics()
+                elif hasattr(king, 'get_state'):
+                    state = king.get_state()
+                    metrics["king"] = {
+                        "response_count": state.get("response_count", 0),
+                        "average_response_time": state.get("average_response_time", 0),
+                        "total_tokens": state.get("total_tokens_generated", 0),
+                        "model_loaded": state.get("model_loaded", False)
+                    }
+            
+            orch = self.modules.get("orchestrator")
+            if orch:
+                if hasattr(orch, 'get_stats'):
+                    metrics["orchestrator"] = orch.get_stats()
+                elif hasattr(orch, 'stats'):
+                    metrics["orchestrator"] = orch.stats
+            
+            hb = self.modules.get("heartbeat")
+            if hb and hasattr(hb, 'get_state'):
+                metrics["heartbeat"] = hb.get_state()
+            
+            sentinel = self.modules.get("sentinel")
+            if sentinel:
+                if hasattr(sentinel, 'get_gpu_status'):
+                    metrics["sentinel"] = {
+                        "gpus": sentinel.get_gpu_status(),
+                        "state": sentinel.get_state() if hasattr(sentinel, 'get_state') else {}
+                    }
+            
+            emit("metrics_update", metrics)
     
     # ----------------------------------------------------------------------
     # INDÍTÁS / LEÁLLÍTÁS
@@ -1196,6 +1435,12 @@ class WebApp:
         if self.dev_mode:
             print("⚠️ FEJLESZTŐI MÓD - automatikus admin bejelentkezés")
             print("🔐 Admin jelszó: admin123")
+        
+        # Telemetria szál indítása
+        self.telemetry_thread = threading.Thread(target=self._telemetry_loop, daemon=True)
+        self.telemetry_thread.start()
+        print("📊 Telemetria szál indítva")
+        
         self.socketio.run(self.app, host=host, port=port, debug=debug)
     
     def start_thread(self):
@@ -1206,13 +1451,15 @@ class WebApp:
     
     def stop(self):
         self.running = False
-        self.socketio.stop()
+        if self.socketio:
+            self.socketio.stop()
         print("🌐 WebApp leállítva")
     
     def get_state(self) -> Dict[str, Any]:
         return {
             "status": "running" if self.running else "stopped",
             "clients": len(self.sessions),
+            "telemetry_clients": len(self.telemetry_clients),
             "system_id": self.system_id
         }
 

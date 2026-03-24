@@ -1,0 +1,49 @@
+{
+  "intents": {
+    "greeting": [
+      "hello", "hi", "hey", "good morning", "good afternoon", "good evening", "greetings", "howdy", "yo"
+    ],
+    "farewell": [
+      "bye", "goodbye", "see you", "talk to you later", "farewell", "later", "cya", "peace"
+    ],
+    "question": [
+      "what", "who", "where", "when", "why", "how", "can you", "do you", "is it", "are you", "could you", "would you"
+    ],
+    "command": [
+      "do", "make", "create", "write", "show", "tell", "give", "help", "execute", "run", "open", "close", "start", "stop"
+    ],
+    "system_control": [
+      "stop", "exit", "quit", "shutdown", "restart", "reload", "reload config", "status", "info", "system status"
+    ],
+    "knowledge_retrieval": [
+      "what is", "tell me about", "explain", "define", "what are", "search", "find", "lookup", "describe", "elaborate"
+    ],
+    "proactive": [
+      "remind", "reminder", "remember", "remind me", "alert", "notify", "schedule", "set reminder", "wake me"
+    ],
+    "affirmation": [
+      "yes", "yeah", "yep", "sure", "ok", "okay", "correct", "right", "absolutely", "definitely", "indeed", "affirmative"
+    ],
+    "negation": [
+      "no", "nope", "not", "never", "incorrect", "wrong", "false", "negative", "nah", "nay"
+    ],
+    "gratitude": [
+      "thank", "thanks", "appreciate", "grateful", "thank you", "thanks a lot", "much appreciated", "cheers"
+    ]
+  },
+  "entities": {
+    "DATE": [
+      "today", "tomorrow", "yesterday", "next", "last", "monday", "tuesday", "wednesday", "thursday", "friday", "saturday", "sunday"
+    ],
+    "TIME": [
+      "morning", "noon", "afternoon", "evening", "night", "midnight", "dawn", "dusk"
+    ],
+    "PERSON": [],
+    "LOCATION": [
+      "New York", "London", "Paris", "Berlin", "Tokyo", "Beijing", "Moscow", "Rome", "Madrid"
+    ]
+  },
+  "question_words": [
+    "what", "who", "where", "when", "why", "how", "can", "could", "would", "will", "do", "does", "is", "are", "was", "were"
+  ]
+}

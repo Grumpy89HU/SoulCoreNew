@@ -23,7 +23,7 @@ from src.core.orchestrator import Orchestrator
 from src.core.heartbeat import Heartbeat
 from src.core.router import Router
 from src.core.identity import SoulIdentity
-from src.agents.king import King
+from src.agents.king import King          # <-- JAVÍTVA!
 from src.agents.jester import Jester
 from src.agents.scribe import Scribe
 from src.agents.valet import Valet
@@ -37,6 +37,7 @@ from src.debug.blackbox import BlackBox
 from src.tools.sandbox import Sandbox
 from src.database.models import Database
 from src.i18n.translator import get_translator
+from src.bus.message_bus import MessageBus
 
 
 class SoulCore:
@@ -281,10 +282,10 @@ class SoulCore:
         db_path = self.config.get('database', {}).get('path', 'data/soulcore.db')
         self.modules['database'] = Database(db_path)
         
-        # Adatbázis táblák létrehozása, ha még nem léteznek
+        # Adatbázis táblák létrehozása
         self._init_database_tables()
         
-        # Alapértelmezett felhasználó létrehozása (ha még nincs)
+        # Alapértelmezett felhasználó létrehozása
         self._init_default_user()
         
         # Aktív személyiség betöltése
@@ -318,54 +319,83 @@ class SoulCore:
             sandbox = Sandbox(self.modules['scratchpad'], config=sandbox_config)
             self.modules['sandbox'] = sandbox
 
+        # ==================== BUSZ (MESSAGE BUS) - ELSŐNEK KELL! ====================
+        from src.bus.message_bus import MessageBus
+        
+        # Busz létrehozása (mindenki ezt fogja használni)
+        bus_config = self.config.get('bus', {})
+        self.modules['bus'] = MessageBus(bus_config)
+        self.modules['bus'].start()
+        print("📡 Message Bus inicializálva")
+
         # ==================== CORE MODULOK ====================
-        # Orchestrator (KVK parser, kontextus)
+        
+        # Orchestrator (központi idegrendszer)
         self.modules['orchestrator'] = Orchestrator(
-            self.modules['scratchpad'], 
-            modules=self.modules
+            scratchpad=self.modules['scratchpad'],
+            message_bus=self.modules['bus'],
+            config=self.config.get('orchestrator', {})
         )
-        # Adatbázis beállítása
+        
+        # Adatbázis beállítása az Orchestratorban
         if 'database' in self.modules:
             self.modules['orchestrator'].set_database(self.modules['database'])
         
         # Router (kommunikáció)
         if self.config.get('modules', {}).get('router', {}).get('enabled', True):
-            router = Router(self.modules['scratchpad'])
-            router.zmq_enabled = self.config['modules']['router'].get('zmq_enabled', False)
+            router = Router(
+                scratchpad=self.modules['scratchpad'],
+                message_bus=self.modules['bus']
+            )
             self.modules['router'] = router
         
         # Heartbeat (időérzék)
         if self.config.get('modules', {}).get('heartbeat', {}).get('enabled', True):
             hb_config = self.config['modules']['heartbeat']
             heartbeat = Heartbeat(
-                self.modules['scratchpad'],
-                orchestrator=self.modules['orchestrator']
+                scratchpad=self.modules['scratchpad'],
+                message_bus=self.modules['bus'],
+                config=hb_config
             )
-            heartbeat.interval = hb_config.get('interval', 1.0)
             self.modules['heartbeat'] = heartbeat
 
         # GATEWAY (külső kapcsolat)
         if self.config.get('modules', {}).get('gateway', {}).get('enabled', False):
             gateway_config = self.config['modules']['gateway']
-            gateway = DiplomaticGateway(
-                self.modules['scratchpad'],
-                orchestrator=self.modules['orchestrator'],
-                config=gateway_config
-            )
-            gateway.system_id = self.system_id
-            self.modules['gateway'] = gateway
-        
+            
+            # Ellenőrizzük, hogy a DiplomaticGateway milyen paramétereket vár
+            # Ha nem vár message_bus-t, akkor ne adjuk át
+            try:
+                gateway = DiplomaticGateway(
+                    scratchpad=self.modules['scratchpad'],
+                    orchestrator=self.modules['orchestrator'],  # ha kell neki orchestrator
+                    config=gateway_config
+                )
+                gateway.system_id = self.system_id
+                self.modules['gateway'] = gateway
+            except TypeError as e:
+                print(f"⚠️ Gateway inicializálási hiba: {e}")
+                print("   Gateway kikapcsolva")
+                
         # ==================== ÁGENSEK ====================
         # Scribe (írás)
         if self.config.get('agents', {}).get('scribe', {}).get('enabled', True):
-            scribe = Scribe(self.modules['scratchpad'])
+            scribe = Scribe(
+                scratchpad=self.modules['scratchpad'],
+                message_bus=self.modules['bus'],
+                config=self.config.get('scribe', {})
+            )
             scribe.translator = self.translator
             self.modules['scribe'] = scribe
         
         # Valet (memória) - a King ELŐTT kell lennie!
         if self.config.get('agents', {}).get('valet', {}).get('enabled', True):
             valet_config = self.config['agents']['valet']
-            valet = Valet(self.modules['scratchpad'], config=valet_config)
+            valet = Valet(
+                scratchpad=self.modules['scratchpad'],
+                message_bus=self.modules['bus'],
+                config=valet_config
+            )
             valet.translator = self.translator
             self.modules['valet'] = valet
         
@@ -388,7 +418,12 @@ class SoulCore:
                 except Exception as e:
                     print(f"⚠️ {self.translator.get('errors.model_load_error', error=e)}")
             
-            queen = Queen(self.modules['scratchpad'], model_wrapper=queen_model, config=queen_config)
+            queen = Queen(
+                scratchpad=self.modules['scratchpad'],
+                model_wrapper=queen_model,
+                message_bus=self.modules['bus'],
+                config=queen_config
+            )
             queen.translator = self.translator
             self.modules['queen'] = queen
         
@@ -397,42 +432,51 @@ class SoulCore:
             king_config = self.config['agents']['king']
             model_path = king_config.get('model')
             
-            # Először létrehozzuk a King-et
             if model_path and model_path.lower() != "none":
-                # Van modell - létrehozzuk a ModelWrapper-t
                 try:
                     from src.core.model_wrapper import ModelWrapper
                     
-                    # Modell konfiguráció összeállítása
                     model_config = {
                         'n_gpu_layers': king_config.get('n_gpu_layers', -1),
                         'n_ctx': king_config.get('n_ctx', 4096),
-                        'main_gpu': 0,  # King az első GPU-n
+                        'main_gpu': 0,
                         'verbose': self.config.get('system', {}).get('environment') == 'development'
                     }
                     
-                    # Abszolút útvonal kezelés
                     if not os.path.isabs(model_path):
                         model_path = str(ROOT_DIR / model_path)
                     
                     print(f"📦 {self.translator.get('system.module_loaded', name='King modell')}")
                     model_wrapper = ModelWrapper(model_path, model_config)
-                    king = King(self.modules['scratchpad'], model_wrapper=model_wrapper)
+                    king = King(
+                        scratchpad=self.modules['scratchpad'],
+                        model_wrapper=model_wrapper,
+                        message_bus=self.modules['bus'],
+                        config=king_config
+                    )
                     
                 except Exception as e:
                     print(f"❌ {self.translator.get('errors.model_load_error', error=e)}")
                     print("   Dummy módban indul a King")
-                    king = King(self.modules['scratchpad'])
+                    king = King(
+                        scratchpad=self.modules['scratchpad'],
+                        model_wrapper=None,
+                        message_bus=self.modules['bus'],
+                        config=king_config
+                    )
             else:
-                # Nincs modell, dummy mód
                 print("👑 King: Modell nélkül (dummy mód)")
-                king = King(self.modules['scratchpad'])
+                king = King(
+                    scratchpad=self.modules['scratchpad'],
+                    model_wrapper=None,
+                    message_bus=self.modules['bus'],
+                    config=king_config
+                )
             
-            # Átadjuk a fordítót
             king.translator = self.translator
             
             # Személyiség beállítása
-            if self.active_personality:
+            if hasattr(self, 'active_personality') and self.active_personality:
                 self.modules['scratchpad'].write_note('king', 'personality', self.active_personality)
             elif 'personality' in king_config:
                 self.modules['scratchpad'].write_note('king', 'personality', king_config['personality'])
@@ -442,23 +486,18 @@ class SoulCore:
         # Jester (bohóc)
         if self.config.get('agents', {}).get('jester', {}).get('enabled', True):
             jester_config = self.config['agents']['jester']
-            jester = Jester(self.modules['scratchpad'])
-            # Konfig átadás
-            if hasattr(jester, 'config'):
-                jester.config.update({
-                    'max_response_time': jester_config.get('max_response_time', 10.0),
-                    'max_error_rate': jester_config.get('max_error_rate', 0.3),
-                    'max_consecutive_errors': jester_config.get('max_consecutive_errors', 3)
-                })
-            # Átadjuk a fordítót
+            jester = Jester(
+                scratchpad=self.modules['scratchpad'],
+                message_bus=self.modules['bus'],
+                config=jester_config
+            )
             jester.translator = self.translator
             self.modules['jester'] = jester
 
         # ==================== WEB ====================
-        # WEB - modulok átadása
         if self.config.get('modules', {}).get('web', {}).get('enabled', True):
             web_config = self.config['modules']['web']
-            web = WebApp(self.modules)  # <-- Itt átadjuk az összes modult
+            web = WebApp(self.modules)
             web.host = web_config.get('host', '0.0.0.0')
             web.port = web_config.get('port', 5000)
             web.translator = self.translator
@@ -466,6 +505,7 @@ class SoulCore:
             self.modules['web'] = web
         
         print(f"✅ {len(self.modules)} modul betöltve")
+    
     
     def _init_database_tables(self):
         """Adatbázis táblák létrehozása (kiegészítve a szükséges táblákkal)"""

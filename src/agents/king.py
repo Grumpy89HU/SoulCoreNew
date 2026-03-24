@@ -1,12 +1,15 @@
 """
 King - A Király, aki éppen uralkodik.
 Lehet Gemma, Llama, bármi. A rendszer nem tudja, nem is akarja tudni, hogy melyik.
-A Király feladata: válaszolni, ha kell.
 
-RAG integráció:
-- Valet-től kapott kontextussal dolgozik
-- Graph-Vault (Neo4j) és Vector-Vault (Qdrant) adatokat építi be
-- Érzelmi kontextus alapján hangolja a választ
+KOMMUNIKÁCIÓS PROTOKOLL:
+- A King BESZÉL a buszon (broadcast), mindenki hallja
+- A King várja a szolgák válaszát a buszon
+- Kompatibilis marad a régi API-kkal (process, generate_response, stb.)
+
+BELSŐ KOMMUNIKÁCIÓS FORMÁTUM:
+- Király beszéde: {"header": {"sender": "king", "broadcast": true}, "payload": {"type": "royal_decree", ...}}
+- Szolgák válasza: {"header": {"target": "king", "in_response_to": "..."}, "payload": {...}}
 """
 
 import time
@@ -15,70 +18,89 @@ import threading
 import random
 import hashlib
 import uuid
-from typing import Dict, Any, Optional, List
+from typing import Dict, Any, Optional, List, Tuple
 from collections import deque
+from dataclasses import dataclass, asdict, field
 
-# i18n import (opcionális)
+# i18n import (csak a felhasználó felé)
 try:
     from src.i18n.translator import get_translator
     I18N_AVAILABLE = True
 except ImportError:
     I18N_AVAILABLE = False
-    print("⚠️ King: i18n nem elérhető, angol alapértelmezettel futok.")
+
+
+@dataclass
+class KingState:
+    """Király állapota (JSON-ben továbbítható)"""
+    status: str = 'idle'
+    last_response_time: float = None
+    last_response_text: str = None
+    response_count: int = 0
+    average_response_time: float = 0
+    errors: List[str] = field(default_factory=list)
+    current_task: str = None
+    current_conversation_id: int = None  # <-- HOZZÁADVA!
+    model_loaded: bool = False
+    total_tokens_generated: int = 0
+    total_processing_time: float = 0
+    last_mood: str = 'neutral'
+    rag_used: bool = False
+    last_context_hash: str = None
+    temperature: float = 0.7
+    
+    def to_dict(self) -> Dict:
+        return asdict(self)
 
 
 class King:
     """
-    A Király.
+    A Király - szuverén entitás.
     
-    - Nem tudja, hogy ő melyik modell
-    - Nem tudja, hogy ki a felhasználó (az a user)
-    - Kap egy intent JSON-t, visszaad egy response JSON-t
-    - A Jester figyeli az állapotát
-    - Identitását a scratchpadből kapja (oda a main tölti)
-    - Valet-től kapott RAG kontextust épít be a válaszába
+    KOMMUNIKÁCIÓ:
+    1. Hallja a felhasználót
+    2. KIÁLTJA a trónteremben (broadcast)
+    3. Várja a szolgák válaszát
+    4. Válaszol a felhasználónak
+    
+    Kompatibilitás: megtartja a régi API-kat (process, generate_response)
     """
     
-    # Prompt verziók (különböző stílusokhoz)
+    # Prompt verziók
     PROMPT_STYLES = {
         'default': 0,
-        'concise': 1,    # Rövid, tömör
-        'detailed': 2,   # Részletes, magyarázó
-        'poetic': 3,     # Költői, metaforikus
-        'technical': 4   # Technikai, precíz
+        'concise': 1,
+        'detailed': 2,
+        'poetic': 3,
+        'technical': 4
     }
     
-    def __init__(self, scratchpad, orchestrator=None, model_wrapper=None):
+    # Hangulati állapotok
+    MOOD_STATES = {
+        'neutral': 0,
+        'lively': 0.5,
+        'thoughtful': -0.2,
+        'tired': -0.5,
+        'playful': 0.6,
+        'sarcastic': 0.3
+    }
+    
+    def __init__(self, scratchpad, model_wrapper, message_bus=None, config: Dict = None):
         self.scratchpad = scratchpad
         self.model = model_wrapper
-        self.valet = None      # Valet hivatkozás (később beállítva)
-        self.queen = None
-        self.orchestrator = orchestrator
+        self.bus = message_bus  # Opcionális - ha nincs, fallback a régi mód
         self.name = "king"
+        self.config = config or {}
         
-        # Fordító (később állítjuk be a felhasználó nyelvére)
+        # Fordító (csak a felhasználó felé)
         self.translator = None
         if I18N_AVAILABLE:
             self.translator = get_translator('en')
         
-        # Állapot (ezt figyeli a Jester)
-        self.state = {
-            'status': 'idle',
-            'last_response_time': None,
-            'last_response_text': None,
-            'response_count': 0,
-            'average_response_time': 0,
-            'errors': [],
-            'current_task': None,
-            'model_loaded': False,
-            'total_tokens_generated': 0,
-            'total_processing_time': 0,
-            'last_mood': 'neutral',
-            'rag_used': False,           # RAG használat jelző
-            'last_context_summary': None  # Utolsó használt kontextus
-        }
+        # Állapot
+        self.state = KingState()
         
-        # Identitás (scratchpadből jön)
+        # Identitás
         self.identity = {
             'name': 'assistant',
             'title': 'The Sovereign',
@@ -86,14 +108,18 @@ class King:
             'style': 'default'
         }
         
-        # Kontextus cache (gyorsítótár az ismétlődő promptokhoz)
-        self.context_cache = {}
-        self.cache_ttl = 300  # 5 perc
+        # Válaszok gyűjtője a szolgáktól (broadcast módhoz)
+        self.pending_responses: Dict[str, Dict] = {}
+        self.response_lock = threading.Lock()
         
-        # Legutóbbi válaszok (ismétlés elkerülésére)
+        # Kontextus cache
+        self.context_cache = {}
+        self.cache_ttl = 300
+        
+        # Legutóbbi válaszok
         self.recent_responses = deque(maxlen=10)
         
-        # Generálási paraméterek (dinamikusan állítható)
+        # Generálási paraméterek
         self.generation_params = {
             'max_tokens': 256,
             'temperature': 0.7,
@@ -104,110 +130,677 @@ class King:
             'presence_penalty': 0.0
         }
         
-        # Válasz callback a WebApp felé
+        # Válasz callback (WebApp felé)
         self.response_callback = None
         
-        # Ha van modell, elindítjuk a betöltést háttérben
+        # Valet és Queen hivatkozások
+        self.valet = None
+        self.queen = None
+        
+        # Ha van busz, feliratkozunk
+        if self.bus:
+            self.bus.subscribe(self.name, self._on_message)
+        
+        # Modell betöltés
         if self.model:
             threading.Thread(target=self._load_model, daemon=True).start()
         
         print("👑 King: Király trónra lépett.")
+        if self.bus:
+            print("👑 King: Broadcast módban működöm.")
+        else:
+            print("👑 King: Hagyományos módban működöm.")
     
-    def set_valet(self, valet):
-        """Valet modul beállítása (memória logisztika)"""
-        self.valet = valet
-        print("👑 King: Valet kapcsolat beállítva")
+    # ========== BUSZ KOMMUNIKÁCIÓ (BROADCAST MÓD) ==========
     
-    def set_queen(self, queen):
-        """Queen modul beállítása (CoT logika)"""
-        self.queen = queen
-        print("👑 King: Queen kapcsolat beállítva")
-    
-    # ========== FŐ BELÉPÉSI PONT (WebApp + Valet kontextus) ==========
-    
-    def generate_response(self, user_text: str, trace_id: str = None, 
-                         conversation_id: int = None,
-                         conversation_history: List[Dict] = None,
-                         rag_context: Dict = None) -> str:
-        """
-        Egyszerű belépési pont a WebApp számára.
-        Létrehoz egy intent packetet, és feldolgozza a Valet kontextussal.
+    def _on_message(self, message: Dict):
+        """Hallja a buszon érkező üzeneteket (csak a neki szóló válaszok)"""
+        if not self.bus:
+            return
         
-        Args:
-            user_text: A felhasználó üzenete
-            trace_id: Opcionális nyomkövetési azonosító
-            conversation_id: Opcionális beszélgetés azonosító
-            conversation_history: Előzmények listája (opcionális)
-            rag_context: Valet-től kapott RAG kontextus (opcionális)
+        header = message.get('header', {})
         
-        Returns:
-            str: A generált válasz szövege
+        # Csak a Kingnek szóló üzenetek
+        if header.get('target') != self.name:
+            return
+        
+        trace_id = header.get('in_response_to')
+        if not trace_id:
+            return
+        
+        with self.response_lock:
+            if trace_id not in self.pending_responses:
+                self.pending_responses[trace_id] = {}
+            
+            sender = header.get('sender', 'unknown')
+            self.pending_responses[trace_id][sender] = message
+    
+    def _wait_for_responses(self, trace_id: str, required_agents: List[str], timeout: float = 5.0) -> Dict:
+        """Vár a szolgák válaszára (broadcast mód)"""
+        if not self.bus:
+            return {}
+        
+        start_time = time.time()
+        required_set = set(required_agents)
+        
+        while time.time() - start_time < timeout:
+            with self.response_lock:
+                if trace_id in self.pending_responses:
+                    responses = self.pending_responses[trace_id]
+                    if set(responses.keys()) >= required_set:
+                        result = responses.copy()
+                        del self.pending_responses[trace_id]
+                        return result
+            
+            time.sleep(0.05)
+        
+        with self.response_lock:
+            if trace_id in self.pending_responses:
+                responses = self.pending_responses[trace_id].copy()
+                del self.pending_responses[trace_id]
+                return responses
+        
+        return {}
+    
+    def _create_royal_decree(self, trace_id: str, user_text: str, 
+                              interpretation: Dict, required_agents: List[str]) -> Dict:
+        """Királyi rendelet összeállítása (broadcast mód)"""
+        return {
+            "header": {
+                "trace_id": trace_id,
+                "timestamp": time.time(),
+                "version": "3.0",
+                "sender": self.name,
+                "target": "kernel",
+                "broadcast": True
+            },
+            "payload": {
+                "type": "royal_decree",
+                "user_message": user_text,
+                "interpretation": interpretation,
+                "order": "prepare_context",
+                "required_agents": required_agents,
+                "optional_agents": ["jester"]
+            },
+            "telemetry": {
+                "model": getattr(self.model, 'name', 'unknown'),
+                "temperature": self.generation_params['temperature']
+            }
+        }
+    
+    def _extract_context_from_responses(self, responses: Dict) -> Dict:
+        """Kinyeri a kontextust a szolgák válaszaiból"""
+        context = {
+            "summary": "",
+            "facts": [],
+            "emotional_charge": 0.0,
+            "logic": ""
+        }
+        
+        for sender, msg in responses.items():
+            payload = msg.get('payload', {})
+            
+            if sender == 'valet':
+                ctx = payload.get('context', {})
+                context['summary'] = ctx.get('summary', '')
+                context['facts'] = ctx.get('facts', [])
+                context['emotional_charge'] = ctx.get('emotional_charge', 0.0)
+            
+            elif sender == 'queen':
+                logic = payload.get('logic', {})
+                context['logic'] = logic.get('conclusion', '')
+                context['thought'] = logic.get('thought', [])
+        
+        return context
+    
+    # ========== FŐ FELDOLGOZÓ METÓDUS (BROADCAST MÓD) ==========
+    
+    def process_user_message(self, user_text: str, trace_id: str = None, conversation_id: int = None) -> str:
         """
+        Felhasználói üzenet feldolgozása BROADCAST móddal.
+        Ha van busz, ezt használja.
+        """
+        if not self.bus:
+            # Fallback a régi módra
+            return self.generate_response(user_text, trace_id, conversation_id)
+        
         if not trace_id:
             trace_id = str(uuid.uuid4())
         
-        # Intent packet összeállítása
-        intent_packet = {
-            'header': {
-                'trace_id': trace_id,
-                'timestamp': time.time(),
-                'version': '3.0',
-                'sender': 'webapp'
-            },
-            'payload': {
-                'intent': {
-                    'class': 'USER_MESSAGE',
-                    'target': 'king',
-                    'confidence': 1.0
-                },
-                'text': user_text,
-                'raw_text': user_text,
-                'conversation_id': conversation_id,
-                'conversation_history': conversation_history or [],
-                'rag_context': rag_context or {}
+        # Mentjük a conversation_id-t a state-be
+        if conversation_id:
+            self.state.current_conversation_id = conversation_id
+        
+        start_time = time.time()
+        self.state.status = 'processing'
+        self.state.current_task = trace_id
+        
+        # 1. Értelmezés
+        interpretation = self._interpret(user_text)
+        
+        # 2. Meghatározzuk, kikre van szükség
+        required_agents = self._determine_required_agents(interpretation)
+        
+        # 3. Broadcast
+        decree = self._create_royal_decree(trace_id, user_text, interpretation, required_agents)
+        self.bus.broadcast(decree)
+        
+        # 4. Várunk a válaszokra
+        responses = self._wait_for_responses(trace_id, required_agents, timeout=5.0)
+        
+        # 5. Válasz generálása
+        response_text = self._generate_response_with_context(user_text, interpretation, responses)
+        
+        # 6. Állapot frissítés
+        processing_time = time.time() - start_time
+        self._update_state(response_text, processing_time, len(response_text.split()), responses)
+        
+        # 7. Callback - 3 paraméter átadása (JAVÍTVA!)
+        if self.response_callback:
+            # conversation_id a state-ből vagy a paraméterből
+            conv_id = conversation_id if conversation_id is not None else self.state.current_conversation_id
+            if conv_id is None:
+                conv_id = trace_id  # fallback
+            self.response_callback(response_text, conv_id, trace_id)
+        
+        return response_text
+    
+    def _determine_required_agents(self, interpretation: Dict) -> List[str]:
+        """Meghatározza, kikre van szükség"""
+        required = ['scribe']
+        intent_class = interpretation.get('intent', {}).get('class', '')
+        complexity = interpretation.get('complexity', 'medium')
+        
+        if intent_class in ['question', 'command', 'knowledge', 'proactive']:
+            required.append('valet')
+        
+        if complexity == 'high' or intent_class == 'knowledge':
+            required.append('queen')
+        
+        return required
+    
+    def _generate_response_with_context(self, user_text: str, interpretation: Dict, responses: Dict) -> str:
+        """Válasz generálása a szolgák válaszaival"""
+        context = self._extract_context_from_responses(responses)
+        prompt = self._build_response_prompt(user_text, interpretation, context)
+        
+        try:
+            response = self.model.generate(
+                prompt=prompt,
+                max_tokens=self.generation_params['max_tokens'],
+                temperature=self.generation_params['temperature'],
+                top_p=self.generation_params['top_p'],
+                top_k=self.generation_params['top_k'],
+                repeat_penalty=self.generation_params['repeat_penalty']
+            )
+            return response.strip()
+        except Exception as e:
+            self.state.errors.append(str(e))
+            return self._get_message('error', error=str(e))
+    
+    def _build_response_prompt(self, user_text: str, interpretation: Dict, context: Dict) -> str:
+        """Prompt összeállítása a válaszhoz"""
+        language = interpretation.get('language', 'en')
+        style = self.identity.get('style', 'default')
+        
+        parts = []
+        
+        style_instruction = self._get_style_instruction(style, language)
+        if style_instruction:
+            parts.append(style_instruction)
+        
+        if context.get('summary'):
+            parts.append(f"Context: {context['summary']}")
+        
+        if context.get('facts'):
+            parts.append("Relevant facts:")
+            for fact in context['facts'][:3]:
+                parts.append(f"- {fact}")
+        
+        if context.get('logic'):
+            parts.append(f"Logical conclusion: {context['logic']}")
+        
+        parts.append(f"\nUser: {user_text}")
+        parts.append(f"{self.identity['name']}:")
+        
+        return "\n".join(parts)
+    
+    # ========== RÉGI API (KOMPATIBILITÁS) ==========
+    
+    def process_request(self, request: Dict) -> Dict:
+        """
+        JSON kérés feldolgozása (régi API).
+        Ha van busz, broadcast módot használ, egyébként a régi módot.
+        """
+        start_time = time.time()
+        
+        if not isinstance(request, dict):
+            return self._error_response("invalid_request", "Request must be dict")
+        
+        trace_id = request.get('trace_id', str(uuid.uuid4()))
+        payload = request.get('payload', {})
+        user_text = payload.get('text', '')
+        conversation_id = payload.get('conversation_id')
+        
+        # Ha van busz, használjuk a broadcast módot
+        if self.bus:
+            response_text = self.process_user_message(user_text, trace_id, conversation_id)
+            
+            return {
+                "type": "king_response",
+                "target": "orchestrator",
+                "trace_id": trace_id,
+                "timestamp": time.time(),
+                "payload": {
+                    "response": response_text,
+                    "confidence": self._calculate_confidence(),
+                    "response_time_ms": int((time.time() - start_time) * 1000),
+                    "tokens_used": len(response_text.split()),
+                    "mood": self._get_current_mood(),
+                    "rag_used": self.state.rag_used
+                }
+            }
+        
+        # Régi mód (ha nincs busz)
+        return self._process_request_legacy(request)
+    
+    def _process_request_legacy(self, request: Dict) -> Dict:
+        """Régi feldolgozó mód (kompatibilitás)"""
+        start_time = time.time()
+        
+        trace_id = request.get('trace_id', str(uuid.uuid4()))
+        payload = request.get('payload', {})
+        
+        self.state.current_task = trace_id
+        self.state.status = 'processing'
+        
+        try:
+            if not self._should_respond(payload):
+                self.state.status = 'idle'
+                return None
+            
+            self._load_identity()
+            
+            rag_context = payload.get('context', {})
+            self.state.rag_used = bool(rag_context and rag_context.get('summary'))
+            
+            user_text = payload.get('text', '')
+            conversation_history = payload.get('conversation_history', [])
+            
+            prompt = self._build_prompt_cached(user_text, rag_context, conversation_history)
+            response_text = self._generate_response(prompt)
+            
+            processing_time = time.time() - start_time
+            tokens_used = len(response_text.split())
+            
+            self._update_state(response_text, processing_time, tokens_used, {})
+            
+            # Callback - 3 paraméter (JAVÍTVA!)
+            if self.response_callback:
+                conversation_id = payload.get('conversation_id')
+                if conversation_id is None:
+                    conversation_id = trace_id
+                self.response_callback(response_text, conversation_id, trace_id)
+            
+            return {
+                "type": "king_response",
+                "target": "orchestrator",
+                "trace_id": trace_id,
+                "timestamp": time.time(),
+                "payload": {
+                    "response": response_text,
+                    "confidence": self._calculate_confidence(),
+                    "response_time_ms": int(processing_time * 1000),
+                    "tokens_used": tokens_used,
+                    "mood": self._get_current_mood(),
+                    "rag_used": self.state.rag_used
+                }
+            }
+            
+        except Exception as e:
+            return self._error_response(trace_id, str(e))
+    
+    def generate_response(self, user_text: str, trace_id: str = None,
+                         conversation_id: int = None,
+                         conversation_history: List[Dict] = None,
+                         rag_context: Dict = None) -> str:
+        """Egyszerű belépési pont a WebApp számára (régi API)"""
+        if not trace_id:
+            trace_id = str(uuid.uuid4())
+        
+        # Ha van busz, használjuk a broadcast módot
+        if self.bus:
+            return self.process_user_message(user_text, trace_id, conversation_id)
+        
+        # Régi mód
+        request = {
+            "type": "king_request",
+            "target": "king",
+            "trace_id": trace_id,
+            "timestamp": time.time(),
+            "payload": {
+                "intent": {"class": "USER_MESSAGE", "target": "king", "confidence": 1.0},
+                "text": user_text,
+                "context": rag_context or {},
+                "conversation_history": conversation_history or [],
+                "conversation_id": conversation_id
             }
         }
         
-        # Feldolgozás a meglévő process metódussal
-        response_packet = self.process(intent_packet)
+        response = self._process_request_legacy(request)
         
-        # Válasz szöveg kinyerése
-        if response_packet and isinstance(response_packet, dict):
-            payload = response_packet.get('payload', {})
-            if isinstance(payload, dict):
-                return payload.get('response', '')
-            elif isinstance(payload, str):
-                return payload
+        if response and isinstance(response, dict):
+            payload = response.get('payload', {})
+            return payload.get('response', '')
         
-        return self._get_error_message("No response generated")
+        return self._get_message('error', error="No response")
     
-    def set_response_callback(self, callback):
-        """
-        Beállítja a válasz callbacket a WebApp felé.
-        A callback függvény: callback(response_text, conversation_id, trace_id)
-        """
-        self.response_callback = callback
+    def process(self, intent_packet: Dict) -> Optional[Dict]:
+        """Régi API kompatibilitás (Orchestrator hívja)"""
+        trace_id = intent_packet.get('header', {}).get('trace_id', str(uuid.uuid4()))
+        payload = intent_packet.get('payload', {})
+        
+        request = {
+            "type": "king_request",
+            "target": "king",
+            "trace_id": trace_id,
+            "timestamp": time.time(),
+            "payload": {
+                "intent": payload.get('intent', {}),
+                "text": payload.get('text', ''),
+                "context": payload.get('rag_context', {}),
+                "conversation_history": payload.get('conversation_history', []),
+                "conversation_id": payload.get('conversation_id')
+            }
+        }
+        
+        response = self.process_request(request)
+        
+        if response and isinstance(response, dict):
+            return {
+                "header": {
+                    "trace_id": trace_id,
+                    "timestamp": response.get('timestamp', time.time()),
+                    "sender": self.name
+                },
+                "payload": response.get('payload', {})
+            }
+        
+        return None
     
-    # ========== MEGLÉVŐ METÓDUSOK (kibővítve) ==========
+    # ========== MEGLÉVŐ SEGÉDFÜGGVÉNYEK (RÉGI) ==========
     
-    def set_language(self, language: str):
-        """Nyelv beállítása (i18n)"""
-        if self.translator and I18N_AVAILABLE:
-            self.translator.set_language(language)
+    def _interpret(self, text: str) -> Dict:
+        """King értelmezi a kérést"""
+        prompt = f"""Analyze this user message and extract intent and entities.
+
+Message: {text}
+
+Return JSON:
+{{
+    "intent": {{"class": "greeting|question|command|knowledge|proactive|system_control|affirmation|negation|gratitude", "confidence": 0.95}},
+    "entities": [{{"type": "PERSON|DATE|TIME|FILE|PATH|URL|EMAIL|NUMBER|LOCATION", "value": "..."}}],
+    "language": "en|hu|...",
+    "sentiment": "positive|neutral|negative",
+    "complexity": "low|medium|high"
+}}"""
+        
+        try:
+            response = self.model.generate(prompt, max_tokens=256, temperature=0.3)
+            import re
+            json_match = re.search(r'\{.*\}', response, re.DOTALL)
+            if json_match:
+                return json.loads(json_match.group())
+        except Exception as e:
+            self.state.errors.append(str(e))
+        
+        return {
+            "intent": {"class": "unknown", "confidence": 0.5},
+            "entities": [],
+            "language": "unknown",
+            "sentiment": "neutral",
+            "complexity": "medium"
+        }
     
-    def set_style(self, style: str):
-        """Stílus beállítása (default, concise, detailed, poetic, technical)"""
-        if style in self.PROMPT_STYLES:
+    def _should_respond(self, payload: Dict) -> bool:
+        intent = payload.get('intent', {})
+        if not isinstance(intent, dict):
+            return False
+        
+        intent_class = intent.get('class', '')
+        target = intent.get('target', '')
+        
+        if target == 'king':
+            return True
+        if intent_class == 'PROACTIVE':
+            return True
+        if intent_class in ['SYSTEM_ALERT', 'ERROR']:
+            return True
+        if intent_class == 'USER_MESSAGE':
+            return True
+        
+        return False
+    
+    def _load_identity(self):
+        stored = self.scratchpad.read_note(self.name, 'personality')
+        if stored:
+            if isinstance(stored, str):
+                self.identity['personality'] = stored
+            elif isinstance(stored, dict):
+                self.identity.update(stored)
+        
+        name = self.scratchpad.read_note(self.name, 'name')
+        if name:
+            self.identity['name'] = name
+        
+        style = self.scratchpad.read_note(self.name, 'style')
+        if style and style in self.PROMPT_STYLES:
             self.identity['style'] = style
     
-    def set_generation_params(self, **kwargs):
-        """Generálási paraméterek módosítása"""
-        for key, value in kwargs.items():
-            if key in self.generation_params:
-                self.generation_params[key] = value
+    def _build_prompt_cached(self, user_text: str, rag_context: Dict, conversation_history: List) -> str:
+        language = self.scratchpad.get_state('user_language', 'en')
+        style = self.identity.get('style', 'default')
+        
+        rag_hash = ''
+        if rag_context:
+            rag_str = f"{rag_context.get('summary', '')}_{rag_context.get('facts', [])}"
+            rag_hash = hashlib.md5(rag_str.encode()).hexdigest()[:8]
+        
+        history_hash = ''
+        if conversation_history:
+            hist_str = str([m.get('content', '') for m in conversation_history[-3:]])
+            history_hash = hashlib.md5(hist_str.encode()).hexdigest()[:8]
+        
+        cache_key = hashlib.md5(f"{user_text}_{language}_{style}_{rag_hash}_{history_hash}".encode()).hexdigest()
+        
+        if cache_key in self.context_cache:
+            cached_time, cached_prompt = self.context_cache[cache_key]
+            if time.time() - cached_time < self.cache_ttl:
+                return cached_prompt
+        
+        prompt = self._build_prompt_legacy(user_text, rag_context, conversation_history)
+        self.context_cache[cache_key] = (time.time(), prompt)
+        
+        if len(self.context_cache) > 100:
+            self._cleanup_cache()
+        
+        return prompt
+    
+    def _build_prompt_legacy(self, user_text: str, rag_context: Dict, conversation_history: List) -> str:
+        language = self.scratchpad.get_state('user_language', 'en')
+        user_name = self.scratchpad.get_state('user_name', 'user')
+        style = self.identity.get('style', 'default')
+        
+        prompt_parts = []
+        
+        if language == 'hu':
+            prompt_parts.append("Figyelem: Csak a saját válaszodat írd le, ne ismételd vissza a felhasználó üzenetét!")
+        else:
+            prompt_parts.append("Note: Only write your own response, do not repeat the user's message!")
+        
+        style_instruction = self._get_style_instruction(style, language)
+        if style_instruction:
+            prompt_parts.append(style_instruction)
+        
+        if rag_context:
+            context_parts = []
+            summary = rag_context.get('summary', '')
+            if summary:
+                context_parts.append(f"Context: {summary}")
+            
+            facts = rag_context.get('facts', [])
+            if facts and isinstance(facts, list):
+                for fact in facts[:3]:
+                    if isinstance(fact, str):
+                        context_parts.append(f"Fact: {fact}")
+            
+            if context_parts:
+                prompt_parts.append("\n".join(context_parts))
+        
+        if conversation_history:
+            history_parts = []
+            for msg in conversation_history[-3:]:
+                role = msg.get('role', 'user')
+                content = msg.get('content', '')[:200]
+                if role == 'user':
+                    history_parts.append(f"{user_name}: {content}")
+                else:
+                    history_parts.append(f"{self.identity['name']}: {content}")
+            
+            if history_parts:
+                prompt_parts.append("\n".join(history_parts))
+        
+        prompt_parts.append(f"{user_name}: {user_text}")
+        prompt_parts.append(f"{self.identity['name']}:")
+        
+        return "\n".join(prompt_parts)
+    
+    def _get_style_instruction(self, style: str, language: str) -> str:
+        instructions = {
+            'default': ('', ''),
+            'concise': ('Légy rövid és tömör.', 'Be concise.'),
+            'detailed': ('Magyarázz részletesen.', 'Explain in detail.'),
+            'poetic': ('Válaszolj költőien, metaforákkal.', 'Answer poetically, with metaphors.'),
+            'technical': ('Használj szakszerű, precíz nyelvezetet.', 'Use technical, precise language.')
+        }
+        hu, en = instructions.get(style, ('', ''))
+        return hu if language == 'hu' else en
+    
+    def _generate_response(self, prompt: str) -> str:
+        if self.model and self.state.model_loaded:
+            try:
+                import queue
+                result_queue = queue.Queue()
+                
+                def generate_thread():
+                    try:
+                        response = self.model.generate(
+                            prompt=prompt,
+                            max_tokens=self.generation_params.get('max_tokens', 256),
+                            temperature=self.generation_params.get('temperature', 0.7),
+                            top_p=self.generation_params.get('top_p', 0.9),
+                            top_k=self.generation_params.get('top_k', 40),
+                            repeat_penalty=self.generation_params.get('repeat_penalty', 1.1)
+                        )
+                        result_queue.put(('success', response))
+                    except Exception as e:
+                        result_queue.put(('error', str(e)))
+                
+                thread = threading.Thread(target=generate_thread)
+                thread.daemon = True
+                thread.start()
+                thread.join(timeout=30)
+                
+                if thread.is_alive():
+                    return self._get_message('timeout')
+                
+                try:
+                    status, result = result_queue.get_nowait()
+                    if status == 'success':
+                        return result
+                    return self._get_message('error', error=result)
+                except queue.Empty:
+                    return self._get_message('error', error='Empty queue')
+                    
+            except Exception as e:
+                return self._get_message('error', error=str(e))
+        
+        elif self.model and not self.state.model_loaded:
+            return self._get_message('loading')
+        
+        else:
+            return self._get_dummy_response(prompt)
+    
+    def _get_dummy_response(self, prompt: str) -> str:
+        prompt_lower = prompt.lower()
+        if any(word in prompt_lower for word in ['hello', 'hi', 'szia']):
+            return self._get_message('greeting')
+        elif '?' in prompt_lower:
+            return self._get_message('thinking')
+        else:
+            return self._get_message('acknowledge')
+    
+    def _get_message(self, msg_type: str, **kwargs) -> str:
+        if self.translator and I18N_AVAILABLE:
+            return self.translator.get(f'prompts.king.{msg_type}', **kwargs)
+        
+        fallbacks = {
+            'timeout': "⏳ I'm thinking... please wait.",
+            'loading': "🤔 I'm awakening...",
+            'error': f"😞 Error: {kwargs.get('error', 'Unknown')}",
+            'greeting': "Hello! How can I help?",
+            'thinking': "Let me think about that...",
+            'acknowledge': "I understand."
+        }
+        return fallbacks.get(msg_type, "I understand.")
+    
+    def _calculate_confidence(self) -> float:
+        base = 0.95
+        if not self.state.model_loaded:
+            base *= 0.5
+        if self.state.errors:
+            base *= max(0.5, 1.0 - (len(self.state.errors) * 0.1))
+        if self.state.rag_used:
+            base += 0.03
+        return min(0.99, max(0.1, base))
+    
+    def _get_current_mood(self) -> str:
+        if self.state.average_response_time > 10:
+            return "tired"
+        elif self.state.average_response_time > 5:
+            return "thoughtful"
+        elif self.state.average_response_time > 2:
+            return "calm"
+        return "lively"
+    
+    def _update_state(self, response_text: str, processing_time: float, tokens_used: int, responses: Dict):
+        self.state.last_response_time = processing_time
+        self.state.last_response_text = response_text[:200]
+        self.state.response_count += 1
+        self.state.total_tokens_generated += tokens_used
+        self.state.total_processing_time += processing_time
+        self.state.status = 'idle'
+        self.state.current_task = None
+        self.state.last_mood = self._get_current_mood()
+        self.state.rag_used = bool(responses.get('valet'))
+        
+        if self.state.average_response_time == 0:
+            self.state.average_response_time = processing_time
+        else:
+            self.state.average_response_time = self.state.average_response_time * 0.9 + processing_time * 0.1
+        
+        self.scratchpad.write_note(self.name, 'state', self.state.to_dict())
+    
+    def _cleanup_cache(self):
+        now = time.time()
+        to_delete = [k for k, (t, _) in self.context_cache.items() if now - t > self.cache_ttl]
+        for key in to_delete:
+            del self.context_cache[key]
     
     def _load_model(self):
-        """Modell betöltése háttérben (timeout-tal)"""
+        if not self.model:
+            return
+        
         try:
             import queue
             result_queue = queue.Queue()
@@ -222,594 +815,145 @@ class King:
             thread = threading.Thread(target=load_thread)
             thread.daemon = True
             thread.start()
-            thread.join(timeout=30)  # 30 másodperc timeout
+            thread.join(timeout=30)
             
             if thread.is_alive():
-                print("👑 King: Modell betöltés timeout (30s)")
-                self.state['model_loaded'] = False
-                self.state['errors'].append("Model load timeout")
+                self.state.model_loaded = False
+                self.state.errors.append("Model load timeout")
                 return
             
             try:
                 status, result = result_queue.get_nowait()
                 if status == 'success':
-                    self.state['model_loaded'] = result
-                    if result:
-                        print("👑 King: Modell betöltve")
-                    else:
-                        print("👑 King: Modell betöltési hiba")
+                    self.state.model_loaded = result
                 else:
-                    self.state['model_loaded'] = False
-                    self.state['errors'].append(f"Model load error: {result}")
-                    print(f"👑 King: Modell hiba: {result}")
+                    self.state.model_loaded = False
+                    self.state.errors.append(f"Model load error: {result}")
             except queue.Empty:
-                self.state['model_loaded'] = False
+                self.state.model_loaded = False
                 
         except Exception as e:
-            self.state['model_loaded'] = False
-            self.state['errors'].append(f"Model load error: {e}")
-            print(f"👑 King: Modell hiba: {e}")
+            self.state.model_loaded = False
+            self.state.errors.append(f"Model load error: {e}")
+    
+    def _error_response(self, trace_id: str, error: str) -> Dict:
+        return {
+            "type": "king_response",
+            "target": "orchestrator",
+            "trace_id": trace_id,
+            "timestamp": time.time(),
+            "payload": {
+                "response": self._get_message('error', error=error),
+                "confidence": 0.0,
+                "response_time_ms": 0,
+                "tokens_used": 0,
+                "mood": "error",
+                "rag_used": False,
+                "error": error
+            }
+        }
+    
+    # ========== PUBLIKUS API (MEGTARTVA) ==========
+    
+    def get_state(self) -> Dict:
+        return {
+            "type": "king_state",
+            "target": "jester",
+            "timestamp": time.time(),
+            "payload": self.state.to_dict()
+        }
+    
+    def set_parameters(self, params: Dict) -> Dict:
+        applied = {}
+        
+        if 'temperature' in params:
+            self.generation_params['temperature'] = max(0.1, min(2.0, params['temperature']))
+            applied['temperature'] = self.generation_params['temperature']
+        
+        if 'max_tokens' in params:
+            self.generation_params['max_tokens'] = max(64, min(2048, params['max_tokens']))
+            applied['max_tokens'] = self.generation_params['max_tokens']
+        
+        if 'style' in params and params['style'] in self.PROMPT_STYLES:
+            self.identity['style'] = params['style']
+            applied['style'] = params['style']
+            self.scratchpad.write_note(self.name, 'style', params['style'])
+        
+        if 'top_p' in params:
+            self.generation_params['top_p'] = max(0.5, min(0.99, params['top_p']))
+            applied['top_p'] = self.generation_params['top_p']
+        
+        if 'repeat_penalty' in params:
+            self.generation_params['repeat_penalty'] = max(1.0, min(1.5, params['repeat_penalty']))
+            applied['repeat_penalty'] = self.generation_params['repeat_penalty']
+        
+        return {"status": "ok", "applied": applied, "timestamp": time.time()}
+    
+    def set_identity(self, identity: Dict) -> Dict:
+        if 'name' in identity:
+            self.identity['name'] = identity['name']
+            self.scratchpad.write_note(self.name, 'name', identity['name'])
+        
+        if 'personality' in identity:
+            self.identity['personality'] = identity['personality']
+            self.scratchpad.write_note(self.name, 'personality', identity['personality'])
+        
+        if 'style' in identity and identity['style'] in self.PROMPT_STYLES:
+            self.identity['style'] = identity['style']
+            self.scratchpad.write_note(self.name, 'style', identity['style'])
+        
+        return {"status": "ok", "identity": self.identity, "timestamp": time.time()}
+    
+    def set_temperature(self, temperature: float):
+        """Jester hívja (identitás reset esetén)"""
+        self.generation_params['temperature'] = max(0.1, min(2.0, temperature))
+        self.state.temperature = self.generation_params['temperature']
+    
+    def set_identity_prompt(self, prompt: str):
+        """Jester hívja (identitás reset esetén)"""
+        self.identity['personality'] = prompt
+        self.scratchpad.write_note(self.name, 'personality', prompt)
+    
+    def get_metrics(self) -> Dict:
+        return {
+            "response_count": self.state.response_count,
+            "average_response_time_ms": round(self.state.average_response_time * 1000, 2),
+            "total_tokens": self.state.total_tokens_generated,
+            "tokens_per_second": round(
+                self.state.total_tokens_generated / max(self.state.total_processing_time, 0.001), 2
+            ),
+            "errors": len(self.state.errors),
+            "model_loaded": self.state.model_loaded,
+            "mood": self.state.last_mood,
+            "style": self.identity.get('style', 'default'),
+            "rag_used": self.state.rag_used,
+            "temperature": self.state.temperature
+        }
+    
+    def set_response_callback(self, callback):
+        self.response_callback = callback
+    
+    def set_valet(self, valet):
+        self.valet = valet
+    
+    def set_queen(self, queen):
+        self.queen = queen
+    
+    def set_language(self, language: str):
+        if self.translator and I18N_AVAILABLE:
+            self.translator.set_language(language)
     
     def start(self):
-        self.state['status'] = 'ready'
+        self.state.status = 'ready'
         self.scratchpad.set_state('king_status', 'ready', self.name)
+        print("👑 King: Készen állok.")
     
     def stop(self):
-        self.state['status'] = 'stopped'
+        self.state.status = 'stopped'
         self.scratchpad.set_state('king_status', 'stopped', self.name)
         if self.model:
             self.model.unload()
-    
-    def process(self, intent_packet: Dict[str, Any]) -> Optional[Dict[str, Any]]:
-        """
-        Intent JSON feldolgozása, response JSON visszaadása.
-        Ez az egyetlen publikus metódus (a generate_response ezt hívja).
-        """
-        start_time = time.time()
-        trace_id = intent_packet.get('header', {}).get('trace_id', 'unknown')
-        self.state['current_task'] = trace_id
-        self.state['status'] = 'processing'
-        
-        try:
-            # 1. Ellenőrizzük, hogy kell-e válaszolni
-            if not self._should_respond(intent_packet):
-                self.state['status'] = 'idle'
-                return None
-            
-            # 2. Identitás betöltése a scratchpadből
-            self._load_identity()
-            
-            # 3. RAG kontextus kinyerése az intent_packet-ből (Valet-től jött)
-            rag_context = intent_packet.get('payload', {}).get('rag_context', {})
-            self.state['rag_used'] = bool(rag_context)
-            
-            # 4. Prompt összeállítása (cache-elve, RAG kontextussal)
-            prompt = self._build_prompt_cached(intent_packet, rag_context)
-            
-            # 5. Válasz generálása
-            response = self._generate_response(prompt)
-            
-            # 6. Válasz csomag összeállítása
-            tokens_used = len(response.split())
-            processing_time = time.time() - start_time
-            
-            response_packet = {
-                'header': {
-                    'trace_id': trace_id,
-                    'in_response_to': trace_id,
-                    'timestamp': time.time(),
-                    'sender': self.name
-                },
-                'payload': {
-                    'response': response,
-                    'confidence': self._calculate_confidence(intent_packet),
-                    'response_time_ms': int(processing_time * 1000),
-                    'tokens_used': tokens_used,
-                    'mood': self._get_current_mood(),
-                    'rag_used': self.state['rag_used']
-                },
-                'state': {
-                    'status': 'success',
-                    'tokens_used': tokens_used,
-                    'processing_time': processing_time
-                }
-            }
-            
-            # 7. Állapot frissítés
-            self.state['last_response_text'] = response[:200]
-            self.state['total_tokens_generated'] += tokens_used
-            self.state['total_processing_time'] += processing_time
-            self.state['last_context_summary'] = rag_context.get('summary', '')[:100]
-            self.recent_responses.append(hashlib.md5(response.encode()).hexdigest()[:8])
-            self._update_state(intent_packet, response_packet, start_time)
-            
-            # 8. Callback hívás (ha van)
-            if self.response_callback:
-                conv_id = intent_packet.get('payload', {}).get('conversation_id')
-                self.response_callback(response, conv_id, trace_id)
-            
-            return response_packet
-            
-        except Exception as e:
-            error = str(e)
-            self.state['errors'].append(error)
-            self.state['status'] = 'error'
-            
-            error_response = {
-                'header': {
-                    'trace_id': trace_id,
-                    'timestamp': time.time(),
-                    'sender': self.name
-                },
-                'payload': {
-                    'error': error,
-                    'mood': 'error'
-                },
-                'state': {
-                    'status': 'error'
-                }
-            }
-            
-            if self.response_callback:
-                conv_id = intent_packet.get('payload', {}).get('conversation_id')
-                self.response_callback(f"Hiba: {error}", conv_id, trace_id)
-            
-            return error_response
-    
-    def _load_identity(self):
-        """Identitás betöltése a scratchpadből"""
-        stored = self.scratchpad.read_note(self.name, 'personality')
-        if stored:
-            if isinstance(stored, str):
-                self.identity['personality'] = stored
-            elif isinstance(stored, dict):
-                self.identity.update(stored)
-        
-        # Név a scratchpadből
-        name = self.scratchpad.read_note(self.name, 'name')
-        if name:
-            self.identity['name'] = name
-        
-        # Stílus a scratchpadből
-        style = self.scratchpad.read_note(self.name, 'style')
-        if style and style in self.PROMPT_STYLES:
-            self.identity['style'] = style
-    
-    def _should_respond(self, intent_packet: Dict) -> bool:
-        """Döntés: válaszoljon-e erre az intentre"""
-        payload = intent_packet.get('payload', {})
-        intent = payload.get('intent', {})
-        
-        if not isinstance(intent, dict):
-            return False
-        
-        intent_class = intent.get('class', '')
-        
-        # Ha a célpont a király
-        if intent.get('target') == 'king' and intent_class != 'none':
-            return True
-        
-        # Proaktív üzenetek
-        if intent_class == 'PROACTIVE':
-            return True
-        
-        # Fontos rendszer üzenetek
-        if intent_class in ['SYSTEM_ALERT', 'ERROR']:
-            return True
-        
-        # USER_MESSAGE (WebApp-ból jön)
-        if intent_class == 'USER_MESSAGE':
-            return True
-        
-        return False
-    
-    def _build_prompt_cached(self, intent_packet: Dict, rag_context: Dict = None) -> str:
-        """
-        Prompt összeállítása cache-eléssel a gyorsításért.
-        RAG kontextust is beépíti.
-        """
-        # Cache kulcs generálása
-        payload = intent_packet.get('payload', {})
-        text = payload.get('text', '')
-        intent_class = payload.get('intent', {}).get('class', 'unknown')
-        language = self.scratchpad.get_state('user_language', 'en')
-        
-        # RAG kontextus hash-e (ha van)
-        rag_hash = ''
-        if rag_context:
-            rag_str = f"{rag_context.get('summary', '')}_{rag_context.get('facts', [])}"
-            rag_hash = hashlib.md5(rag_str.encode()).hexdigest()[:8]
-        
-        cache_key = hashlib.md5(
-            f"{text}_{intent_class}_{language}_{self.identity['style']}_{rag_hash}".encode()
-        ).hexdigest()
-        
-        # Cache ellenőrzés
-        if cache_key in self.context_cache:
-            cached_time, cached_prompt = self.context_cache[cache_key]
-            if time.time() - cached_time < self.cache_ttl:
-                return cached_prompt
-        
-        # Új prompt építés
-        prompt = self._build_prompt(intent_packet, rag_context)
-        
-        # Cache mentés
-        self.context_cache[cache_key] = (time.time(), prompt)
-        
-        # Cache takarítás
-        if len(self.context_cache) > 100:
-            self._cleanup_cache()
-        
-        return prompt
-    
-    def _cleanup_cache(self):
-        """Régi cache bejegyzések törlése"""
-        now = time.time()
-        to_delete = []
-        for key, (timestamp, _) in self.context_cache.items():
-            if now - timestamp > self.cache_ttl:
-                to_delete.append(key)
-        for key in to_delete:
-            del self.context_cache[key]
-    
-    def _build_prompt(self, intent_packet: Dict, rag_context: Dict = None) -> str:
-        """
-        Prompt összeállítása az intent packetből és RAG kontextusból.
-        A prompt tömör, csak az aktuális üzenet + releváns kontextus.
-        """
-        payload = intent_packet.get('payload', {})
-        if not isinstance(payload, dict):
-            payload = {}
-        
-        text = payload.get('text', '')
-        if not isinstance(text, str):
-            text = str(text)
-        
-        # Felhasználó neve
-        user_name = self.scratchpad.get_state('user_name', 'user')
-        
-        # Nyelv
-        language = self.scratchpad.get_state('user_language', 'en')
-        if self.translator:
-            self.translator.set_language(language)
-        
-        # Stílus alapú prompt építés
-        style = self.identity.get('style', 'default')
-        
-        # Prompt részek
-        prompt_parts = []
-        
-        # Instrukció a modellnek, hogy ne ismételje vissza a felhasználó üzenetét
-        if language == 'hu':
-            prompt_parts.append("Figyelem: Csak a saját válaszodat írd le, ne ismételd vissza a felhasználó üzenetét!")
-            prompt_parts.append("Ne írd ki, hogy 'User:' vagy 'Assistant:'!")
-        else:
-            prompt_parts.append("Note: Only write your own response, do not repeat the user's message!")
-            prompt_parts.append("Do not write 'User:' or 'Assistant:'!")
-        
-        # Stílus prefix
-        style_prefix = self._get_style_prefix(style, language)
-        if style_prefix:
-            prompt_parts.append(style_prefix)
-        
-        # ========== RAG KONTEXTUS BEÉPÍTÉSE ==========
-        if rag_context:
-            # Összefoglaló
-            summary = rag_context.get('summary', '')
-            if summary:
-                prompt_parts.append(f"\n## Összefoglaló\n{summary}")
-            
-            # Tények
-            facts = rag_context.get('facts', [])
-            if facts:
-                facts_text = "\n".join([f"• {f}" for f in facts[:3]])
-                prompt_parts.append(f"\n## Ismert tények\n{facts_text}")
-            
-            # Gráf kontextus (kapcsolatok)
-            graph_context = rag_context.get('graph_context', [])
-            if graph_context and isinstance(graph_context, list):
-                if graph_context:
-                    graph_text = "\n".join([f"• {g}" for g in graph_context[:3]])
-                    prompt_parts.append(f"\n## Kapcsolatok\n{graph_text}")
-            
-            # Vektor kontextus (globális tudás)
-            vector_context = rag_context.get('vector_context', [])
-            if vector_context and isinstance(vector_context, list):
-                if vector_context:
-                    vector_text = "\n".join([f"• {v}" for v in vector_context[:2]])
-                    prompt_parts.append(f"\n## Tudás\n{vector_text}")
-            
-            # Érzelmi kontextus
-            emotional = rag_context.get('emotional_context', {})
-            if emotional.get('recent_mood'):
-                mood = emotional['recent_mood']
-                if language == 'hu':
-                    mood_text = {"positive": "pozitív", "negative": "negatív", "neutral": "semleges"}
-                    prompt_parts.append(f"\n## Hangulat\nA beszélgetés hangulata: {mood_text.get(mood, mood)}")
-                else:
-                    prompt_parts.append(f"\n## Mood\nThe conversation mood is: {mood}")
-        
-        # Csak az aktuális üzenet
-        prompt_parts.append(f"\n{user_name}: {text}")
-        prompt_parts.append(f"{self.identity['name']}:")
-        
-        return "\n".join(prompt_parts)
-    
-    def _get_style_prefix(self, style: str, language: str) -> str:
-        """Stílus alapú prompt előtag lekérése"""
-        if language == 'hu':
-            prefixes = {
-                'default': '',
-                'concise': 'Légy rövid és tömör.',
-                'detailed': 'Magyarázz részletesen.',
-                'poetic': 'Válaszolj költőien, metaforákkal.',
-                'technical': 'Használj szakszerű, precíz nyelvezetet.'
-            }
-        else:
-            prefixes = {
-                'default': '',
-                'concise': 'Be concise.',
-                'detailed': 'Explain in detail.',
-                'poetic': 'Answer poetically, with metaphors.',
-                'technical': 'Use technical, precise language.'
-            }
-        
-        return prefixes.get(style, '')
-    
-    def _generate_response(self, prompt: str) -> str:
-        """Válasz generálása - modell hívás timeout-tal"""
-        
-        # Ha van modell és be van töltve
-        if self.model and self.state.get('model_loaded'):
-            try:
-                import queue
-                result_queue = queue.Queue()
-                
-                def generate_thread():
-                    try:
-                        response = self.model.generate(
-                            prompt=prompt,
-                            max_tokens=self.generation_params.get('max_tokens', 256),
-                            temperature=self.generation_params.get('temperature', 0.7),
-                            top_p=self.generation_params.get('top_p', 0.9),
-                            top_k=self.generation_params.get('top_k', 40),
-                            repeat_penalty=self.generation_params.get('repeat_penalty', 1.1),
-                            stop=None,
-                            stream=False
-                        )
-                        result_queue.put(('success', response))
-                    except Exception as e:
-                        result_queue.put(('error', str(e)))
-                
-                thread = threading.Thread(target=generate_thread)
-                thread.daemon = True
-                thread.start()
-                thread.join(timeout=30)  # 30 másodperc timeout
-                
-                if thread.is_alive():
-                    self.state['errors'].append("Generation timeout")
-                    return self._get_timeout_message()
-                
-                try:
-                    status, result = result_queue.get_nowait()
-                    if status == 'success':
-                        response = result
-                        
-                        # Naplózás
-                        self.scratchpad.write(self.name, 
-                            {'response': response[:100], 'tokens': len(response.split())},
-                            'generation'
-                        )
-                        
-                        return response
-                    else:
-                        return self._get_error_message(result)
-                        
-                except queue.Empty:
-                    return self._get_error_message("Unknown error")
-                
-            except Exception as e:
-                self.state['errors'].append(f"Generation error: {e}")
-                return self._get_error_message(str(e))
-        
-        # Ha van modell, de még tölt
-        elif self.model and not self.state.get('model_loaded'):
-            return self._get_loading_message()
-        
-        # Dummy mód (nincs modell)
-        else:
-            return self._get_dummy_response(prompt)
-    
-    def _get_timeout_message(self) -> str:
-        """Időtúllépés üzenet"""
-        if self.translator:
-            return self.translator.get('prompts.king.timeout')
-        return "⏳ I'm thinking deeply... please wait."
-    
-    def _get_error_message(self, error: str) -> str:
-        """Hibaüzenet"""
-        if self.translator:
-            return self.translator.get('prompts.king.error', error=error)
-        return f"😞 Sorry, I encountered an error: {error}"
-    
-    def _get_loading_message(self) -> str:
-        """Modell töltés üzenet"""
-        if self.translator:
-            return self.translator.get('prompts.king.loading')
-        return "🤔 I'm awakening..."
-    
-    def _get_dummy_response(self, prompt: str) -> str:
-        """Dummy válasz (ha nincs modell)"""
-        prompt_lower = prompt.lower()
-        user_name = self.scratchpad.get_state('user_name', 'user')
-        
-        if "hello" in prompt_lower or "hi" in prompt_lower or "szia" in prompt_lower:
-            if self.translator:
-                return self.translator.get('prompts.king.greeting', user=user_name)
-            return f"Hello {user_name}!"
-        elif "?" in prompt:
-            if self.translator:
-                return self.translator.get('prompts.king.thinking')
-            return "Interesting question. Let me think..."
-        else:
-            if self.translator:
-                return self.translator.get('prompts.king.acknowledge')
-            return "I understand."
-    
-    def _calculate_confidence(self, intent_packet: Dict) -> float:
-        """Bizonyossági szint számítása"""
-        base = 0.95
-        
-        # Ha van modell és be van töltve
-        if not (self.model and self.state.get('model_loaded')):
-            base *= 0.5
-        
-        # Ha vannak hibák
-        if self.state['errors']:
-            base *= max(0.5, 1.0 - (len(self.state['errors']) * 0.1))
-        
-        # RAG használat növeli a bizalmat
-        if self.state.get('rag_used'):
-            base += 0.03
-        
-        # Ha van Valet
-        if hasattr(self, 'valet') and self.valet is not None:
-            base += 0.02
-        
-        # Ha van Queen
-        if hasattr(self, 'queen') and self.queen is not None:
-            base += 0.03
-        
-        return min(0.99, max(0.1, base))
-    
-    def _get_current_mood(self) -> str:
-        """Aktuális hangulat lekérése"""
-        if self.state['average_response_time'] > 10:
-            mood = "tired"
-        elif self.state['average_response_time'] > 5:
-            mood = "thoughtful"
-        elif self.state['average_response_time'] > 2:
-            mood = "calm"
-        else:
-            mood = "lively"
-        
-        self.state['last_mood'] = mood
-        return mood
-    
-    def _update_state(self, intent: Dict, response: Dict, start_time: float):
-        """Állapot frissítése (ezt nézi a Jester)"""
-        response_time = time.time() - start_time
-        
-        self.state['last_response_time'] = response_time
-        self.state['response_count'] += 1
-        self.state['status'] = 'idle'
-        self.state['current_task'] = None
-        self.state['last_mood'] = self._get_current_mood()
-        
-        # Mozgóátlag
-        if self.state['average_response_time'] == 0:
-            self.state['average_response_time'] = response_time
-        else:
-            self.state['average_response_time'] = (
-                self.state['average_response_time'] * 0.9 + response_time * 0.1
-            )
-        
-        # Állapot mentése (Jesternek)
-        self.scratchpad.write_note(self.name, 'state', dict(self.state))
-    
-    def get_state(self) -> Dict:
-        """Állapot lekérése (Jester hívja)"""
-        if isinstance(self.state, dict):
-            return {
-                **self.state,
-                'average_tokens_per_second': self._calculate_tokens_per_second(),
-                'mood': self._get_current_mood()
-            }
-        return {
-            'status': 'error',
-            'last_response_time': None,
-            'response_count': 0,
-            'average_response_time': 0,
-            'errors': [f"Invalid state: {type(self.state)}"],
-            'current_task': None,
-            'model_loaded': False,
-            'mood': 'error'
-        }
-    
-    def _calculate_tokens_per_second(self) -> float:
-        """Átlagos token/másodperc számítás"""
-        if self.state['total_processing_time'] == 0:
-            return 0
-        return self.state['total_tokens_generated'] / self.state['total_processing_time']
+        print("👑 King: Leállt.")
     
     def get_mood(self) -> str:
-        """Aktuális hangulat (UI-nak)"""
         return self._get_current_mood()
-    
-    def get_metrics(self) -> Dict:
-        """Részletes metrikák lekérése"""
-        return {
-            'response_count': self.state['response_count'],
-            'average_response_time': round(self.state['average_response_time'] * 1000, 2),
-            'total_tokens': self.state['total_tokens_generated'],
-            'average_tokens_per_second': round(self._calculate_tokens_per_second(), 2),
-            'errors': len(self.state['errors']),
-            'model_loaded': self.state['model_loaded'],
-            'mood': self._get_current_mood(),
-            'style': self.identity.get('style', 'default'),
-            'rag_used': self.state.get('rag_used', False)
-        }
-
-
-# Teszt
-if __name__ == "__main__":
-    from scratchpad import Scratchpad
-    
-    s = Scratchpad()
-    s.set_state('user_name', 'user')
-    s.write_note('king', 'personality', 'curious, helpful, witty')
-    
-    king = King(s)
-    
-    # Új metódus tesztelése
-    response = king.generate_response("Hello, how are you?")
-    print(f"Response: {response}")
-    
-    # Teszt RAG kontextussal
-    rag_context = {
-        'summary': 'User asked about the weather yesterday',
-        'facts': ['Weather was sunny', 'Temperature was 25°C'],
-        'graph_context': ['User likes sunny weather'],
-        'vector_context': ['Climate data shows summer approaching'],
-        'emotional_context': {'recent_mood': 'positive'}
-    }
-    
-    response_with_rag = king.generate_response(
-        "What's the weather like?",
-        rag_context=rag_context
-    )
-    print(f"\nResponse with RAG: {response_with_rag}")
-    
-    # Régi process metódus tesztelése
-    test_intent = {
-        'header': {
-            'trace_id': 'test-123',
-            'timestamp': time.time(),
-            'sender': 'scribe'
-        },
-        'payload': {
-            'intent': {
-                'class': 'greeting',
-                'target': 'king',
-                'confidence': 0.9
-            },
-            'text': 'Hello!',
-            'rag_context': rag_context
-        }
-    }
-    
-    response_packet = king.process(test_intent)
-    print(json.dumps(response_packet, indent=2))
-    print("\nKing state:", king.get_state())
-    print("King mood:", king.get_mood())
-    print("King metrics:", king.get_metrics())

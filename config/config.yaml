@@ -81,7 +81,7 @@ modules:
       max_http_buffer_size: 10000000
 
   gateway:
-    enabled: true
+    enabled: false
     max_external_connections: 5
     message_queue_size: 100
     trust_score_decay: 0.95        # Naponta ennyivel csökken, ha nem interaktál

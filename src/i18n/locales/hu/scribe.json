@@ -1,0 +1,49 @@
+{
+  "intents": {
+    "greeting": [
+      "szia", "szép napot", "jó reggelt", "jó napot", "jó estét", "üdv", "üdvözlet", "hello", "heló", "szevasz", "csá"
+    ],
+    "farewell": [
+      "viszlát", "szia", "később", "majd beszélünk", "isten veled", "pápá", "bye", "goodbye"
+    ],
+    "question": [
+      "mi", "ki", "hol", "mikor", "hogyan", "miért", "tudsz-e", "tudod-e", "lehet-e", "kérdezhetem", "megkérdezhetem"
+    ],
+    "command": [
+      "csináld", "írd", "mutasd", "mondd", "adj", "segíts", "végezd", "nyisd", "csukd", "futtasd", "indítsd", "állítsd", "kapcsold"
+    ],
+    "system_control": [
+      "állj le", "lépj ki", "kapcsolj ki", "indítsd újra", "betöltés", "állapot", "info", "státusz", "kilépés", "újraindítás"
+    ],
+    "knowledge_retrieval": [
+      "mi az", "mesélj erről", "magyarázd el", "definiáld", "keresd", "keress", "találd", "tudod-e", "ismersz-e", "mit tudsz"
+    ],
+    "proactive": [
+      "emlékeztess", "emlékeztető", "jegyezd meg", "jelezz", "értesíts", "ütemezz", "ne felejtsd", "szólj"
+    ],
+    "affirmation": [
+      "igen", "persze", "rendben", "oké", "igaz", "helyes", "abszolút", "pontosan", "úgy van", "aha"
+    ],
+    "negation": [
+      "nem", "nem igaz", "soha", "helytelen", "rossz", "hamis", "nem úgy", "dehogy", "nem hiszem"
+    ],
+    "gratitude": [
+      "köszi", "köszönöm", "hálás", "nagyon köszönöm", "köszi szépen", "kösz", "köszi", "gratulálok"
+    ]
+  },
+  "entities": {
+    "DATE": [
+      "ma", "holnap", "tegnap", "jövő", "múlt", "hétfő", "kedd", "szerda", "csütörtök", "péntek", "szombat", "vasárnap"
+    ],
+    "TIME": [
+      "reggel", "délelőtt", "délben", "délután", "este", "éjjel", "éjszaka", "hajnal"
+    ],
+    "PERSON": [],
+    "LOCATION": [
+      "Budapest", "Pécs", "Szeged", "Debrecen", "Miskolc", "Győr", "Kecskemét", "Székesfehérvár"
+    ]
+  },
+  "question_words": [
+    "mi", "ki", "hol", "mikor", "hogyan", "miért", "tudsz", "lehet", "szeretnéd", "kell-e", "van-e", "lesz-e"
+  ]
+}
