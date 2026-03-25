@@ -328,3 +328,20 @@ system_settings:
     hot_reload: false
     test_mode: false
     mock_responses: false
+    
+web:
+    enabled: true                    # Flask WebApp (régi) be/kikapcsolás
+    host: 0.0.0.0
+    port: 5000
+    
+    # ÚJ: statikus webszerver beállítások
+    static_enabled: true             # Statikus webszerver be/kikapcsolás
+    static_host: 0.0.0.0
+    static_port: 8000
+    web_root: null                   # Alapértelmezett: ./web
+
+api:                          # ÚJ SoulCore API
+    enabled: true
+    host: 0.0.0.0
+    port: 5001
+    ws_port: 5002  

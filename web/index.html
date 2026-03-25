@@ -1,0 +1,36 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>SoulCore</title>
+    <link rel="stylesheet" href="/css/main.css">
+</head>
+<body>
+    <div class="container">
+        <header>
+            <h1>🏰 SoulCore</h1>
+            <div class="status" id="status">Connecting...</div>
+        </header>
+        
+        <div class="main">
+            <div class="sidebar">
+                <div class="conversations">
+                    <button class="new-chat" id="newChatBtn">+ New Conversation</button>
+                    <div id="conversationList"></div>
+                </div>
+            </div>
+            
+            <div class="chat-area">
+                <div class="messages" id="messages"></div>
+                <div class="input-area">
+                    <textarea id="messageInput" placeholder="Type your message..." rows="3"></textarea>
+                    <button id="sendBtn">Send</button>
+                </div>
+            </div>
+        </div>
+    </div>
+    
+    <script src="/js/app.js"></script>
+</body>
+</html>

@@ -23,7 +23,7 @@ from src.core.orchestrator import Orchestrator
 from src.core.heartbeat import Heartbeat
 from src.core.router import Router
 from src.core.identity import SoulIdentity
-from src.agents.king import King          # <-- JAVÍTVA!
+from src.agents.king import King
 from src.agents.jester import Jester
 from src.agents.scribe import Scribe
 from src.agents.valet import Valet
@@ -38,6 +38,10 @@ from src.tools.sandbox import Sandbox
 from src.database.models import Database
 from src.i18n.translator import get_translator
 from src.bus.message_bus import MessageBus
+from src.api.server import APIServer
+
+# Statikus webszerver import
+from server.webserver import StaticServer
 
 
 class SoulCore:
@@ -53,16 +57,23 @@ class SoulCore:
         self.config = self._load_config(config_path)
         self.running = True
         self.modules = {}
-        self.current_user = None  # Aktív felhasználó
+        self.current_user = None
         self.start_time = time.time()
         
-        # Rendszer azonosító (egyedi UUID a példányhoz)
+        # Rendszer azonosító
         self.system_id = self._get_system_id()
+        
+        # API szerver (később indítjuk, miután a kernel kész)
+        self.api_server = None
+        
+        # Statikus webszerver
+        self.static_server = None
+        self.static_server_thread = None
         
         # Modulok inicializálása
         self._init_modules()
         
-        # Modulok összekapcsolása (Valet, King, Orchestrator)
+        # Modulok összekapcsolása
         self._connect_modules()
         
         # WebApp és King összekapcsolása
@@ -71,16 +82,75 @@ class SoulCore:
         # Rendszerindulás naplózása
         self._log_system_start()
         
-        # Signal kezelés a szép leálláshoz
+        # Signal kezelés
         signal.signal(signal.SIGINT, self._signal_handler)
         signal.signal(signal.SIGTERM, self._signal_handler)
         
         print(self.translator.get('system.started'))
     
-    def _connect_modules(self):
-        """Modulok összekapcsolása (Valet ↔ King ↔ Orchestrator)"""
+    # ==================== STATIKUS WEBSZERVER INDÍTÁS ====================
+    
+    def _start_static_server(self):
+        """Statikus webszerver indítása külön szálon"""
+        web_config = self.config.get('modules', {}).get('web', {})
+        static_enabled = web_config.get('static_enabled', True)
         
-        # 1. Valet és King összekapcsolása
+        if not static_enabled:
+            return
+        
+        web_host = web_config.get('static_host', '0.0.0.0')
+        web_port = web_config.get('static_port', 8000)
+        web_root = web_config.get('web_root', None)
+        
+        if web_root:
+            web_root_path = Path(web_root)
+        else:
+            web_root_path = ROOT_DIR / 'web'
+        
+        self.static_server = StaticServer(
+            host=web_host,
+            port=web_port,
+            web_root=web_root_path
+        )
+        
+        # Indítás külön szálban
+        self.static_server.start_in_thread()
+        
+        print(f"🌐 Statikus webszerver elindítva: http://{web_host}:{web_port}")
+    
+    def _stop_static_server(self):
+        """Statikus webszerver leállítása"""
+        if self.static_server:
+            print("\n🛑 Statikus webszerver leállítása...")
+            self.static_server.stop()
+    
+    # ==================== API SZERVER INDÍTÁS ====================
+    
+    def _start_api_server(self):
+        """API szerver indítása (HTTP + WebSocket)"""
+        api_config = self.config.get('modules', {}).get('api', {})
+        api_enabled = api_config.get('enabled', True)
+        
+        if not api_enabled:
+            print("⚠️ API szerver ki van kapcsolva")
+            return
+        
+        api_host = api_config.get('host', '0.0.0.0')
+        api_port = api_config.get('port', 5001)
+        ws_port = api_config.get('ws_port', 5002)
+        
+        self.api_server = APIServer(self, host=api_host, http_port=api_port, ws_port=ws_port)
+        self.api_server.start_in_thread()
+        
+        print(f"🌐 SoulCore API szerver: http://{api_host}:{api_port}")
+        print(f"🔌 WebSocket: ws://{api_host}:{ws_port}")
+    
+    # ==================== MEGLÉVŐ METÓDUSOK ====================
+    
+    def _connect_modules(self):
+        """Modulok összekapcsolása"""
+        
+        # 1. Valet és King
         if 'valet' in self.modules and 'king' in self.modules:
             valet = self.modules['valet']
             king = self.modules['king']
@@ -89,12 +159,11 @@ class SoulCore:
                 king.set_valet(valet)
                 print("👑 King ↔ Valet kapcsolat létrejött")
             
-            # Ha van embedder a King-ben, adjuk át a Valet-nek
             if hasattr(king, 'model') and king.model and hasattr(valet, 'set_embedder'):
                 valet.set_embedder(king.model)
                 print("🔗 Valet embedder beállítva (King modelljével)")
         
-        # 2. Valet és Orchestrator összekapcsolása
+        # 2. Valet és Orchestrator
         if 'valet' in self.modules and 'orchestrator' in self.modules:
             valet = self.modules['valet']
             orchestrator = self.modules['orchestrator']
@@ -103,17 +172,16 @@ class SoulCore:
                 orchestrator.set_valet(valet)
                 print("⚙️ Orchestrator ↔ Valet kapcsolat létrejött")
         
-        # 3. King és Orchestrator összekapcsolása
+        # 3. King és Orchestrator
         if 'king' in self.modules and 'orchestrator' in self.modules:
             king = self.modules['king']
             orchestrator = self.modules['orchestrator']
             
-            # King hozzáadása az orchestrator moduljaihoz
             if hasattr(orchestrator, 'modules'):
                 orchestrator.modules['king'] = king
                 print("⚙️ Orchestrator ↔ King kapcsolat létrejött")
         
-        # 4. Queen és King összekapcsolása
+        # 4. Queen és King
         if 'queen' in self.modules and 'king' in self.modules:
             queen = self.modules['queen']
             king = self.modules['king']
@@ -122,7 +190,7 @@ class SoulCore:
                 king.set_queen(queen)
                 print("👑 King ↔ Queen kapcsolat létrejött")
         
-        # 5. Valet és Scribe összekapcsolása (opcionális)
+        # 5. Valet és Scribe
         if 'valet' in self.modules and 'scribe' in self.modules:
             valet = self.modules['valet']
             scribe = self.modules['scribe']
@@ -132,14 +200,13 @@ class SoulCore:
                 print("📝 Scribe ↔ Valet kapcsolat létrejött")
     
     def _connect_webapp_king(self):
-        """WebApp és King összekapcsolása a válaszok továbbításához"""
+        """WebApp és King összekapcsolása (régi Flask)"""
+        
         if 'web' in self.modules and 'king' in self.modules:
             web = self.modules['web']
             king = self.modules['king']
             
-            # King callback beállítása a WebApp felé
             def king_response_callback(response_text, conversation_id, trace_id):
-                """A King válaszának továbbítása a WebApp felé"""
                 if web and hasattr(web, 'socketio'):
                     try:
                         web.socketio.emit("chat:response", {
@@ -154,12 +221,10 @@ class SoulCore:
                 king.set_response_callback(king_response_callback)
                 print("🔗 King ↔ WebApp kapcsolat létrejött")
         
-        # Orchestrator és WebApp összekapcsolása
         if 'web' in self.modules and 'orchestrator' in self.modules:
             orch = self.modules['orchestrator']
             web = self.modules['web']
             
-            # Orchestrator callback beállítása
             if hasattr(orch, 'set_webapp_callback'):
                 def orch_response_callback(response_text, conversation_id, trace_id):
                     if web and hasattr(web, 'socketio'):
@@ -176,7 +241,6 @@ class SoulCore:
                 print("🔗 Orchestrator ↔ WebApp kapcsolat létrejött")
     
     def _get_system_id(self) -> str:
-        """Rendszer egyedi azonosító lekérése vagy generálása"""
         id_file = ROOT_DIR / 'data' / 'system.id'
         if id_file.exists():
             with open(id_file, 'r') as f:
@@ -189,7 +253,6 @@ class SoulCore:
             return system_id
     
     def _log_system_start(self):
-        """Rendszerindulás naplózása a BlackBox-ba"""
         if 'blackbox' in self.modules:
             self.modules['blackbox'].log(
                 event_type='system',
@@ -205,7 +268,6 @@ class SoulCore:
             )
     
     def _load_config(self, config_path):
-        """Konfiguráció betöltése YAML-ből"""
         if not config_path:
             config_path = ROOT_DIR / 'config' / 'config.yaml'
         
@@ -216,13 +278,25 @@ class SoulCore:
             return config
         except Exception as e:
             print(f"⚠️ {self.translator.get('system.config_error', error=e)}")
-            # Alapértelmezett konfig (hardkódolás nélkül)
             return {
                 'system': {'name': 'SoulCore', 'version': '3.0'},
                 'modules': {
                     'heartbeat': {'enabled': True, 'interval': 1.0},
                     'router': {'enabled': True, 'zmq_enabled': False},
-                    'web': {'enabled': True, 'host': '0.0.0.0', 'port': 5000},
+                    'web': {
+                        'enabled': True,
+                        'host': '0.0.0.0',
+                        'port': 5000,
+                        'static_enabled': True,
+                        'static_host': '0.0.0.0',
+                        'static_port': 8000,
+                        'web_root': None
+                    },
+                    'api': {
+                        'enabled': True,
+                        'host': '0.0.0.0',
+                        'port': 5001
+                    },
                     'blackbox': {'enabled': True},
                     'sandbox': {'enabled': True},
                     'sentinel': {'enabled': False},
@@ -269,60 +343,45 @@ class SoulCore:
             }
     
     def _init_modules(self):
-        """Minden modul példányosítása a konfig alapján"""
+        """Minden modul példányosítása"""
         print("📦 Modulok betöltése...")
         
         # ==================== MEMÓRIA ÉS ALAP MODULOK ====================
-        # MEMÓRIA (első, mindenki ezt használja)
         self.modules['scratchpad'] = Scratchpad(
             max_history=self.config.get('memory', {}).get('scratchpad_max_entries', 1000)
         )
 
-        # ADATBÁZIS (második, mert mások használhatják)
         db_path = self.config.get('database', {}).get('path', 'data/soulcore.db')
         self.modules['database'] = Database(db_path)
         
-        # Adatbázis táblák létrehozása
         self._init_database_tables()
-        
-        # Alapértelmezett felhasználó létrehozása
         self._init_default_user()
-        
-        # Aktív személyiség betöltése
         self._load_active_personality()
         
-        # IDENTITY (lélek)
         identity_file = self.config.get('system', {}).get('identity_file', 'config/identity.inf')
         self.modules['identity'] = SoulIdentity(self.modules['scratchpad'], config_path=ROOT_DIR / identity_file)
 
-        # EYE-CORE (vizuális)
         if self.config.get('modules', {}).get('eyecore', {}).get('enabled', False):
             eyecore_config = self.config['modules']['eyecore']
             eyecore = EyeCore(self.modules['scratchpad'], config=eyecore_config)
             self.modules['eyecore'] = eyecore
 
-        # SENTINEL (hardver)
         if self.config.get('modules', {}).get('sentinel', {}).get('enabled', False):
             sentinel_config = self.config['modules']['sentinel']
             sentinel = HardwareSentinel(self.modules['scratchpad'], config=sentinel_config)
             self.modules['sentinel'] = sentinel
 
-        # BLACKBOX (naplózás)
         if self.config.get('modules', {}).get('blackbox', {}).get('enabled', True):
             blackbox_config = self.config['modules']['blackbox']
             blackbox = BlackBox(self.modules['scratchpad'], config=blackbox_config)
             self.modules['blackbox'] = blackbox
             
-        # SANDBOX (kód futtatás)
         if self.config.get('modules', {}).get('sandbox', {}).get('enabled', True):
             sandbox_config = self.config['modules']['sandbox']
             sandbox = Sandbox(self.modules['scratchpad'], config=sandbox_config)
             self.modules['sandbox'] = sandbox
 
-        # ==================== BUSZ (MESSAGE BUS) - ELSŐNEK KELL! ====================
-        from src.bus.message_bus import MessageBus
-        
-        # Busz létrehozása (mindenki ezt fogja használni)
+        # ==================== BUSZ ====================
         bus_config = self.config.get('bus', {})
         self.modules['bus'] = MessageBus(bus_config)
         self.modules['bus'].start()
@@ -330,18 +389,15 @@ class SoulCore:
 
         # ==================== CORE MODULOK ====================
         
-        # Orchestrator (központi idegrendszer)
         self.modules['orchestrator'] = Orchestrator(
             scratchpad=self.modules['scratchpad'],
             message_bus=self.modules['bus'],
             config=self.config.get('orchestrator', {})
         )
         
-        # Adatbázis beállítása az Orchestratorban
         if 'database' in self.modules:
             self.modules['orchestrator'].set_database(self.modules['database'])
         
-        # Router (kommunikáció)
         if self.config.get('modules', {}).get('router', {}).get('enabled', True):
             router = Router(
                 scratchpad=self.modules['scratchpad'],
@@ -349,7 +405,6 @@ class SoulCore:
             )
             self.modules['router'] = router
         
-        # Heartbeat (időérzék)
         if self.config.get('modules', {}).get('heartbeat', {}).get('enabled', True):
             hb_config = self.config['modules']['heartbeat']
             heartbeat = Heartbeat(
@@ -359,26 +414,21 @@ class SoulCore:
             )
             self.modules['heartbeat'] = heartbeat
 
-        # GATEWAY (külső kapcsolat)
         if self.config.get('modules', {}).get('gateway', {}).get('enabled', False):
             gateway_config = self.config['modules']['gateway']
-            
-            # Ellenőrizzük, hogy a DiplomaticGateway milyen paramétereket vár
-            # Ha nem vár message_bus-t, akkor ne adjuk át
             try:
                 gateway = DiplomaticGateway(
                     scratchpad=self.modules['scratchpad'],
-                    orchestrator=self.modules['orchestrator'],  # ha kell neki orchestrator
+                    orchestrator=self.modules['orchestrator'],
                     config=gateway_config
                 )
                 gateway.system_id = self.system_id
                 self.modules['gateway'] = gateway
             except TypeError as e:
                 print(f"⚠️ Gateway inicializálási hiba: {e}")
-                print("   Gateway kikapcsolva")
                 
         # ==================== ÁGENSEK ====================
-        # Scribe (írás)
+        
         if self.config.get('agents', {}).get('scribe', {}).get('enabled', True):
             scribe = Scribe(
                 scratchpad=self.modules['scratchpad'],
@@ -388,7 +438,6 @@ class SoulCore:
             scribe.translator = self.translator
             self.modules['scribe'] = scribe
         
-        # Valet (memória) - a King ELŐTT kell lennie!
         if self.config.get('agents', {}).get('valet', {}).get('enabled', True):
             valet_config = self.config['agents']['valet']
             valet = Valet(
@@ -399,11 +448,8 @@ class SoulCore:
             valet.translator = self.translator
             self.modules['valet'] = valet
         
-        # Queen (logika) - a King ELŐTT kell lennie!
         if self.config.get('agents', {}).get('queen', {}).get('enabled', False):
             queen_config = self.config['agents']['queen']
-            
-            # Ha külön modell kell a Queennek
             queen_model_path = queen_config.get('model', 'none')
             queen_model = None
             
@@ -413,7 +459,7 @@ class SoulCore:
                     queen_model = ModelWrapper(queen_model_path, {
                         'n_gpu_layers': queen_config.get('n_gpu_layers', -1),
                         'n_ctx': queen_config.get('n_ctx', 4096),
-                        'main_gpu': 1  # Queen a második GPU-n
+                        'main_gpu': 1
                     })
                 except Exception as e:
                     print(f"⚠️ {self.translator.get('errors.model_load_error', error=e)}")
@@ -427,7 +473,7 @@ class SoulCore:
             queen.translator = self.translator
             self.modules['queen'] = queen
         
-        # King (király) - ModelWrapper-rel
+        # King - FONTOS: a king változót el kell menteni a self.king-be is!
         if self.config.get('agents', {}).get('king', {}).get('enabled', True):
             king_config = self.config['agents']['king']
             model_path = king_config.get('model')
@@ -482,8 +528,8 @@ class SoulCore:
                 self.modules['scratchpad'].write_note('king', 'personality', king_config['personality'])
             
             self.modules['king'] = king
+            self.king = king  # <-- FONTOS! API szerver ezt használja
         
-        # Jester (bohóc)
         if self.config.get('agents', {}).get('jester', {}).get('enabled', True):
             jester_config = self.config['agents']['jester']
             jester = Jester(
@@ -494,7 +540,7 @@ class SoulCore:
             jester.translator = self.translator
             self.modules['jester'] = jester
 
-        # ==================== WEB ====================
+        # ==================== WEB (RÉGI FLASK) ====================
         if self.config.get('modules', {}).get('web', {}).get('enabled', True):
             web_config = self.config['modules']['web']
             web = WebApp(self.modules)
@@ -503,18 +549,18 @@ class SoulCore:
             web.translator = self.translator
             web.system_id = self.system_id
             self.modules['web'] = web
+            print("⚠️ Flask WebApp (régi) bekapcsolva - kompatibilitás miatt")
+        else:
+            print("📁 Flask WebApp (régi) kikapcsolva")
         
         print(f"✅ {len(self.modules)} modul betöltve")
     
-    
     def _init_database_tables(self):
-        """Adatbázis táblák létrehozása (kiegészítve a szükséges táblákkal)"""
         db = self.modules['database']
         
         with db.lock:
             conn = db._get_connection()
             
-            # Személyiségek tábla
             conn.execute("""
                 CREATE TABLE IF NOT EXISTS personalities (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -527,7 +573,6 @@ class SoulCore:
                 )
             """)
             
-            # Rendszerbeállítások tábla
             conn.execute("""
                 CREATE TABLE IF NOT EXISTS system_settings (
                     key TEXT PRIMARY KEY,
@@ -539,7 +584,6 @@ class SoulCore:
                 )
             """)
             
-            # Felhasználók tábla
             conn.execute("""
                 CREATE TABLE IF NOT EXISTS users (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -553,7 +597,6 @@ class SoulCore:
                 )
             """)
             
-            # Sessionök tábla
             conn.execute("""
                 CREATE TABLE IF NOT EXISTS sessions (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -565,7 +608,6 @@ class SoulCore:
                 )
             """)
             
-            # Beszélgetések tábla
             conn.execute("""
                 CREATE TABLE IF NOT EXISTS conversations (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -577,7 +619,6 @@ class SoulCore:
                 )
             """)
             
-            # Üzenetek tábla
             conn.execute("""
                 CREATE TABLE IF NOT EXISTS messages (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -592,7 +633,6 @@ class SoulCore:
                 )
             """)
             
-            # Emlékek tábla (Vault)
             conn.execute("""
                 CREATE TABLE IF NOT EXISTS memories (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -608,7 +648,6 @@ class SoulCore:
                 )
             """)
             
-            # Kapcsolatok tábla (gráf)
             conn.execute("""
                 CREATE TABLE IF NOT EXISTS relationships (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -621,7 +660,6 @@ class SoulCore:
                 )
             """)
             
-            # Audit log tábla (biztonsági napló)
             conn.execute("""
                 CREATE TABLE IF NOT EXISTS audit_log (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -635,7 +673,6 @@ class SoulCore:
                 )
             """)
             
-            # Teljesítmény metrikák tábla
             conn.execute("""
                 CREATE TABLE IF NOT EXISTS performance_metrics (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -651,7 +688,6 @@ class SoulCore:
             conn.close()
     
     def _init_default_user(self):
-        """Alapértelmezett felhasználó létrehozása, ha még nincs"""
         db = self.modules['database']
         
         with db.lock:
@@ -671,7 +707,6 @@ class SoulCore:
                 
                 user_id = cursor.lastrowid
                 
-                # Session token létrehozása
                 token = secrets.token_urlsafe(32)
                 expires_at = time.time() + 30 * 86400
                 
@@ -691,15 +726,13 @@ class SoulCore:
                 
                 self.translator.set_language(default_language)
                 
-                print(f"👤 Alapértelmezett felhasználó létrehozva: {default_name} ({default_language})")
+                print(f"👤 Alapértelmezett felhasználó: {default_name} ({default_language})")
                 
-                # Alapértelmezett beszélgetés létrehozása
                 conn.execute("""
                     INSERT INTO conversations (user_id, title)
                     VALUES (?, ?)
                 """, (user_id, self.translator.get('conversation.default_title', 'New Conversation')))
                 
-                # Audit log
                 conn.execute("""
                     INSERT INTO audit_log (user_id, action, resource, details)
                     VALUES (?, ?, ?, ?)
@@ -709,7 +742,6 @@ class SoulCore:
             conn.close()
     
     def _load_active_personality(self):
-        """Aktív személyiség betöltése az adatbázisból"""
         db = self.modules['database']
         
         with db.lock:
@@ -720,9 +752,8 @@ class SoulCore:
             
             if row:
                 self.active_personality = row[0]
-                print(f"👑 Aktív személyiség betöltve az adatbázisból")
+                print(f"👑 Aktív személyiség betöltve")
             else:
-                # Alapértelmezett személyiség (hardkódolás nélkül, általános)
                 default_personality = '''GENERAL:
 name: Sovereign
 title: The First
@@ -756,12 +787,11 @@ rules: Think for yourself.
             conn.close()
     
     def _signal_handler(self, signum, frame):
-        """Szép leállítás signal esetén (Ctrl+C)"""
         print(f"\n⚠️ {self.translator.get('system.stopping')}")
         self.shutdown()
     
     def start(self):
-        """Minden modul indítása a megfelelő sorrendben"""
+        """Minden modul indítása"""
         print("🚀 Modulok indítása...")
         
         start_order = [
@@ -795,6 +825,19 @@ rules: Think for yourself.
                     except Exception as e:
                         print(f"  ❌ {name} hiba: {e}")
         
+        # API szerver indítása (kernel után)
+        self._start_api_server()
+        
+        # Statikus webszerver indítása
+        web_config = self.config.get('modules', {}).get('web', {})
+        static_enabled = web_config.get('static_enabled', True)
+        
+        if static_enabled:
+            print("\n📁 Statikus webszerver indítása...")
+            self._start_static_server()
+        else:
+            print("\n⚠️ Statikus webszerver ki van kapcsolva")
+        
         if self.current_user:
             self.modules['scratchpad'].set_state('user_name', self.current_user['display_name'], 'system')
             self.modules['scratchpad'].set_state('user_language', self.current_user['language'], 'system')
@@ -803,11 +846,25 @@ rules: Think for yourself.
         print(f"\n✅ {self.translator.get('system.started')}")
         print(f"   System ID: {self.system_id[:8]}...")
         
-        if 'web' in self.modules:
-            web_config = self.config.get('modules', {}).get('web', {})
+        web_config = self.config.get('modules', {}).get('web', {})
+        if web_config.get('enabled', True):
             host = web_config.get('host', '0.0.0.0')
             port = web_config.get('port', 5000)
-            print(f"🌐 Web UI: http://{host if host != '0.0.0.0' else 'localhost'}:{port}")
+            print(f"🌐 Flask WebApp (régi): http://{host if host != '0.0.0.0' else 'localhost'}:{port}")
+        
+        if static_enabled:
+            static_host = web_config.get('static_host', '0.0.0.0')
+            static_port = web_config.get('static_port', 8000)
+            print(f"🌐 Statikus weboldal: http://{static_host if static_host != '0.0.0.0' else 'localhost'}:{static_port}")
+        
+        api_config = self.config.get('modules', {}).get('api', {})
+        if api_config.get('enabled', True):
+            api_host = api_config.get('host', '0.0.0.0')
+            api_port = api_config.get('port', 5001)
+            print(f"🌐 SoulCore API: http://{api_host if api_host != '0.0.0.0' else 'localhost'}:{api_port}")
+        
+        print("\n💡 A statikus weboldal JavaScript-je hívja a SoulCore API-t (localhost:5001)")
+        print("=" * 50)
         
         try:
             while self.running:
@@ -816,11 +873,12 @@ rules: Think for yourself.
             self.shutdown()
     
     def shutdown(self):
-        """Minden modul szép leállítása (fordított sorrendben)"""
+        """Minden modul leállítása"""
         print(f"\n📴 {self.translator.get('system.stopping')}")
         self.running = False
         
-        # Rendszerleállás naplózása
+        self._stop_static_server()
+        
         if 'blackbox' in self.modules:
             uptime = time.time() - self.start_time
             self.modules['blackbox'].log(
