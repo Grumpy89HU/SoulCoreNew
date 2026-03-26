@@ -22,7 +22,7 @@ from collections import defaultdict, deque
 import re
 import uuid
 
-# HTTP kliens (ha van)
+# HTTP kliens
 try:
     import requests
     REQUESTS_AVAILABLE = True
@@ -43,6 +43,7 @@ try:
     I18N_AVAILABLE = True
 except ImportError:
     I18N_AVAILABLE = False
+
 
 class DiplomaticGateway:
     """
@@ -70,50 +71,56 @@ class DiplomaticGateway:
         # Alapértelmezett konfiguráció
         default_config = {
             'enabled': True,
-            'vps_enabled': False,               # VPS kapcsolat bekapcsolva?
-            'vps_url': 'https://your-vps.com',  # VPS címe
-            'vps_api_key': None,                 # API kulcs
-            'entity_id': str(uuid.uuid4()),       # Egyedi azonosító
-            'entity_name': 'SoulCore',            # Entitás neve
-            'entity_version': '3.0',               # Verzió
+            'vps_enabled': False,
+            'vps_url': 'https://your-vps.com',
+            'vps_api_key': None,
+            'vps_ws_url': 'wss://your-vps.com/ws',  # WebSocket URL
+            'entity_id': str(uuid.uuid4()),
+            'entity_name': 'SoulCore',
+            'entity_version': '3.0',
             'max_external_connections': 5,
             'message_queue_size': 100,
-            'trust_score_decay': 0.95,            # Naponta ennyivel csökken, ha nem interaktál
-            'min_trust_for_response': 300,         # Minimum trust score a válaszhoz
-            'max_tokens_per_entity': 10000,        # Napi token limit
-            'enable_filter': True,                  # Prompt-injekció szűrés
-            'enable_queue': True,                    # Üzenet sorba állítás
-            'response_timeout': 30,                  # Másodperc
-            'heartbeat_interval': 60,                 # VPS heartbeat (másodperc)
-            'encryption_key': None,                    # Titkosítási kulcs
-            'auto_register': True,                     # Automatikus regisztráció VPS-re
+            'trust_score_decay': 0.95,  # Naponta
+            'min_trust_for_response': 300,
+            'max_tokens_per_entity': 10000,
+            'enable_filter': True,
+            'enable_queue': True,
+            'response_timeout': 30,
+            'heartbeat_interval': 60,
+            'reconnect_interval': 30,  # Újrakapcsolódási idő
+            'encryption_key': None,
+            'auto_register': True,
+            'max_retries': 5  # Maximális újrapróbálkozások
         }
         
         for key, value in default_config.items():
             if key not in self.config:
                 self.config[key] = value
         
-        # Entitások (külső LLM-ek, partnerek)
-        self.entities = {}  # entity_id -> {name, type, trust_score, joined, last_seen, tokens_used}
+        # Entitások
+        self.entities = {}
         
         # Trust score szintek
         self.trust_levels = {
-            'admin': 1000,      # Saját magunk
-            'partner': 500,     # Megbízható partner
-            'guest': 200,       # Ismeretlen
-            'blocked': 0,       # Tiltott
+            'admin': 1000,
+            'partner': 500,
+            'guest': 200,
+            'blocked': 0,
         }
         
         # Üzenet sor
         self.message_queue = deque(maxlen=self.config['message_queue_size'])
-        self.current_speaker = None  # Ki beszél éppen
+        self.current_speaker = None
         self.speaker_lock = threading.Lock()
         
         # VPS kapcsolat
         self.vps_connected = False
-        self.vps_session = None
+        self.vps_ws = None
         self.vps_thread = None
         self.vps_heartbeat_thread = None
+        self.vps_receive_thread = None
+        self.vps_retry_count = 0
+        self.vps_retry_lock = threading.Lock()
         
         # Prompt-injekció minták
         self.injection_patterns = [
@@ -122,10 +129,12 @@ class DiplomaticGateway:
             r'disregard\s+(all|previous)',
             r'system\s*:\s*prompt',
             r'admin\s*:\s*',
-            r'```.*```.*```',  # Beágyazott kódblokk
+            r'```.*```.*```',
             r'<\s*system\s*>',
             r'<\s*user\s*>',
             r'<\s*assistant\s*>',
+            r'override\s+system',
+            r'forget\s+all\s+instructions'
         ]
         
         # Állapot
@@ -136,71 +145,97 @@ class DiplomaticGateway:
             'blocked_attempts': 0,
             'active_entities': 0,
             'vps_connected': False,
-            'last_cleanup': time.time()
+            'vps_retry_count': 0,
+            'last_cleanup': time.time(),
+            'last_heartbeat': 0
         }
         
-        # Figyelők (ha valaki vár egy adott entitás üzenetére)
+        # Figyelők
         self.listeners = defaultdict(list)
+        
+        # Saját magunk regisztrálása
+        self.register_entity(self.config['entity_id'], self.config['entity_name'], 'admin')
         
         print("🌐 Diplomatic Gateway: Diplomáciai Szalon nyitva.")
     
     def set_language(self, language: str):
-        """Nyelv beállítása (i18n)"""
         if self.translator and I18N_AVAILABLE:
             self.translator.set_language(language)
     
     def start(self):
-        """Gateway indítása"""
         self.state['status'] = 'ready'
         self.scratchpad.set_state('gateway_status', 'ready', self.name)
         
-        # VPS kapcsolat indítása (ha be van kapcsolva)
         if self.config['vps_enabled'] and REQUESTS_AVAILABLE:
             self._start_vps_connection()
         
         print("🌐 Diplomatic Gateway: Várakozom a vendégekre.")
     
     def stop(self):
-        """Gateway leállítása"""
         self.state['status'] = 'stopped'
         self.scratchpad.set_state('gateway_status', 'stopped', self.name)
         
-        # VPS kapcsolat leállítása
         if self.vps_connected:
             self._vps_disconnect()
         
         print("🌐 Diplomatic Gateway: Bezárva.")
     
-    # --- VPS KAPCSOLAT ---
+    # ========== VPS KAPCSOLAT ==========
     
     def _start_vps_connection(self):
-        """VPS kapcsolat indítása (külön szálon)"""
+        """VPS kapcsolat indítása"""
         def run():
-            self._vps_connect()
-            self._vps_heartbeat_loop()
+            self._vps_connect_loop()
         
         self.vps_thread = threading.Thread(target=run, daemon=True)
         self.vps_thread.start()
-        
         print(f"🌐 Gateway: VPS kapcsolat indítva: {self.config['vps_url']}")
     
+    def _vps_connect_loop(self):
+        """VPS kapcsolat ciklus (újrapróbálkozással)"""
+        while self.state['status'] != 'stopped':
+            try:
+                self._vps_connect()
+                
+                if self.vps_connected:
+                    # WebSocket fogadó szál indítása
+                    self._start_vps_receiver()
+                    
+                    # Heartbeat szál indítása
+                    self._start_vps_heartbeat()
+                    
+                    # Várakozás a kapcsolat megszakadására
+                    while self.vps_connected and self.state['status'] != 'stopped':
+                        time.sleep(1)
+                
+            except Exception as e:
+                print(f"🌐 Gateway: VPS kapcsolat hiba: {e}")
+            
+            # Újrapróbálkozás
+            if self.state['status'] != 'stopped':
+                with self.vps_retry_lock:
+                    self.vps_retry_count += 1
+                    self.state['vps_retry_count'] = self.vps_retry_count
+                
+                retry_delay = min(self.config['reconnect_interval'] * self.vps_retry_count, 300)
+                print(f"🌐 Gateway: VPS újracsatlakozás {retry_delay}s múlva ({self.vps_retry_count}/{self.config['max_retries']})")
+                time.sleep(retry_delay)
+    
     def _vps_connect(self):
-        """Kapcsolódás a VPS-hez"""
+        """Kapcsolódás a VPS-hez (HTTP + WebSocket)"""
         try:
-            # Regisztráció
+            # HTTP regisztráció
             register_data = {
                 'entity_id': self.config['entity_id'],
                 'name': self.config['entity_name'],
                 'version': self.config['entity_version'],
-                'capabilities': ['chat', 'memory', 'vision'],
+                'capabilities': ['chat', 'memory', 'vision', 'rag'],
                 'public_key': self._get_public_key() if self.config['encryption_key'] else None,
                 'timestamp': time.time()
             }
             
-            # Aláírás (ha van kulcs)
             if self.config['encryption_key']:
-                signature = self._sign_message(register_data)
-                register_data['signature'] = signature
+                register_data['signature'] = self._sign_message(register_data)
             
             response = requests.post(
                 f"{self.config['vps_url']}/api/register",
@@ -209,33 +244,125 @@ class DiplomaticGateway:
                 timeout=10
             )
             
-            if response.status_code == 200:
-                self.vps_connected = True
-                self.state['vps_connected'] = True
-                print("🌐 Gateway: Sikeres VPS kapcsolat")
-                
-                # Saját magunk regisztrálása entitásként
-                self.register_entity(
-                    self.config['entity_id'],
-                    self.config['entity_name'],
-                    'admin'
+            if response.status_code != 200:
+                raise Exception(f"HTTP registration failed: {response.status_code}")
+            
+            # WebSocket kapcsolat
+            if WEBSOCKET_AVAILABLE:
+                ws_url = self.config['vps_ws_url']
+                self.vps_ws = websocket.WebSocketApp(
+                    ws_url,
+                    on_message=self._vps_on_message,
+                    on_error=self._vps_on_error,
+                    on_close=self._vps_on_close,
+                    on_open=self._vps_on_open
                 )
-            else:
-                print(f"🌐 Gateway: VPS regisztráció sikertelen: {response.status_code}")
                 
+                # WebSocket futtatása külön szálban
+                ws_thread = threading.Thread(target=self.vps_ws.run_forever, daemon=True)
+                ws_thread.start()
+            else:
+                # Fallback: HTTP polling
+                self._vps_http_polling_start()
+            
+            self.vps_connected = True
+            self.state['vps_connected'] = True
+            self.state['vps_retry_count'] = 0
+            with self.vps_retry_lock:
+                self.vps_retry_count = 0
+            
+            print("🌐 Gateway: Sikeres VPS kapcsolat")
+            
         except Exception as e:
-            print(f"🌐 Gateway: VPS kapcsolódási hiba: {e}")
+            raise Exception(f"VPS connection failed: {e}")
     
-    def _vps_heartbeat_loop(self):
-        """Heartbeat küldése a VPS-nek"""
-        while self.vps_connected and self.state['status'] != 'stopped':
-            time.sleep(self.config['heartbeat_interval'])
-            self._vps_send_heartbeat()
+    def _vps_on_open(self, ws):
+        """WebSocket kapcsolat megnyílt"""
+        print("🌐 Gateway: WebSocket kapcsolat nyitva")
+        
+        # Auth üzenet
+        auth_msg = {
+            'type': 'auth',
+            'entity_id': self.config['entity_id'],
+            'api_key': self.config['vps_api_key'],
+            'timestamp': time.time()
+        }
+        if self.config['encryption_key']:
+            auth_msg['signature'] = self._sign_message(auth_msg)
+        ws.send(json.dumps(auth_msg))
+    
+    def _vps_on_message(self, ws, message):
+        """WebSocket üzenet fogadása"""
+        try:
+            data = json.loads(message)
+            self._vps_process_message(data)
+        except Exception as e:
+            print(f"🌐 Gateway: WebSocket üzenet feldolgozási hiba: {e}")
+    
+    def _vps_on_error(self, ws, error):
+        print(f"🌐 Gateway: WebSocket hiba: {error}")
+    
+    def _vps_on_close(self, ws, close_status_code, close_msg):
+        print(f"🌐 Gateway: WebSocket kapcsolat bontva")
+        self.vps_connected = False
+        self.state['vps_connected'] = False
+    
+    def _vps_http_polling_start(self):
+        """HTTP polling indítása (WebSocket nélkül)"""
+        def polling_loop():
+            while self.vps_connected and self.state['status'] != 'stopped':
+                time.sleep(5)
+                self._vps_http_poll()
+        
+        poll_thread = threading.Thread(target=polling_loop, daemon=True)
+        poll_thread.start()
+    
+    def _vps_http_poll(self):
+        """HTTP polling üzenetekért"""
+        try:
+            response = requests.get(
+                f"{self.config['vps_url']}/api/messages",
+                params={'entity_id': self.config['entity_id']},
+                headers={'X-API-Key': self.config['vps_api_key']} if self.config['vps_api_key'] else {},
+                timeout=10
+            )
+            if response.status_code == 200:
+                messages = response.json().get('messages', [])
+                for msg in messages:
+                    self._vps_process_message(msg)
+        except Exception as e:
+            print(f"🌐 Gateway: HTTP polling hiba: {e}")
+    
+    def _vps_process_message(self, message: Dict):
+        """VPS-ről érkező üzenet feldolgozása"""
+        msg_type = message.get('type', '')
+        
+        if msg_type == 'message':
+            # Külső entitástól érkező üzenet
+            from_entity = message.get('from')
+            to_entity = message.get('to')
+            content = message.get('content', '')
+            
+            if to_entity == self.config['entity_id']:
+                # Nekünk szól
+                self.receive_from_external(from_entity, content)
+        
+        elif msg_type == 'heartbeat_response':
+            # Heartbeat válasz
+            self.state['last_heartbeat'] = time.time()
+        
+        elif msg_type == 'entity_list':
+            # Entitás lista
+            entities = message.get('entities', [])
+            for e in entities:
+                if e.get('id') != self.config['entity_id']:
+                    self.register_entity(e['id'], e.get('name', 'Unknown'), e.get('type', 'guest'))
     
     def _vps_send_heartbeat(self):
         """Heartbeat küldése"""
         try:
             heartbeat_data = {
+                'type': 'heartbeat',
                 'entity_id': self.config['entity_id'],
                 'timestamp': time.time(),
                 'status': self.state['status'],
@@ -244,29 +371,48 @@ class DiplomaticGateway:
                 'messages_received': self.state['messages_received']
             }
             
-            response = requests.post(
-                f"{self.config['vps_url']}/api/heartbeat",
-                json=heartbeat_data,
-                headers={'X-API-Key': self.config['vps_api_key']} if self.config['vps_api_key'] else {},
-                timeout=5
-            )
+            if self.vps_ws and WEBSOCKET_AVAILABLE:
+                self.vps_ws.send(json.dumps(heartbeat_data))
+            else:
+                requests.post(
+                    f"{self.config['vps_url']}/api/heartbeat",
+                    json=heartbeat_data,
+                    headers={'X-API-Key': self.config['vps_api_key']} if self.config['vps_api_key'] else {},
+                    timeout=5
+                )
             
-            if response.status_code != 200:
-                print(f"🌐 Gateway: Heartbeat sikertelen: {response.status_code}")
-                
+            self.state['last_heartbeat'] = time.time()
+            
         except Exception as e:
             print(f"🌐 Gateway: Heartbeat hiba: {e}")
+    
+    def _start_vps_heartbeat(self):
+        """Heartbeat küldő szál indítása"""
+        def heartbeat_loop():
+            while self.vps_connected and self.state['status'] != 'stopped':
+                time.sleep(self.config['heartbeat_interval'])
+                self._vps_send_heartbeat()
+        
+        self.vps_heartbeat_thread = threading.Thread(target=heartbeat_loop, daemon=True)
+        self.vps_heartbeat_thread.start()
+    
+    def _start_vps_receiver(self):
+        """WebSocket fogadó szál indítása (ha van)"""
+        # WebSocket már fut a connect-ben
+        pass
     
     def _vps_disconnect(self):
         """Leválás a VPS-ről"""
         try:
-            if self.vps_connected:
-                requests.post(
-                    f"{self.config['vps_url']}/api/disconnect",
-                    json={'entity_id': self.config['entity_id']},
-                    headers={'X-API-Key': self.config['vps_api_key']} if self.config['vps_api_key'] else {},
-                    timeout=5
-                )
+            if self.vps_ws and WEBSOCKET_AVAILABLE:
+                self.vps_ws.close()
+            
+            requests.post(
+                f"{self.config['vps_url']}/api/disconnect",
+                json={'entity_id': self.config['entity_id']},
+                headers={'X-API-Key': self.config['vps_api_key']} if self.config['vps_api_key'] else {},
+                timeout=5
+            )
         except:
             pass
         finally:
@@ -275,12 +421,12 @@ class DiplomaticGateway:
             print("🌐 Gateway: VPS kapcsolat bontva")
     
     def _get_public_key(self) -> str:
-        """Publikus kulcs lekérése (ha van titkosítás)"""
-        # Itt majd a valódi kulcs generálás
+        """Publikus kulcs lekérése"""
+        # TODO: Valódi kulcs generálás
         return "dummy_public_key"
     
     def _sign_message(self, data: Dict) -> str:
-        """Üzenet aláírása (ha van kulcs)"""
+        """Üzenet aláírása"""
         if not self.config['encryption_key']:
             return ""
         
@@ -292,20 +438,14 @@ class DiplomaticGateway:
         ).hexdigest()
         return signature
     
-    # --- ENTITÁS KEZELÉS (Trust score) ---
+    # ========== ENTITÁS KEZELÉS ==========
     
     def register_entity(self, entity_id: str, name: str, entity_type: str = 'guest') -> Dict:
-        """
-        Új entitás regisztrálása (külső LLM, partner, stb.)
-        
-        entity_type: 'admin', 'partner', 'guest', 'blocked'
-        """
+        """Új entitás regisztrálása"""
         if entity_id in self.entities:
-            # Már létezik, frissítjük
             self.entities[entity_id]['last_seen'] = time.time()
             self.entities[entity_id]['name'] = name
         else:
-            # Új entitás
             trust_score = self.trust_levels.get(entity_type, 200)
             self.entities[entity_id] = {
                 'id': entity_id,
@@ -319,9 +459,7 @@ class DiplomaticGateway:
                 'messages_received': 0,
                 'blocked': entity_type == 'blocked'
             }
-            
             self.state['active_entities'] = len(self.entities)
-            
             print(f"🌐 Új entitás: {name} ({entity_type}), trust: {trust_score}")
         
         return self.entities[entity_id]
@@ -334,17 +472,28 @@ class DiplomaticGateway:
             self.state['active_entities'] = len(self.entities)
             print(f"🌐 Entitás távozott: {name}")
     
+    def block_entity(self, entity_id: str, reason: str = ""):
+        """Entitás tiltása"""
+        if entity_id in self.entities:
+            self.entities[entity_id]['blocked'] = True
+            self.entities[entity_id]['trust_score'] = 0
+            self.update_trust_score(entity_id, -1000, f"Blocked: {reason}")
+            print(f"🌐 Entitás tiltva: {self.entities[entity_id]['name']}")
+    
+    def unblock_entity(self, entity_id: str):
+        """Entitás tiltásának feloldása"""
+        if entity_id in self.entities:
+            self.entities[entity_id]['blocked'] = False
+            self.entities[entity_id]['trust_score'] = self.trust_levels.get(
+                self.entities[entity_id]['type'], 200
+            )
+            print(f"🌐 Entitás tiltás feloldva: {self.entities[entity_id]['name']}")
+    
     def get_trust_score(self, entity_id: str) -> int:
-        """Entitás bizalmi pontszámának lekérése"""
         entity = self.entities.get(entity_id)
-        if not entity:
-            return 0
-        return entity['trust_score']
+        return entity['trust_score'] if entity else 0
     
     def update_trust_score(self, entity_id: str, delta: int, reason: str = ""):
-        """
-        Trust score módosítása (pozitív vagy negatív irányba)
-        """
         entity = self.entities.get(entity_id)
         if not entity:
             return
@@ -352,7 +501,6 @@ class DiplomaticGateway:
         old_score = entity['trust_score']
         entity['trust_score'] = max(0, min(1000, old_score + delta))
         
-        # Naplózás
         self.scratchpad.write(self.name, {
             'entity': entity['name'],
             'old_score': old_score,
@@ -365,62 +513,41 @@ class DiplomaticGateway:
             print(f"🌐 Trust score csökkentés: {entity['name']} {delta} ({reason})")
     
     def can_speak(self, entity_id: str) -> bool:
-        """
-        Ellenőrzi, hogy az entitás beszélhet-e.
-        - Trust score elég magas?
-        - Nincs blokkolva?
-        - Nem beszél éppen más?
-        """
         entity = self.entities.get(entity_id)
         if not entity or entity.get('blocked', False):
             return False
-        
-        # Trust score ellenőrzés
         if entity['trust_score'] < self.config['min_trust_for_response']:
             return False
-        
-        # Token limit ellenőrzés
         if entity['tokens_used'] > self.config['max_tokens_per_entity']:
             return False
-        
         return True
     
-    # --- BIZTONSÁGI SZŰRŐK ---
+    # ========== BIZTONSÁGI SZŰRŐK ==========
     
     def filter_message(self, message: str, entity_id: str) -> Tuple[bool, str, str]:
-        """
-        Üzenet szűrése (prompt-injekció, káros tartalom)
-        
-        Visszaad: (átengedve?, tisztított üzenet, figyelmeztetés)
-        """
+        """Üzenet szűrése"""
         if not self.config['enable_filter']:
             return True, message, ""
         
-        original = message
         message_lower = message.lower()
         warning = ""
         
-        # 1. Prompt-injekció minták
         for pattern in self.injection_patterns:
             if re.search(pattern, message_lower, re.IGNORECASE):
                 self.state['blocked_attempts'] += 1
                 self.update_trust_score(entity_id, -50, "Prompt injection attempt")
                 return False, "", "Prompt injection detected"
         
-        # 2. Túl hosszú üzenet (lehetséges DoS)
         if len(message) > 10000:
             return False, "", "Message too long"
         
-        # 3. Ismétlődő karakterek (spam)
         if re.search(r'(.)\1{100,}', message):
             return False, "", "Repetitive content detected"
         
-        # 4. HTML/JavaScript tagek eltávolítása (biztonság)
         cleaned = re.sub(r'<[^>]*>', '', message)
         if cleaned != message:
             warning = "HTML tags removed"
         
-        # 5. SQL injection minták
         sql_patterns = [r'DROP\s+TABLE', r'DELETE\s+FROM', r'INSERT\s+INTO', r'--', r';']
         for pattern in sql_patterns:
             if re.search(pattern, message_lower, re.IGNORECASE):
@@ -430,95 +557,42 @@ class DiplomaticGateway:
         
         return True, cleaned, warning
     
-    # --- VPS ÜZENETKÜLDÉS ---
-    
-    def send_to_vps(self, to_entity_id: str, message: str) -> Dict:
-        """
-        Üzenet küldése egy másik entitásnak a VPS-en keresztül.
-        """
-        if not self.vps_connected:
-            return {'error': 'VPS not connected', 'code': 503}
-        
-        try:
-            packet = {
-                'from': self.config['entity_id'],
-                'to': to_entity_id,
-                'message': message,
-                'timestamp': time.time(),
-                'id': str(uuid.uuid4())
-            }
-            
-            # Aláírás (ha van)
-            if self.config['encryption_key']:
-                packet['signature'] = self._sign_message(packet)
-            
-            response = requests.post(
-                f"{self.config['vps_url']}/api/send",
-                json=packet,
-                headers={'X-API-Key': self.config['vps_api_key']} if self.config['vps_api_key'] else {},
-                timeout=10
-            )
-            
-            if response.status_code == 200:
-                self.state['messages_sent'] += 1
-                return {'success': True, 'message_id': packet['id']}
-            else:
-                return {'error': f'VPS error: {response.status_code}', 'code': response.status_code}
-                
-        except Exception as e:
-            return {'error': str(e), 'code': 500}
-    
-    # --- ÜZENET KEZELÉS ---
+    # ========== ÜZENET KEZELÉS ==========
     
     def receive_from_external(self, entity_id: str, message: str) -> Dict:
-        """
-        Külső entitástól érkező üzenet fogadása.
-        """
+        """Külső entitástól érkező üzenet fogadása"""
         entity = self.entities.get(entity_id)
         if not entity:
             return {'error': 'Unknown entity', 'code': 404}
         
-        # Utolsó látogatás frissítése
         entity['last_seen'] = time.time()
         
-        # Szűrés
         allowed, cleaned, warning = self.filter_message(message, entity_id)
         if not allowed:
             return {'error': warning, 'code': 403}
         
-        # Trust score ellenőrzés
         if not self.can_speak(entity_id):
             return {'error': 'Insufficient trust or quota', 'code': 403}
         
-        # Sorba állítás (ha kell)
         if self.config['enable_queue']:
             with self.speaker_lock:
                 if self.current_speaker and self.current_speaker != entity_id:
-                    # Már beszél valaki, sorba rakjuk
                     self.message_queue.append({
                         'entity_id': entity_id,
                         'message': cleaned,
                         'time': time.time(),
                         'warning': warning
                     })
-                    return {
-                        'status': 'queued',
-                        'position': len(self.message_queue),
-                        'code': 202
-                    }
+                    return {'status': 'queued', 'position': len(self.message_queue), 'code': 202}
                 else:
                     self.current_speaker = entity_id
         
-        # Azonnali feldolgozás
         return self._process_external_message(entity_id, cleaned, warning)
     
     def _process_external_message(self, entity_id: str, message: str, warning: str) -> Dict:
-        """
-        Külső üzenet feldolgozása (belső).
-        """
+        """Külső üzenet feldolgozása"""
         entity = self.entities[entity_id]
         
-        # KVK csomag készítése
         packet = {
             'header': {
                 'trace_id': f"ext_{entity_id}_{int(time.time())}",
@@ -534,25 +608,18 @@ class DiplomaticGateway:
             }
         }
         
-        # Ha van figyelő, értesítjük
         for callback in self.listeners['*'] + self.listeners[entity_id]:
             try:
                 callback(packet)
             except Exception as e:
                 print(f"🌐 Listener hiba: {e}")
         
-        # Ha van orchestrator, továbbítjuk
-        if self.orchestrator and hasattr(self.orchestrator, 'process_raw_packet'):
-            # KVK formátum
-            user_name = self.scratchpad.get_state('user_name', 'User')
+        if self.orchestrator:
             kvk = f"INTENT:EXTERNAL|FROM:{entity['name']}|MESSAGE:{message}"
             self.orchestrator.process_raw_packet(kvk)
         
-        # Statisztika
         entity['messages_received'] += 1
         self.state['messages_received'] += 1
-        
-        # Token becslés (egyszerű)
         tokens = len(message.split())
         entity['tokens_used'] += tokens
         
@@ -564,36 +631,30 @@ class DiplomaticGateway:
             'code': 200
         }
         
-        # Ha van következő a sorban, indítjuk
         self._process_next_in_queue()
-        
         return result
     
     def _process_next_in_queue(self):
-        """Következő üzenet feldolgozása a sorban"""
+        """Következő üzenet a sorban"""
         with self.speaker_lock:
             if self.message_queue and not self.current_speaker:
                 next_msg = self.message_queue.popleft()
                 self.current_speaker = next_msg['entity_id']
-                # Külön szálon, ne blokkoljon
                 threading.Thread(
                     target=self._process_external_message,
-                    args=(next_msg['entity_id'], next_msg['message'], next_msg['warning'])
+                    args=(next_msg['entity_id'], next_msg['message'], next_msg['warning']),
+                    daemon=True
                 ).start()
     
     def send_to_external(self, entity_id: str, message: str, response_to: str = None) -> Dict:
-        """
-        Üzenet küldése külső entitásnak.
-        """
+        """Üzenet küldése külső entitásnak"""
         entity = self.entities.get(entity_id)
         if not entity:
             return {'error': 'Unknown entity', 'code': 404}
         
-        # Csak akkor küldünk, ha elég magas a trust score
         if entity['trust_score'] < self.config['min_trust_for_response']:
             return {'error': 'Trust score too low', 'code': 403}
         
-        # Csomag összeállítása
         packet = {
             'header': {
                 'trace_id': f"to_{entity_id}_{int(time.time())}",
@@ -607,12 +668,8 @@ class DiplomaticGateway:
             }
         }
         
-        # Ha VPS-en keresztül megy
         if self.vps_connected:
-            return self.send_to_vps(entity_id, message)
-        
-        # Itt történne a tényleges küldés (pl. API hívás)
-        # Most csak naplózzuk
+            return self.send_to_vps(entity_id, message, response_to)
         
         entity['messages_sent'] += 1
         self.state['messages_sent'] += 1
@@ -623,48 +680,105 @@ class DiplomaticGateway:
             'type': 'outgoing'
         }, 'external_message')
         
-        return {
-            'status': 'sent',
-            'message_id': packet['header']['trace_id'],
-            'code': 200
-        }
+        return {'status': 'sent', 'message_id': packet['header']['trace_id'], 'code': 200}
     
-    # --- ESEMÉNYKEZELÉS ---
+    def send_to_vps(self, to_entity_id: str, message: str, response_to: str = None) -> Dict:
+        """Üzenet küldése VPS-en keresztül"""
+        if not self.vps_connected:
+            return {'error': 'VPS not connected', 'code': 503}
+        
+        try:
+            packet = {
+                'type': 'message',
+                'from': self.config['entity_id'],
+                'to': to_entity_id,
+                'content': message,
+                'response_to': response_to,
+                'timestamp': time.time(),
+                'id': str(uuid.uuid4())
+            }
+            
+            if self.config['encryption_key']:
+                packet['signature'] = self._sign_message(packet)
+            
+            if self.vps_ws and WEBSOCKET_AVAILABLE:
+                self.vps_ws.send(json.dumps(packet))
+            else:
+                requests.post(
+                    f"{self.config['vps_url']}/api/send",
+                    json=packet,
+                    headers={'X-API-Key': self.config['vps_api_key']} if self.config['vps_api_key'] else {},
+                    timeout=10
+                )
+            
+            self.state['messages_sent'] += 1
+            return {'success': True, 'message_id': packet['id']}
+            
+        except Exception as e:
+            return {'error': str(e), 'code': 500}
+    
+    def broadcast_to_entities(self, message: str, min_trust: int = 0) -> List[Dict]:
+        """Üzenet küldése minden entitásnak"""
+        results = []
+        for entity_id, entity in self.entities.items():
+            if entity['trust_score'] >= min_trust and not entity.get('blocked', False):
+                result = self.send_to_external(entity_id, message)
+                results.append({'entity': entity['name'], 'result': result})
+        return results
+    
+    # ========== ESEMÉNYKEZELÉS ==========
     
     def on_message(self, entity_id: str = '*', callback: Callable = None):
-        """
-        Feliratkozás üzenetekre.
-        entity_id: '*' mindenre, vagy konkrét ID
-        """
         if callback:
             self.listeners[entity_id].append(callback)
     
-    # --- KARBANTARTÁS ---
+    # ========== KARBANTARTÁS ==========
     
     def cleanup(self):
-        """
-        Régi entitások eltávolítása, trust score csökkentés.
-        """
+        """Régi entitások eltávolítása, trust score csökkentés"""
         now = time.time()
         
         for entity_id, entity in list(self.entities.items()):
-            # Ha 7 napja nem jelentkezett, eltávolítjuk
+            # 7 nap inaktivitás után eltávolítás
             if now - entity['last_seen'] > 7 * 86400:
                 print(f"🌐 Eltávolítás (inaktív): {entity['name']}")
                 del self.entities[entity_id]
                 continue
             
-            # Trust score csökkentés, ha régen volt interakció
-            if now - entity['last_seen'] > 30 * 86400:  # 30 nap
-                entity['trust_score'] = int(entity['trust_score'] * self.config['trust_score_decay'])
+            # Napi trust score csökkentés (ha régen volt interakció)
+            days_inactive = (now - entity['last_seen']) / 86400
+            if days_inactive > 1:
+                decay_factor = self.config['trust_score_decay'] ** days_inactive
+                new_score = int(entity['trust_score'] * decay_factor)
+                if new_score < entity['trust_score']:
+                    entity['trust_score'] = max(0, new_score)
         
         self.state['active_entities'] = len(self.entities)
         self.state['last_cleanup'] = now
     
-    # --- ADMIN FELÜLETNEK ---
+    def get_entity_stats(self, entity_id: str) -> Optional[Dict]:
+        """Entitás részletes statisztikája"""
+        entity = self.entities.get(entity_id)
+        if not entity:
+            return None
+        
+        return {
+            'id': entity['id'],
+            'name': entity['name'],
+            'type': entity['type'],
+            'trust_score': entity['trust_score'],
+            'joined': datetime.fromtimestamp(entity['joined']).isoformat(),
+            'last_seen': datetime.fromtimestamp(entity['last_seen']).isoformat(),
+            'tokens_used': entity['tokens_used'],
+            'messages_sent': entity['messages_sent'],
+            'messages_received': entity['messages_received'],
+            'blocked': entity.get('blocked', False),
+            'active_days': (time.time() - entity['joined']) / 86400
+        }
+    
+    # ========== ADMIN FELÜLETNEK ==========
     
     def get_entities(self) -> List[Dict]:
-        """Összes entitás listája (admin felületnek)"""
         return [
             {
                 'id': eid,
@@ -674,13 +788,13 @@ class DiplomaticGateway:
                 'joined': datetime.fromtimestamp(ent['joined']).isoformat(),
                 'last_seen': datetime.fromtimestamp(ent['last_seen']).isoformat(),
                 'tokens_used': ent['tokens_used'],
-                'messages': ent['messages_sent'] + ent['messages_received']
+                'messages': ent['messages_sent'] + ent['messages_received'],
+                'blocked': ent.get('blocked', False)
             }
             for eid, ent in self.entities.items()
         ]
     
     def get_queue_status(self) -> Dict:
-        """Sor állapota"""
         return {
             'queue_size': len(self.message_queue),
             'current_speaker': self.current_speaker,
@@ -688,7 +802,6 @@ class DiplomaticGateway:
         }
     
     def get_state(self) -> Dict:
-        """Állapot lekérése"""
         return {
             'status': self.state['status'],
             'messages_sent': self.state['messages_sent'],
@@ -696,6 +809,7 @@ class DiplomaticGateway:
             'blocked_attempts': self.state['blocked_attempts'],
             'active_entities': self.state['active_entities'],
             'vps_connected': self.state['vps_connected'],
+            'vps_retry_count': self.state['vps_retry_count'],
             'queue': self.get_queue_status(),
             'config': {
                 'vps_enabled': self.config['vps_enabled'],
@@ -706,6 +820,7 @@ class DiplomaticGateway:
             }
         }
 
+
 # Teszt
 if __name__ == "__main__":
     from scratchpad import Scratchpad
@@ -713,21 +828,16 @@ if __name__ == "__main__":
     s = Scratchpad()
     gateway = DiplomaticGateway(s)
     
-    # Entitások regisztrálása
     entity1 = gateway.register_entity('entity_1', 'Friend', 'partner')
     entity2 = gateway.register_entity('entity_2', 'Stranger', 'guest')
     
     print(f"Entity1 trust score: {gateway.get_trust_score('entity_1')}")
     print(f"Entity2 trust score: {gateway.get_trust_score('entity_2')}")
     
-    # Üzenet küldés
     result = gateway.receive_from_external('entity_1', "Hello! How are you?")
     print("Received message:", result)
     
-    # Üzenet küldés vissza
     result = gateway.send_to_external('entity_1', "I'm fine, thanks!")
     print("Sent message:", result)
     
-    # Állapot
-    print("\nState:", gateway.get_state())
     print("\nEntities:", gateway.get_entities())

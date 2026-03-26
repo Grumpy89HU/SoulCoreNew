@@ -25,6 +25,7 @@ try:
 except ImportError:
     I18N_AVAILABLE = False
 
+
 class Scratchpad:
     """
     A közös memória fal. Minden modul ide írja a gondolatait,
@@ -37,7 +38,7 @@ class Scratchpad:
     """
     
     def __init__(self, max_history=1000):
-        self.lock = threading.RLock()  # Újra beléphető lock a biztonságos íráshoz
+        self.lock = threading.RLock()
         
         # Állapotok - aktuális értékek (felülíródnak)
         self.state = {
@@ -56,16 +57,15 @@ class Scratchpad:
         self.entries = deque(maxlen=max_history)
         
         # Modul-specifikus jegyzettömbök (token-takarékos)
-        # Ezek nem évülnek el, amíg felül nem írják őket
         self.notepads = defaultdict(dict)  # {modul: {kulcs: érték}}
         
-        # Rejtett piszkozatok (belső monológok, amik nem mennek ki)
+        # Rejtett piszkozatok (belső monológok)
         self.drafts = defaultdict(list)  # {modul: [piszkozatok]}
         
-        # Esemény figyelők (ha valaki vár egy adott eseményre)
+        # Esemény figyelők
         self.event_listeners = defaultdict(list)
         
-        # Token számláló (hozzávetőleges)
+        # Token számláló
         self.token_estimates = defaultdict(int)
         
         # Debug napló
@@ -73,7 +73,7 @@ class Scratchpad:
         
         print("📝 Scratchpad: Memóriafal inicializálva")
     
-    # --- ÁLLAPOT KEZELÉS ---
+    # ========== ÁLLAPOT KEZELÉS ==========
     
     def set_state(self, key: str, value: Any, source: str = "system"):
         """Állapot beállítása (felülírja a régit)"""
@@ -88,7 +88,6 @@ class Scratchpad:
                     'source': source
                 })
                 
-                # Token becslés (kb 1 token szónként)
                 if isinstance(value, str):
                     self.token_estimates[f'state_{key}'] = len(value.split())
         except Exception as e:
@@ -119,18 +118,12 @@ class Scratchpad:
         except Exception as e:
             self._debug(f"update_state hiba: {e}")
     
-    # --- JEGYZETTÖMB KEZELÉS (token-takarékos memória) ---
+    # ========== JEGYZETTÖMB KEZELÉS ==========
     
     def write_note(self, module: str, key: str, value: Any, ttl: int = None):
         """
         Modul saját jegyzettömbjébe ír.
-        Ezek az értékek nem évülnek el, amíg felül nem írják őket.
-        
-        Args:
-            module: modul neve
-            key: jegyzet kulcsa
-            value: érték (bármi)
-            ttl: élettartam másodpercben (None = örök)
+        ttl: élettartam másodpercben (None = örök)
         """
         try:
             with self.lock:
@@ -142,20 +135,20 @@ class Scratchpad:
                     'ttl': ttl
                 }
                 
-                # Token becslés
                 if isinstance(value, str):
                     self.token_estimates[f'note_{module}_{key}'] = len(value.split())
         except Exception as e:
             self._debug(f"write_note hiba: {e}")
     
     def read_note(self, module: str, key: str, default=None):
-        """Modul saját jegyzetének olvasása"""
+        """Modul saját jegyzetének olvasása (TTL ellenőrzéssel)"""
         try:
             with self.lock:
                 note = self.notepads.get(module, {}).get(key)
                 if note and isinstance(note, dict):
-                    # TTL ellenőrzés
-                    if note.get('ttl') and time.time() - note['timestamp'] > note['ttl']:
+                    now = time.time()
+                    ttl = note.get('ttl')
+                    if ttl and now - note['timestamp'] > ttl:
                         # Lejárt, töröljük
                         del self.notepads[module][key]
                         return default
@@ -166,35 +159,74 @@ class Scratchpad:
             return default
     
     def read_all_notes(self, module: str = None):
-        """Modul összes jegyzetének olvasása (vagy az összes modulé)"""
+        """Modul összes jegyzetének olvasása (TTL ellenőrzéssel)"""
         try:
             with self.lock:
                 if module:
                     notes = self.notepads.get(module, {})
-                    # TTL ellenőrzés
                     now = time.time()
                     result = {}
                     for k, v in list(notes.items()):
-                        if v.get('ttl') and now - v['timestamp'] > v['ttl']:
-                            del notes[k]
+                        if isinstance(v, dict):
+                            ttl = v.get('ttl')
+                            if ttl and now - v['timestamp'] > ttl:
+                                del notes[k]
+                            else:
+                                result[k] = v.get('value')
                         else:
-                            result[k] = v.get('value') if isinstance(v, dict) else v
+                            result[k] = v
                     return result
                 
-                # Minden modul összes jegyezete (TTL ellenőrzéssel)
+                # Minden modul
                 result = {}
                 for mod, notes in self.notepads.items():
                     result[mod] = {}
                     now = time.time()
                     for k, v in list(notes.items()):
-                        if v.get('ttl') and now - v['timestamp'] > v['ttl']:
-                            del notes[k]
+                        if isinstance(v, dict):
+                            ttl = v.get('ttl')
+                            if ttl and now - v['timestamp'] > ttl:
+                                del notes[k]
+                            else:
+                                result[mod][k] = v.get('value')
                         else:
-                            result[mod][k] = v.get('value') if isinstance(v, dict) else v
+                            result[mod][k] = v
                 return result
         except Exception as e:
             self._debug(f"read_all_notes hiba: {e}")
             return {} if module else {}
+    
+    def get_notes_by_prefix(self, module: str, prefix: str) -> Dict[str, Any]:
+        """Prefix alapján keresés a jegyzetekben"""
+        try:
+            with self.lock:
+                notes = self.notepads.get(module, {})
+                result = {}
+                for key, note in notes.items():
+                    if key.startswith(prefix):
+                        if isinstance(note, dict):
+                            result[key] = note.get('value')
+                        else:
+                            result[key] = note
+                return result
+        except Exception as e:
+            self._debug(f"get_notes_by_prefix hiba: {e}")
+            return {}
+    
+    def clear_section(self, module: str):
+        """Adott modul összes jegyzetének törlése"""
+        try:
+            with self.lock:
+                if module in self.notepads:
+                    # Token becslések törlése
+                    for key in list(self.notepads[module].keys()):
+                        token_key = f'note_{module}_{key}'
+                        if token_key in self.token_estimates:
+                            del self.token_estimates[token_key]
+                    del self.notepads[module]
+                    self._debug(f"clear_section: {module} jegyzetei törölve")
+        except Exception as e:
+            self._debug(f"clear_section hiba: {e}")
     
     def delete_note(self, module: str, key: str):
         """Jegyzet törlése"""
@@ -202,18 +234,16 @@ class Scratchpad:
             with self.lock:
                 if module in self.notepads and key in self.notepads[module]:
                     del self.notepads[module][key]
-                    if key in self.token_estimates:
-                        del self.token_estimates[f'note_{module}_{key}']
+                    token_key = f'note_{module}_{key}'
+                    if token_key in self.token_estimates:
+                        del self.token_estimates[token_key]
         except Exception as e:
             self._debug(f"delete_note hiba: {e}")
     
-    # --- REJTETT PISZKOLAT (belső monológ) ---
+    # ========== REJTETT PISZKOLAT ==========
     
     def write_draft(self, module: str, content: Any, draft_type: str = "internal"):
-        """
-        Rejtett piszkozat írása (belső monológ).
-        Ezek nem mennek ki a felhasználónak, csak belső használatra.
-        """
+        """Rejtett piszkozat írása (belső monológ)"""
         try:
             with self.lock:
                 draft = {
@@ -226,7 +256,6 @@ class Scratchpad:
                 }
                 self.drafts[module].append(draft)
                 
-                # Csak az utolsó 10 piszkozatot tartjuk meg modulonként
                 if len(self.drafts[module]) > 10:
                     self.drafts[module] = self.drafts[module][-10:]
                 
@@ -236,9 +265,7 @@ class Scratchpad:
             return None
     
     def read_drafts(self, module: str = None, limit: int = 10) -> List[Dict]:
-        """
-        Rejtett piszkozatok olvasása.
-        """
+        """Rejtett piszkozatok olvasása"""
         try:
             with self.lock:
                 if module:
@@ -248,26 +275,32 @@ class Scratchpad:
                     for mod_drafts in self.drafts.values():
                         drafts.extend(mod_drafts)
                     drafts.sort(key=lambda x: x['time'], reverse=True)
-                
                 return drafts[:limit]
         except Exception as e:
             self._debug(f"read_drafts hiba: {e}")
             return []
     
-    # --- IDŐBÉLYEGES BEJEGYZÉSEK (üzenetek, gondolatok) ---
+    def clear_drafts(self, module: str = None):
+        """Piszkozatok törlése"""
+        try:
+            with self.lock:
+                if module:
+                    if module in self.drafts:
+                        self.drafts[module] = []
+                else:
+                    self.drafts.clear()
+        except Exception as e:
+            self._debug(f"clear_drafts hiba: {e}")
+    
+    # ========== IDŐBÉLYEGES BEJEGYZÉSEK ==========
     
     def write(self, module: str, content: Any, msg_type: str = "thought"):
-        """
-        Új bejegyzés írása a közös falra.
-        Minden bejegyzés kap egy egyedi ID-t és időbélyeget.
-        """
+        """Új bejegyzés írása a közös falra"""
         try:
-            # Debug: kiírjuk, ha nem dict a content
             if not isinstance(content, dict):
                 self._debug(f"Nem dict kerül a scratchpad-be! module={module}, type={type(content)}")
             
             with self.lock:
-                # Biztosítjuk, hogy a content serializálható legyen
                 safe_content = self._make_serializable(content)
                 
                 entry = {
@@ -284,14 +317,13 @@ class Scratchpad:
                 if isinstance(content, str):
                     self.token_estimates[f'entry_{entry["id"]}'] = len(content.split())
                 elif isinstance(content, dict):
-                    # Becslés a dict alapján
                     total = 0
                     for k, v in content.items():
                         if isinstance(v, str):
                             total += len(v.split())
                     self.token_estimates[f'entry_{entry["id"]}'] = total
                 
-                # Ha van listener erre a típusra, értesítjük
+                # Eseménykibocsátás
                 if msg_type in self.event_listeners:
                     for callback in self.event_listeners[msg_type]:
                         try:
@@ -305,18 +337,11 @@ class Scratchpad:
             return None
     
     def read(self, limit: int = 50, since: float = None, msg_type: str = None, module: str = None):
-        """
-        Bejegyzések olvasása.
-        - limit: maximum szám
-        - since: csak ennél újabbak (timestamp)
-        - msg_type: csak adott típus
-        - module: csak adott modul
-        """
+        """Bejegyzések olvasása"""
         try:
             with self.lock:
                 result = list(self.entries)
                 
-                # Szűrés
                 if since is not None:
                     result = [e for e in result if e.get('timestamp', 0) > since]
                 if msg_type is not None:
@@ -324,7 +349,6 @@ class Scratchpad:
                 if module is not None:
                     result = [e for e in result if e.get('module') == module]
                 
-                # Visszafelé sorrend (újabb elöl)
                 result.reverse()
                 return result[:limit]
         except Exception as e:
@@ -332,7 +356,7 @@ class Scratchpad:
             return []
     
     def read_last(self, msg_type: str = None, module: str = None):
-        """Utolsó bejegyzés olvasása (opcionálisan típus és modul szerint)"""
+        """Utolsó bejegyzés olvasása"""
         try:
             with self.lock:
                 for entry in reversed(self.entries):
@@ -347,9 +371,7 @@ class Scratchpad:
             return None
     
     def search(self, query: str, limit: int = 10) -> List[Dict]:
-        """
-        Egyszerű szöveges keresés a bejegyzésekben.
-        """
+        """Egyszerű szöveges keresés"""
         try:
             with self.lock:
                 results = []
@@ -369,7 +391,7 @@ class Scratchpad:
             self._debug(f"search hiba: {e}")
             return []
     
-    # --- ESEMÉNYKEZELÉS (értesülések) ---
+    # ========== ESEMÉNYKEZELÉS ==========
     
     def on(self, event_type: str, callback: Callable):
         """Esemény figyelő regisztrálása"""
@@ -390,9 +412,7 @@ class Scratchpad:
             self._debug(f"off hiba: {e}")
     
     def emit(self, event_type: str, data: Any):
-        """
-        Esemény kibocsátása (értesíti a figyelőket).
-        """
+        """Esemény kibocsátása"""
         try:
             with self.lock:
                 for callback in self.event_listeners.get(event_type, []):
@@ -403,20 +423,36 @@ class Scratchpad:
         except Exception as e:
             self._debug(f"emit hiba: {e}")
     
-    # --- TOKEN TAKARÉKOSSÁG ---
+    # ========== TOKEN TAKARÉKOSSÁG ==========
     
     def get_token_estimate(self, key: str = None) -> int:
-        """
-        Token becslés lekérése.
-        """
+        """Token becslés lekérése"""
         if key:
             return self.token_estimates.get(key, 0)
         return sum(self.token_estimates.values())
     
+    def get_token_breakdown(self) -> Dict[str, int]:
+        """Részletes token statisztika"""
+        result = {
+            'total': 0,
+            'state': 0,
+            'notes': 0,
+            'entries': 0
+        }
+        
+        for key, value in self.token_estimates.items():
+            result['total'] += value
+            if key.startswith('state_'):
+                result['state'] += value
+            elif key.startswith('note_'):
+                result['notes'] += value
+            elif key.startswith('entry_'):
+                result['entries'] += value
+        
+        return result
+    
     def prune_old_entries(self, max_age_seconds: int = 3600):
-        """
-        Régi bejegyzések törlése (memóriatakarékosság).
-        """
+        """Régi bejegyzések törlése"""
         try:
             with self.lock:
                 cutoff = time.time() - max_age_seconds
@@ -424,54 +460,45 @@ class Scratchpad:
                 for e in self.entries:
                     if e.get('timestamp', 0) > cutoff:
                         new_entries.append(e)
+                    else:
+                        # Token becslés törlése
+                        token_key = f'entry_{e.get("id", "")}'
+                        if token_key in self.token_estimates:
+                            del self.token_estimates[token_key]
                 self.entries = new_entries
                 self._debug(f"prune_old_entries: {len(new_entries)} bejegyzés maradt")
         except Exception as e:
             self._debug(f"prune_old_entries hiba: {e}")
     
-    # --- BELSŐ SEGÉDFÜGGVÉNYEK ---
+    def cleanup_old(self, max_age_seconds: int = 3600):
+        """Régi bejegyzések törlése (alias)"""
+        self.prune_old_entries(max_age_seconds)
     
-    def _log_entry(self, entry_type, data):
-        """Belső események naplózása"""
+    # ========== MODUL KEZELÉS ==========
+    
+    def get_active_modules(self) -> List[str]:
+        """Aktív modulok listázása (amelyek írtak már)"""
         try:
-            self.write('scratchpad', data, entry_type)
+            with self.lock:
+                modules = set()
+                for e in self.entries:
+                    if e.get('module'):
+                        modules.add(e['module'])
+                for mod in self.notepads.keys():
+                    modules.add(mod)
+                for mod in self.drafts.keys():
+                    modules.add(mod)
+                return sorted(list(modules))
         except Exception as e:
-            self._debug(f"_log_entry hiba: {e}")
+            self._debug(f"get_active_modules hiba: {e}")
+            return []
     
-    def _make_serializable(self, obj: Any) -> Any:
-        """
-        Objektum átalakítása biztonságosan tárolható formátumba.
-        """
-        if obj is None:
-            return None
-        if isinstance(obj, (str, int, float, bool)):
-            return obj
-        if isinstance(obj, (list, tuple)):
-            return [self._make_serializable(item) for item in obj]
-        if isinstance(obj, dict):
-            return {str(k): self._make_serializable(v) for k, v in obj.items()}
-        # Ha nem serializálható, stringgé alakítjuk
-        try:
-            # Próbáljuk meg JSON serializálni
-            json.dumps(obj)
-            return obj
-        except:
-            # Ha nem megy, stringgé alakítjuk
-            return str(obj)
-    
-    def _debug(self, message: str):
-        """Debug üzenet naplózása"""
-        timestamp = datetime.now().isoformat()
-        self._debug_log.append(f"[{timestamp}] {message}")
-        print(f"📝 Scratchpad debug: {message}")
-    
-    # --- ÖSSZEFOGLALÓ ---
+    # ========== ÖSSZEFOGLALÓ ==========
     
     def get_summary(self) -> Dict:
         """Összefoglaló a memória állapotáról"""
         try:
             with self.lock:
-                # Aktív modulok
                 active_modules = set()
                 for e in self.entries:
                     if e.get('module'):
@@ -485,6 +512,7 @@ class Scratchpad:
                     'drafts': {mod: len(d) for mod, d in self.drafts.items()},
                     'last_entry': self.read_last(),
                     'token_estimate': self.get_token_estimate(),
+                    'token_breakdown': self.get_token_breakdown(),
                     'debug_log_count': len(self._debug_log)
                 }
         except Exception as e:
@@ -496,61 +524,88 @@ class Scratchpad:
                 'error': str(e)
             }
     
-    def cleanup_old(self, max_age_seconds: int = 3600):
-        """
-        Régi bejegyzések törlése (memóriatakarékosság).
-        Meghívható külsőleg is (pl. heartbeat).
-        """
-        self.prune_old_entries(max_age_seconds)
-    
     def get_debug_log(self) -> List[str]:
         """Debug napló lekérése"""
         return list(self._debug_log)
     
     def clear(self):
-        """Teljes memória törlése (csak vészhelyzetben)"""
+        """Teljes memória törlése (vészhelyzet)"""
         with self.lock:
             self.entries.clear()
             self.notepads.clear()
             self.drafts.clear()
             self.token_estimates.clear()
             self._debug("Memória teljesen törölve")
+    
+    # ========== BELSŐ SEGÉDFÜGGVÉNYEK ==========
+    
+    def _log_entry(self, entry_type, data):
+        """Belső események naplózása"""
+        try:
+            self.write('scratchpad', data, entry_type)
+        except Exception as e:
+            self._debug(f"_log_entry hiba: {e}")
+    
+    def _make_serializable(self, obj: Any) -> Any:
+        """Objektum átalakítása tárolható formátumba"""
+        if obj is None:
+            return None
+        if isinstance(obj, (str, int, float, bool)):
+            return obj
+        if isinstance(obj, (list, tuple)):
+            return [self._make_serializable(item) for item in obj]
+        if isinstance(obj, dict):
+            return {str(k): self._make_serializable(v) for k, v in obj.items()}
+        try:
+            json.dumps(obj)
+            return obj
+        except:
+            return str(obj)
+    
+    def _debug(self, message: str):
+        """Debug üzenet naplózása"""
+        timestamp = datetime.now().isoformat()
+        self._debug_log.append(f"[{timestamp}] {message}")
+        print(f"📝 Scratchpad debug: {message}")
 
-# Ha önállóan futtatjuk, teszteljük
+
+# Teszt
 if __name__ == "__main__":
     s = Scratchpad()
     
-    # Teszt írás
+    print("\n--- Teszt írás ---")
     s.write('king', 'Thinking...', 'internal_monologue')
     s.write('scribe', {'intent': 'greeting', 'confidence': 0.9}, 'intent')
     s.write('jester', 'Watching...', 'observation')
     
-    # Teszt olvasás
     print("Utolsó 5 bejegyzés:")
     for entry in s.read(limit=5):
         print(f"  [{entry['module']}] {entry['type']}: {entry['content']}")
     
-    # Teszt jegyzet
+    print("\n--- Jegyzet teszt ---")
     s.write_note('king', 'last_mood', 'curious')
     s.write_note('jester', 'last_warning', 'none', ttl=60)
-    print(f"\nKing mood: {s.read_note('king', 'last_mood')}")
+    print(f"King mood: {s.read_note('king', 'last_mood')}")
     print(f"Jester warning: {s.read_note('jester', 'last_warning')}")
     
-    # Teszt rejtett piszkozat
+    print("\n--- Rejtett piszkozat ---")
     s.write_draft('king', 'I wonder what Grumpy is thinking...')
     drafts = s.read_drafts('king')
-    print(f"\nRejtett piszkozatok: {len(drafts)}")
+    print(f"Piszkozatok: {len(drafts)}")
     
-    # Teszt állapot
+    print("\n--- Állapot ---")
     s.set_state('current_mood', 'happy', 'king')
-    print(f"\nÁllapot: {s.get_state('current_mood')}")
+    print(f"Állapot: {s.get_state('current_mood')}")
     
-    # Token becslés
-    print(f"\nToken becslés: {s.get_token_estimate()}")
+    print("\n--- Token statisztika ---")
+    print(f"Összes token: {s.get_token_estimate()}")
+    print(f"Részletezés: {s.get_token_breakdown()}")
     
-    # Összefoglaló
-    print("\nÖsszefoglaló:")
+    print("\n--- Aktív modulok ---")
+    print(f"Modulok: {s.get_active_modules()}")
+    
+    print("\n--- Összefoglaló ---")
     summary = s.get_summary()
     for k, v in summary.items():
-        if k != 'last_entry':
+        if k not in ['last_entry', 'state']:
             print(f"  {k}: {v}")

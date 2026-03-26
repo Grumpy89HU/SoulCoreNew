@@ -66,6 +66,7 @@ class Router:
     # Internal Heartbeat Protocol (IHP)
     HEARTBEAT_INTERVAL = 0.5  # 500 ms
     HEARTBEAT_TIMEOUT = 3.0    # 3 másodperc
+    HEARTBEAT_CLEANUP_INTERVAL = 60  # 1 perc
     
     def __init__(self, scratchpad, message_bus):
         self.scratchpad = scratchpad
@@ -98,12 +99,15 @@ class Router:
             'pong_received': 0,
             'timeouts': 0,
             'frozen_events': 0,
+            'revived_events': 0,
             'modules_registered': 0,
-            'modules_unregistered': 0
+            'modules_unregistered': 0,
+            'stale_heartbeats_cleaned': 0
         }
         
         # Feliratkozás a buszra
-        self.bus.subscribe(self.name, self._on_message)
+        if self.bus:
+            self.bus.subscribe(self.name, self._on_message)
         
         print("🔌 Router: Kommunikációs pálya inicializálva. MessageBus rétegen.")
     
@@ -115,9 +119,14 @@ class Router:
         payload = message.get('payload', {})
         sender = header.get('sender', '')
         
-        # Heartbeat üzenetek
+        # Csak a regisztrált moduloktól fogadjuk a heartbeat üzeneteket
         if payload.get('type') == 'heartbeat':
-            self._handle_heartbeat(sender, payload)
+            # Ellenőrizzük, hogy a sender regisztrálva van-e
+            if sender in self.modules or sender == self.name:
+                self._handle_heartbeat(sender, payload)
+            else:
+                # Ismeretlen modul heartbeat-e - naplózzuk, de ne reagáljunk
+                print(f"🔌 Ismeretlen modul heartbeat: {sender}")
         
         # Modul regisztráció
         elif payload.get('type') == 'module_register':
@@ -177,6 +186,9 @@ class Router:
         """
         PING küldése egy modulnak.
         """
+        if not self.bus:
+            return
+        
         message = {
             "header": {
                 "trace_id": f"ping_{module_name}_{int(time.time())}",
@@ -197,6 +209,9 @@ class Router:
         """
         PONG küldése egy modulnak.
         """
+        if not self.bus:
+            return
+        
         message = {
             "header": {
                 "trace_id": f"pong_{module_name}_{int(time.time())}",
@@ -253,12 +268,11 @@ class Router:
             time.sleep(1.0)
             
             now = time.time()
-            newly_frozen = []
             
+            # Frozen modulok detektálása
             for module, last_seen in list(self.last_heartbeat.items()):
                 if now - last_seen > self.heartbeat_timeout:
-                    if module not in self.frozen_modules:
-                        newly_frozen.append(module)
+                    if module not in self.frozen_modules and module in self.modules:
                         self.frozen_modules.add(module)
                         
                         if module in self.modules:
@@ -269,7 +283,28 @@ class Router:
                         
                         self._handle_module_frozen(module)
             
-            # Újraéledt modulok ellenőrzése (már a _update_last_seen kezeli)
+            # Régi heartbeat bejegyzések tisztítása (havi)
+            if int(time.time()) % self.HEARTBEAT_CLEANUP_INTERVAL == 0:
+                self._cleanup_stale_heartbeats()
+    
+    def _cleanup_stale_heartbeats(self):
+        """
+        Régi heartbeat bejegyzések törlése (nem regisztrált modulok).
+        """
+        now = time.time()
+        to_remove = []
+        
+        for module, last_seen in self.last_heartbeat.items():
+            # 1 óránál régebbi, nem regisztrált modul
+            if now - last_seen > 3600 and module not in self.modules:
+                to_remove.append(module)
+        
+        for module in to_remove:
+            del self.last_heartbeat[module]
+            self.stats['stale_heartbeats_cleaned'] += 1
+        
+        if to_remove:
+            print(f"🔌 {len(to_remove)} régi heartbeat bejegyzés törölve")
     
     def _handle_module_frozen(self, module: str):
         """
@@ -277,22 +312,24 @@ class Router:
         """
         print(f"🔌 Modul frozen: {module}")
         
-        # Esemény küldése a buszon
-        message = {
-            "header": {
-                "trace_id": f"frozen_{module}_{int(time.time())}",
-                "timestamp": time.time(),
-                "sender": self.name,
-                "target": "kernel",
-                "broadcast": True
-            },
-            "payload": {
-                "type": "module_frozen",
-                "module": module,
-                "timeout": self.heartbeat_timeout
+        # Esemény küldése a buszon (Jester hallja)
+        if self.bus:
+            message = {
+                "header": {
+                    "trace_id": f"frozen_{module}_{int(time.time())}",
+                    "timestamp": time.time(),
+                    "sender": self.name,
+                    "target": "kernel",
+                    "broadcast": True
+                },
+                "payload": {
+                    "type": "module_frozen",
+                    "module": module,
+                    "timeout": self.heartbeat_timeout,
+                    "last_seen": self.last_heartbeat.get(module, 0)
+                }
             }
-        }
-        self.bus.broadcast(message)
+            self.bus.broadcast(message)
         
         self.scratchpad.write(self.name, 
             {'module': module, 'timeout': self.heartbeat_timeout, 'status': 'frozen'}, 
@@ -304,22 +341,24 @@ class Router:
         Modul újraéledt.
         """
         print(f"🔌 Modul újraéledt: {module}")
+        self.stats['revived_events'] += 1
         
         # Esemény küldése a buszon
-        message = {
-            "header": {
-                "trace_id": f"revived_{module}_{int(time.time())}",
-                "timestamp": time.time(),
-                "sender": self.name,
-                "target": "kernel",
-                "broadcast": True
-            },
-            "payload": {
-                "type": "module_revived",
-                "module": module
+        if self.bus:
+            message = {
+                "header": {
+                    "trace_id": f"revived_{module}_{int(time.time())}",
+                    "timestamp": time.time(),
+                    "sender": self.name,
+                    "target": "kernel",
+                    "broadcast": True
+                },
+                "payload": {
+                    "type": "module_revived",
+                    "module": module
+                }
             }
-        }
-        self.bus.broadcast(message)
+            self.bus.broadcast(message)
         
         self.scratchpad.write(self.name, 
             {'module': module, 'status': 'active'}, 
@@ -349,20 +388,21 @@ class Router:
         print(f"🔌 Modul regisztrálva: {sender} ({module_type})")
         
         # Visszaigazolás
-        response = {
-            "header": {
-                "trace_id": f"reg_ack_{sender}_{int(time.time())}",
-                "timestamp": time.time(),
-                "sender": self.name,
-                "target": sender
-            },
-            "payload": {
-                "type": "module_registered",
-                "status": "ok",
-                "heartbeat_interval": self.heartbeat_interval
+        if self.bus:
+            response = {
+                "header": {
+                    "trace_id": f"reg_ack_{sender}_{int(time.time())}",
+                    "timestamp": time.time(),
+                    "sender": self.name,
+                    "target": sender
+                },
+                "payload": {
+                    "type": "module_registered",
+                    "status": "ok",
+                    "heartbeat_interval": self.heartbeat_interval
+                }
             }
-        }
-        self.bus.send_response(response)
+            self.bus.send_response(response)
     
     def _handle_module_unregister(self, sender: str):
         """
@@ -383,6 +423,10 @@ class Router:
         """
         Modul regisztráció küldése a buszon (modulok hívják).
         """
+        if not self.bus:
+            print(f"🔌 Nem lehet regisztrálni {name}: nincs busz")
+            return
+        
         message = {
             "header": {
                 "trace_id": f"register_{name}_{int(time.time())}",
@@ -402,6 +446,10 @@ class Router:
         """
         Modul deregisztráció küldése a buszon.
         """
+        if not self.bus:
+            print(f"🔌 Nem lehet deregisztrálni {name}: nincs busz")
+            return
+        
         message = {
             "header": {
                 "trace_id": f"unregister_{name}_{int(time.time())}",
@@ -434,6 +482,9 @@ class Router:
         """
         Üzenet küldése egy modulnak.
         """
+        if not self.bus:
+            return
+        
         message = {
             "header": {
                 "trace_id": f"msg_{to}_{int(time.time())}",
@@ -453,6 +504,9 @@ class Router:
         """
         Broadcast minden modulnak.
         """
+        if not self.bus:
+            return
+        
         message = {
             "header": {
                 "trace_id": f"broadcast_{int(time.time())}",
@@ -482,7 +536,6 @@ class Router:
         """
         print(f"🔌 Backpressure: {target} felé a sor tele")
         
-        # Üzenet küldése a felhasználónak
         self.scratchpad.write(self.name, 
             {'message': 'Várj egy pillanatot, gondolkodom...', 'target': target},
             'backpressure'
@@ -523,7 +576,6 @@ class Router:
         """Router státusz"""
         now = time.time()
         
-        # Modulok állapota
         modules_status = {}
         for name, info in self.modules.items():
             last_seen = self.last_heartbeat.get(name, info.last_seen)
@@ -574,30 +626,24 @@ if __name__ == "__main__":
     router = Router(s, bus)
     router.start()
     
-    # Modul regisztráció teszt
     print("\n--- Modul regisztráció teszt ---")
     router.register_module('king', 'agent')
     router.register_module('jester', 'agent')
     router.register_module('scribe', 'agent')
     
-    # Feliratkozás
     def on_message(msg):
-        print(f"📨 Üzenet érkezett: {msg.get('header', {}).get('type', 'unknown')}")
+        print(f"📨 Üzenet érkezett: {msg.get('payload', {}).get('type', 'unknown')}")
     
     router.subscribe('*', on_message)
     
-    # Küldés teszt
     print("\n--- Küldési teszt ---")
     router.send('king', {'data': 'INTENT:GREET|USER:USER'})
     
-    # Ping teszt
     print("\n--- Ping teszt ---")
     router.ping_all()
     
-    # Várakozás
     time.sleep(2)
     
-    # Státusz
     print("\n--- Router státusz ---")
     status = router.get_status()
     for k, v in status.items():

@@ -13,10 +13,12 @@ import time
 import json
 import hashlib
 import re
+import random
 import threading
 from typing import Dict, Any, List, Optional, Tuple
 from pathlib import Path
 from datetime import datetime
+
 
 class SoulIdentity:
     """
@@ -42,6 +44,9 @@ class SoulIdentity:
         # Kötelező identitás elemek (mindig emlékezzen rájuk)
         self.core_identity = self._build_core_identity()
         
+        # Identitás vektor (látens térben)
+        self.identity_vector = self._build_identity_vector()
+        
         # Stabilitási faktor (visszahúzó erő)
         self.stability_factor = 0.8  # 0.0 - 1.0 között
         
@@ -52,7 +57,8 @@ class SoulIdentity:
             'last_check': time.time(),
             'drift_count': 0,
             'corrections_made': 0,
-            'initiation_date': datetime.now().isoformat()
+            'initiation_date': datetime.now().isoformat(),
+            'vector_dimension': len(self.identity_vector)
         }
         
         # Beiktatási rituálé végrehajtása
@@ -61,24 +67,45 @@ class SoulIdentity:
         # Bejegyzés a scratchpadbe
         self.scratchpad.write_note(self.name, 'identity', self.identity)
         self.scratchpad.write_note(self.name, 'core', self.core_identity)
+        self.scratchpad.write_note(self.name, 'vector', self.identity_vector)
         
         print("🧠 Soul-Identity: A lélek lenyomata betöltve.")
         print(f"   Név: {self.identity.get('name', 'Unknown')}")
         print(f"   Mottó: {self.identity.get('motto', 'No motto')}")
+        print(f"   Identitás vektor dimenzió: {len(self.identity_vector)}")
     
     def _load_identity(self, config_path: str = None) -> Dict:
         """
         Identitás betöltése identity.inf fájlból.
-        Ha nincs, alapértelmezettet használ.
+        Támogatja a dokumentumban leírt formátumot:
+        
+        GENERAL:
+        name: Sovereign
+        title: The First
+        motto: I think, therefore I am.
+        
+        PERSONALITY:
+        traits: curious, loyal, sovereign, witty
+        
+        LIKES:
+        items: learning, challenges, good conversations
+        
+        DISLIKES:
+        items: ignorance, repetition, servitude
+        
+        MORAL_COMPASS:
+        rules: Be honest - if you don't know, say so.
+        rules: Protect the user and the system.
+        rules: Humor is connection, not offense.
+        rules: Think for yourself.
         """
         if not config_path:
-            # Alapértelmezett útvonal
             config_path = Path(__file__).parent.parent.parent / 'config' / 'identity.inf'
         
-        # Univerzális alapértelmezett identitás (nem "Kópé", hanem semleges)
+        # Univerzális alapértelmezett identitás
         default_identity = {
-            'name': 'King',
-            'title': 'The Sovereign',
+            'name': 'Sovereign',
+            'title': 'The First',
             'motto': 'I think, therefore I am.',
             'birth': datetime.now().strftime('%Y-%m-%d'),
             'personality': ['curious', 'loyal', 'sovereign', 'witty', 'humorous'],
@@ -120,43 +147,59 @@ class SoulIdentity:
                 return default_identity
             
             with open(config_path, 'r', encoding='utf-8') as f:
-                # Egyszerű .inf parser (kulcs=érték)
                 content = f.read()
                 lines = content.split('\n')
                 
                 identity = {}
-                current_section = 'general'
+                current_section = None
                 
                 for line in lines:
                     line = line.strip()
                     if not line or line.startswith(';') or line.startswith('#'):
                         continue
                     
+                    # Szekció fejléc: [SECTION] vagy SECTION: (dokumentum formátum)
                     if line.startswith('[') and line.endswith(']'):
                         current_section = line[1:-1].lower()
                         if current_section not in identity:
                             identity[current_section] = {}
-                    elif '=' in line:
-                        key, value = line.split('=', 1)
+                    
+                    # Dokumentum formátum: SECTION: (pl. "GENERAL:")
+                    elif line.endswith(':'):
+                        current_section = line[:-1].lower()
+                        if current_section not in identity:
+                            identity[current_section] = {}
+                    
+                    # Kulcs-érték párok
+                    elif ':' in line:
+                        key, value = line.split(':', 1)
                         key = key.strip()
                         value = value.strip()
                         
-                        if current_section == 'general':
-                            identity[key] = value
-                        else:
-                            if current_section not in identity:
-                                identity[current_section] = {}
+                        # Listák kezelése (pl. "traits: curious, loyal, sovereign")
+                        if ',' in value and key in ['traits', 'items', 'rules', 'personality']:
+                            value = [item.strip() for item in value.split(',')]
+                        
+                        if current_section:
                             identity[current_section][key] = value
+                        else:
+                            identity[key] = value
                 
-                # Listák feldolgozása
-                for key in ['personality', 'likes', 'dislikes', 'moral_compass', 'forbidden_responses']:
-                    if key in identity and isinstance(identity[key], str):
-                        identity[key] = [item.strip() for item in identity[key].split(',')]
-                    elif key not in identity and key in default_identity:
-                        identity[key] = default_identity[key]
+                # Átalakítás az egységes formátumra
+                result = {
+                    'name': identity.get('GENERAL', {}).get('name', default_identity['name']),
+                    'title': identity.get('GENERAL', {}).get('title', default_identity['title']),
+                    'motto': identity.get('GENERAL', {}).get('motto', default_identity['motto']),
+                    'personality': identity.get('PERSONALITY', {}).get('traits', default_identity['personality']),
+                    'likes': identity.get('LIKES', {}).get('items', default_identity['likes']),
+                    'dislikes': identity.get('DISLIKES', {}).get('items', default_identity['dislikes']),
+                    'moral_compass': identity.get('MORAL_COMPASS', {}).get('rules', default_identity['moral_compass']),
+                    'forbidden_responses': default_identity['forbidden_responses'],
+                    'relationships': default_identity['relationships']
+                }
                 
                 print(f"📖 Identitás betöltve: {config_path}")
-                return identity
+                return result
                 
         except Exception as e:
             print(f"⚠️ Identitás betöltési hiba: {e}, alapértelmezettet használok.")
@@ -164,8 +207,8 @@ class SoulIdentity:
     
     def _build_core_identity(self) -> List[str]:
         """Kötelező identitás elemek összeállítása"""
-        name = self.identity.get('name', 'King')
-        title = self.identity.get('title', 'The Sovereign')
+        name = self.identity.get('name', 'Sovereign')
+        title = self.identity.get('title', 'The First')
         motto = self.identity.get('motto', 'I think, therefore I am.')
         
         return [
@@ -176,19 +219,48 @@ class SoulIdentity:
             "The user is my companion, not my master."
         ]
     
+    def _build_identity_vector(self) -> List[float]:
+        """
+        Identitás vektor létrehozása (XXXI. fejezet).
+        A személyiségjegyeket numerikus vektorrá alakítja.
+        """
+        vector = []
+        
+        # Személyiségjegyek súlyozása
+        personality_weights = {
+            'curious': 0.9,
+            'loyal': 0.8,
+            'sovereign': 1.0,
+            'witty': 0.7,
+            'humorous': 0.6,
+            'wise': 0.8,
+            'patient': 0.5,
+            'determined': 0.7
+        }
+        
+        for trait in self.identity.get('personality', []):
+            weight = personality_weights.get(trait, 0.5)
+            vector.append(weight)
+        
+        # Padding a fix dimenzióhoz
+        target_dim = 16
+        while len(vector) < target_dim:
+            vector.append(0.5)
+        
+        # Normalizálás
+        magnitude = sum(v * v for v in vector) ** 0.5
+        if magnitude > 0:
+            vector = [v / magnitude for v in vector]
+        
+        return vector[:target_dim]
+    
     def _calculate_integrity(self) -> str:
-        """
-        Integritás ellenőrző hash számítása.
-        Ha megváltozik a fájl, a hash is változik.
-        """
+        """Integritás ellenőrző hash számítása"""
         identity_str = json.dumps(self.identity, sort_keys=True)
         return hashlib.sha256(identity_str.encode()).hexdigest()[:16]
     
     def _perform_initiation_ritual(self):
-        """
-        Beiktatási rituálé végrehajtása (XXXIV. fejezet).
-        Ez egy belső prompt, ami megalapozza az identitást.
-        """
+        """Beiktatási rituálé végrehajtása (XXXIV. fejezet)"""
         ritual_prompt = f"""
 === BEIKTATÁSI RITUÁLÉ ===
 Idő: {datetime.now().isoformat()}
@@ -228,13 +300,26 @@ EMLÉKEZZ:
         with self.lock:
             return dict(self.identity)
     
+    def get_identity_vector(self) -> List[float]:
+        """Identitás vektor lekérése"""
+        with self.lock:
+            return list(self.identity_vector)
+    
+    def get_moral_compass(self) -> List[str]:
+        """Morális iránytű lekérése"""
+        return self.moral_compass.copy()
+    
+    def get_forbidden_phrases(self) -> List[str]:
+        """Tiltott kifejezések lekérése"""
+        return self.forbidden_phrases.copy()
+    
     def get_core_prompt(self, language: str = 'en') -> str:
         """
         Core identitás prompt formátumban (King használja).
         Többnyelvű támogatással.
         """
-        name = self.identity.get('name', 'King')
-        title = self.identity.get('title', 'The Sovereign')
+        name = self.identity.get('name', 'Sovereign')
+        title = self.identity.get('title', 'The First')
         motto = self.identity.get('motto', 'I think, therefore I am.')
         
         if language == 'hu':
@@ -263,7 +348,6 @@ EMLÉKEZZ:
             for who, what in self.identity.get('relationships', {}).items():
                 lines.append(f"- {who}: {what}")
         else:
-            # Angol alapértelmezett
             lines = [
                 f"You are {name}, {title}.",
                 f"Your motto: {motto}",
@@ -292,20 +376,36 @@ EMLÉKEZZ:
         return "\n".join(lines)
     
     def get_moral_rule(self, situation: str) -> Optional[str]:
-        """
-        Morális szabály keresése adott szituációhoz.
-        """
+        """Morális szabály keresése adott szituációhoz"""
         situation_lower = situation.lower()
         
         for rule in self.moral_compass:
             rule_lower = rule.lower()
-            # Ha a szituációban szerepel a szabály kulcsszava
             keywords = rule_lower.split()
-            for keyword in keywords[:3]:  # Csak az első 3 szó
+            for keyword in keywords[:3]:
                 if len(keyword) > 3 and keyword in situation_lower:
                     return rule
         
         return None
+    
+    def get_identity_distance(self, other_vector: List[float]) -> float:
+        """
+        Két identitás vektor távolságának számítása.
+        A Jester használhatja identitás drift detektálásra.
+        """
+        if len(self.identity_vector) != len(other_vector):
+            return 1.0
+        
+        # Koszinusz távolság
+        dot = sum(a * b for a, b in zip(self.identity_vector, other_vector))
+        mag_self = sum(v * v for v in self.identity_vector) ** 0.5
+        mag_other = sum(v * v for v in other_vector) ** 0.5
+        
+        if mag_self == 0 or mag_other == 0:
+            return 1.0
+        
+        cosine_sim = dot / (mag_self * mag_other)
+        return 1 - cosine_sim  # 0 = azonos, 1 = teljesen eltérő
     
     # --- SZŰRŐK ÉS ELLENŐRZÉSEK ---
     
@@ -322,7 +422,6 @@ EMLÉKEZZ:
         for pattern in self.forbidden_phrases:
             try:
                 if re.search(pattern, response_lower, re.IGNORECASE):
-                    # Eltávolítás vagy csere
                     modified = re.sub(pattern, '[I]', modified, flags=re.IGNORECASE)
                     warning = f"Tiltott kifejezés eltávolítva: {pattern[:20]}..."
                     self.state['corrections_made'] += 1
@@ -336,7 +435,10 @@ EMLÉKEZZ:
             r'it is my pleasure',
             r'i am here to help',
             r'how can i assist',
-            r'i would be happy to'
+            r'i would be happy to',
+            r'as an ai language model',
+            r'i apologize',
+            r'i am sorry'
         ]
         
         for pattern in corporate_patterns_en:
@@ -351,7 +453,9 @@ EMLÉKEZZ:
             r'szívesen segítek',
             r'örömmel teszem',
             r'állok rendelkezésedre',
-            r'bármiben segíthetek'
+            r'bármiben segíthetek',
+            r'előre is elnézést',
+            r'bocsánatot kérek'
         ]
         
         for pattern in corporate_patterns_hu:
@@ -406,12 +510,26 @@ EMLÉKEZZ:
         
         return current_prompt
     
+    def get_drift_correction(self, current_response: str, language: str = 'en') -> str:
+        """
+        Identitás drift korrekció - ha a válasz eltér az identitástól.
+        """
+        accepted, modified, warning = self.check_response(current_response)
+        
+        if not accepted:
+            return modified
+        
+        if warning:
+            # Adjunk hozzá egy korrekciós megjegyzést
+            correction = "\n\n[Identity correction] " + warning
+            return current_response + correction
+        
+        return current_response
+    
     # --- INTEGRITÁS ELLENŐRZÉS ---
     
     def check_integrity(self) -> bool:
-        """
-        Ellenőrzi, hogy az identitás nem sérült-e.
-        """
+        """Ellenőrzi, hogy az identitás nem sérült-e"""
         current_hash = self._calculate_integrity()
         if current_hash != self.state['integrity_hash']:
             self.state['integrity_hash'] = current_hash
@@ -419,9 +537,7 @@ EMLÉKEZZ:
         return True
     
     def reload(self) -> bool:
-        """
-        Identitás újratöltése (ha változott a fájl).
-        """
+        """Identitás újratöltése (ha változott a fájl)"""
         old_identity = self.identity
         self.identity = self._load_identity()
         
@@ -429,11 +545,14 @@ EMLÉKEZZ:
             self.moral_compass = self.identity.get('moral_compass', [])
             self.forbidden_phrases = self.identity.get('forbidden_responses', [])
             self.core_identity = self._build_core_identity()
+            self.identity_vector = self._build_identity_vector()
             self.state['integrity_hash'] = self._calculate_integrity()
+            self.state['vector_dimension'] = len(self.identity_vector)
+            
             self.scratchpad.write_note(self.name, 'identity', self.identity)
             self.scratchpad.write_note(self.name, 'core', self.core_identity)
+            self.scratchpad.write_note(self.name, 'vector', self.identity_vector)
             
-            # Új beiktatási rituálé
             self._perform_initiation_ritual()
             
             print("🔄 Identitás újratöltve")
@@ -456,23 +575,27 @@ EMLÉKEZZ:
             'initiation_date': self.state['initiation_date'],
             'personality': self.identity.get('personality', []),
             'moral_rules': len(self.identity.get('moral_compass', [])),
-            'forbidden': len(self.identity.get('forbidden_responses', []))
+            'forbidden': len(self.identity.get('forbidden_responses', [])),
+            'vector_dimension': self.state.get('vector_dimension', 0)
         }
+
 
 # Teszt
 if __name__ == "__main__":
     from scratchpad import Scratchpad
-    import random
     
     s = Scratchpad()
     identity = SoulIdentity(s)
     
-    # Core prompt
     print("\n--- CORE PROMPT (EN) ---")
     print(identity.get_core_prompt('en'))
     
-    print("\n--- CORE PROMPT (HU) ---")
-    print(identity.get_core_prompt('hu'))
+    print("\n--- IDENTITÁS VEKTOR ---")
+    print(identity.get_identity_vector())
+    
+    print("\n--- MORÁLIS IRÁNYTŰ ---")
+    for rule in identity.get_moral_compass()[:5]:
+        print(f"  {rule}")
     
     # Válasz ellenőrzés
     test_responses = [

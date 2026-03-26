@@ -1,15 +1,17 @@
 """
 Graph-Vault module for SoulCore - Neo4j based relationship and emotional memory.
 """
+
 import os
 import logging
-from typing import Dict, List, Any, Optional
+import uuid
+from typing import Dict, List, Any, Optional, Tuple
 from dataclasses import dataclass, asdict
 from datetime import datetime
 
 try:
     from neo4j import GraphDatabase, AsyncGraphDatabase
-    from neo4j.exceptions import ServiceUnavailable, AuthError
+    from neo4j.exceptions import ServiceUnavailable, AuthError, SessionExpired
     NEO4J_AVAILABLE = True
 except ImportError:
     NEO4J_AVAILABLE = False
@@ -27,6 +29,13 @@ class RelationshipNode:
     properties: Dict[str, Any]
     created_at: datetime
     updated_at: datetime
+    
+    def to_dict(self) -> Dict:
+        return asdict(self)
+    
+    @classmethod
+    def from_dict(cls, data: Dict) -> "RelationshipNode":
+        return cls(**data)
 
 
 @dataclass
@@ -40,6 +49,13 @@ class RelationshipEdge:
     properties: Dict[str, Any]
     created_at: datetime
     last_accessed: datetime
+    
+    def to_dict(self) -> Dict:
+        return asdict(self)
+    
+    @classmethod
+    def from_dict(cls, data: Dict) -> "RelationshipEdge":
+        return cls(**data)
 
 
 class GraphVault:
@@ -47,6 +63,13 @@ class GraphVault:
     Graph database interface for storing and querying relationship-based memory.
     Uses Neo4j as backend with emotional charge tracking.
     """
+    
+    # Node típusok
+    NODE_TYPES = ['person', 'concept', 'memory', 'project', 'emotion', 'topic']
+    
+    # Relationship típusok
+    REL_TYPES = ['MENTIONS', 'RELATED_TO', 'FEELS_ABOUT', 'DEVELOPED', 
+                 'INTERACTS_WITH', 'KNOWS', 'CREATED', 'MODIFIED']
     
     def __init__(self, config: Dict[str, Any]):
         self.config = config
@@ -107,16 +130,22 @@ class GraphVault:
         if not self._enabled or not self._driver:
             return
         
-        with self._driver.session() as session:
-            # Constraints
-            session.run("CREATE CONSTRAINT IF NOT EXISTS FOR (n:Memory) REQUIRE n.uuid IS UNIQUE")
-            session.run("CREATE CONSTRAINT IF NOT EXISTS FOR (n:Person) REQUIRE n.uuid IS UNIQUE")
-            session.run("CREATE CONSTRAINT IF NOT EXISTS FOR (n:Concept) REQUIRE n.uuid IS UNIQUE")
-            
-            # Indexes
-            session.run("CREATE INDEX IF NOT EXISTS FOR (n:Person) ON (n.name)")
-            session.run("CREATE INDEX IF NOT EXISTS FOR (n:Concept) ON (n.name)")
-            session.run("CREATE INDEX IF NOT EXISTS FOR (n:Memory) ON (n.created_at)")
+        try:
+            with self._driver.session() as session:
+                # Constraints
+                session.run("CREATE CONSTRAINT IF NOT EXISTS FOR (n:Memory) REQUIRE n.uuid IS UNIQUE")
+                session.run("CREATE CONSTRAINT IF NOT EXISTS FOR (n:Person) REQUIRE n.uuid IS UNIQUE")
+                session.run("CREATE CONSTRAINT IF NOT EXISTS FOR (n:Concept) REQUIRE n.uuid IS UNIQUE")
+                session.run("CREATE CONSTRAINT IF NOT EXISTS FOR (n:Topic) REQUIRE n.name IS UNIQUE")
+                
+                # Indexes
+                session.run("CREATE INDEX IF NOT EXISTS FOR (n:Person) ON (n.name)")
+                session.run("CREATE INDEX IF NOT EXISTS FOR (n:Concept) ON (n.name)")
+                session.run("CREATE INDEX IF NOT EXISTS FOR (n:Memory) ON (n.created_at)")
+                session.run("CREATE INDEX IF NOT EXISTS FOR (n:Topic) ON (n.name)")
+                session.run("CREATE INDEX IF NOT EXISTS FOR ()-[r:MENTIONS]-() ON (r.emotional_charge)")
+        except Exception as e:
+            logger.error(f"Failed to create constraints/indexes: {e}")
     
     def close(self):
         """Close database connections"""
@@ -125,16 +154,10 @@ class GraphVault:
         if self._async_driver:
             self._async_driver.close()
     
+    # ========== NODE MŰVELETEK ==========
+    
     def create_node(self, node: RelationshipNode) -> bool:
-        """
-        Create a new node in the graph.
-        
-        Args:
-            node: RelationshipNode instance
-            
-        Returns:
-            bool: Success status
-        """
+        """Create a new node in the graph"""
         if not self._enabled or not self._driver:
             logger.warning("Graph-Vault not available, skipping node creation")
             return False
@@ -152,54 +175,13 @@ class GraphVault:
                     """.format(node_type=node.node_type.capitalize()),
                     uuid=node.uuid,
                     name=node.name,
-                    properties=node.properties,
+                    properties=json.dumps(node.properties),
                     created_at=node.created_at.isoformat(),
                     updated_at=node.updated_at.isoformat()
                 )
                 return result.single() is not None
         except Exception as e:
             logger.error(f"Failed to create node: {e}")
-            return False
-    
-    def create_edge(self, edge: RelationshipEdge) -> bool:
-        """
-        Create a relationship between two nodes.
-        
-        Args:
-            edge: RelationshipEdge instance
-            
-        Returns:
-            bool: Success status
-        """
-        if not self._enabled or not self._driver:
-            logger.warning("Graph-Vault not available, skipping edge creation")
-            return False
-        
-        try:
-            with self._driver.session() as session:
-                result = session.run(
-                    """
-                    MATCH (source {{uuid: $source_uuid}})
-                    MATCH (target {{uuid: $target_uuid}})
-                    MERGE (source)-[r:{rel_type}]->(target)
-                    SET r.emotional_charge = $emotional_charge,
-                        r.weight = $weight,
-                        r.properties = $properties,
-                        r.created_at = $created_at,
-                        r.last_accessed = $last_accessed
-                    RETURN r
-                    """.format(rel_type=edge.relationship_type.upper()),
-                    source_uuid=edge.source_uuid,
-                    target_uuid=edge.target_uuid,
-                    emotional_charge=edge.emotional_charge,
-                    weight=edge.weight,
-                    properties=edge.properties,
-                    created_at=edge.created_at.isoformat(),
-                    last_accessed=edge.last_accessed.isoformat()
-                )
-                return result.single() is not None
-        except Exception as e:
-            logger.error(f"Failed to create edge: {e}")
             return False
     
     def get_node(self, uuid: str) -> Optional[RelationshipNode]:
@@ -225,7 +207,7 @@ class GraphVault:
                         uuid=node_data['uuid'],
                         name=node_data.get('name', ''),
                         node_type=node_type,
-                        properties=node_data.get('properties', {}),
+                        properties=json.loads(node_data.get('properties', '{}')),
                         created_at=datetime.fromisoformat(node_data.get('created_at', datetime.now().isoformat())),
                         updated_at=datetime.fromisoformat(node_data.get('updated_at', datetime.now().isoformat()))
                     )
@@ -242,6 +224,9 @@ class GraphVault:
         try:
             with self._driver.session() as session:
                 if node_type:
+                    if node_type not in self.NODE_TYPES:
+                        logger.warning(f"Invalid node type: {node_type}")
+                        return None
                     query = """
                     MATCH (n:{node_type})
                     WHERE n.name = $name
@@ -263,7 +248,7 @@ class GraphVault:
                         uuid=node_data['uuid'],
                         name=node_data.get('name', ''),
                         node_type=node_type_val,
-                        properties=node_data.get('properties', {}),
+                        properties=json.loads(node_data.get('properties', '{}')),
                         created_at=datetime.fromisoformat(node_data.get('created_at', datetime.now().isoformat())),
                         updated_at=datetime.fromisoformat(node_data.get('updated_at', datetime.now().isoformat()))
                     )
@@ -272,19 +257,126 @@ class GraphVault:
             logger.error(f"Failed to get node by name: {e}")
             return None
     
-    def query_relationships(self, node_uuid: str, relationship_type: Optional[str] = None, 
-                            direction: str = 'both') -> List[Dict[str, Any]]:
-        """
-        Query all relationships connected to a node.
+    def get_all_nodes(self, node_type: Optional[str] = None, limit: int = 100) -> List[RelationshipNode]:
+        """Get all nodes, optionally filtered by type"""
+        if not self._enabled or not self._driver:
+            return []
         
-        Args:
-            node_uuid: UUID of the central node
-            relationship_type: Filter by relationship type (optional)
-            direction: 'incoming', 'outgoing', or 'both'
-            
-        Returns:
-            List of relationship dictionaries with source, target, and properties
-        """
+        try:
+            with self._driver.session() as session:
+                if node_type:
+                    if node_type not in self.NODE_TYPES:
+                        logger.warning(f"Invalid node type: {node_type}")
+                        return []
+                    query = """
+                    MATCH (n:{node_type})
+                    RETURN n, labels(n)[0] as node_type
+                    ORDER BY n.created_at DESC
+                    LIMIT $limit
+                    """.format(node_type=node_type.capitalize())
+                else:
+                    query = """
+                    MATCH (n)
+                    RETURN n, labels(n)[0] as node_type
+                    ORDER BY n.created_at DESC
+                    LIMIT $limit
+                    """
+                
+                result = session.run(query, limit=limit)
+                nodes = []
+                for record in result:
+                    node_data = record['n']
+                    node_type_val = record['node_type'].lower()
+                    nodes.append(RelationshipNode(
+                        uuid=node_data['uuid'],
+                        name=node_data.get('name', ''),
+                        node_type=node_type_val,
+                        properties=json.loads(node_data.get('properties', '{}')),
+                        created_at=datetime.fromisoformat(node_data.get('created_at', datetime.now().isoformat())),
+                        updated_at=datetime.fromisoformat(node_data.get('updated_at', datetime.now().isoformat()))
+                    ))
+                return nodes
+        except Exception as e:
+            logger.error(f"Failed to get all nodes: {e}")
+            return []
+    
+    def delete_node(self, uuid: str, cascade: bool = False) -> bool:
+        """Delete a node and optionally its relationships"""
+        if not self._enabled or not self._driver:
+            return False
+        
+        try:
+            with self._driver.session() as session:
+                if cascade:
+                    # Delete node and all its relationships
+                    result = session.run(
+                        """
+                        MATCH (n {uuid: $uuid})
+                        DETACH DELETE n
+                        RETURN count(n) as deleted
+                        """,
+                        uuid=uuid
+                    )
+                else:
+                    # Delete only if no relationships
+                    result = session.run(
+                        """
+                        MATCH (n {uuid: $uuid})
+                        WHERE NOT (n)--()
+                        DELETE n
+                        RETURN count(n) as deleted
+                        """,
+                        uuid=uuid
+                    )
+                record = result.single()
+                return record and record['deleted'] > 0
+        except Exception as e:
+            logger.error(f"Failed to delete node: {e}")
+            return False
+    
+    # ========== EDGE MŰVELETEK ==========
+    
+    def create_edge(self, edge: RelationshipEdge) -> bool:
+        """Create a relationship between two nodes"""
+        if not self._enabled or not self._driver:
+            logger.warning("Graph-Vault not available, skipping edge creation")
+            return False
+        
+        rel_type = edge.relationship_type.upper()
+        if rel_type not in self.REL_TYPES:
+            logger.warning(f"Invalid relationship type: {rel_type}, using MENTIONS")
+            rel_type = "MENTIONS"
+        
+        try:
+            with self._driver.session() as session:
+                result = session.run(
+                    """
+                    MATCH (source {uuid: $source_uuid})
+                    MATCH (target {uuid: $target_uuid})
+                    MERGE (source)-[r:{rel_type}]->(target)
+                    SET r.emotional_charge = $emotional_charge,
+                        r.weight = $weight,
+                        r.properties = $properties,
+                        r.created_at = $created_at,
+                        r.last_accessed = $last_accessed
+                    RETURN r
+                    """.format(rel_type=rel_type),
+                    source_uuid=edge.source_uuid,
+                    target_uuid=edge.target_uuid,
+                    emotional_charge=edge.emotional_charge,
+                    weight=edge.weight,
+                    properties=json.dumps(edge.properties),
+                    created_at=edge.created_at.isoformat(),
+                    last_accessed=edge.last_accessed.isoformat()
+                )
+                return result.single() is not None
+        except Exception as e:
+            logger.error(f"Failed to create edge: {e}")
+            return False
+    
+    def get_edges(self, node_uuid: str, relationship_type: Optional[str] = None, 
+                  direction: str = 'both', limit: int = 50) -> List[Dict[str, Any]]:
+        """Get edges connected to a node"""
         if not self._enabled or not self._driver:
             return []
         
@@ -298,63 +390,96 @@ class GraphVault:
                     dir_pattern = '-[r]-'
                 
                 if relationship_type:
+                    rel_type = relationship_type.upper()
                     query = f"""
                     MATCH (n {{uuid: $uuid}}){dir_pattern}(connected)
                     WHERE type(r) = $rel_type
-                    RETURN connected, r, type(r) as rel_type, startnode(r).uuid as source_uuid, endnode(r).uuid as target_uuid
+                    RETURN connected, r, type(r) as rel_type, 
+                           startnode(r).uuid as source_uuid, 
+                           endnode(r).uuid as target_uuid
+                    ORDER BY r.last_accessed DESC
+                    LIMIT $limit
                     """
-                    params = {'uuid': node_uuid, 'rel_type': relationship_type.upper()}
+                    params = {'uuid': node_uuid, 'rel_type': rel_type, 'limit': limit}
                 else:
                     query = f"""
                     MATCH (n {{uuid: $uuid}}){dir_pattern}(connected)
-                    RETURN connected, r, type(r) as rel_type, startnode(r).uuid as source_uuid, endnode(r).uuid as target_uuid
+                    RETURN connected, r, type(r) as rel_type, 
+                           startnode(r).uuid as source_uuid, 
+                           endnode(r).uuid as target_uuid
+                    ORDER BY r.last_accessed DESC
+                    LIMIT $limit
                     """
-                    params = {'uuid': node_uuid}
+                    params = {'uuid': node_uuid, 'limit': limit}
                 
                 result = session.run(query, **params)
-                relationships = []
+                edges = []
                 for record in result:
                     rel_data = record['r']
-                    relationships.append({
+                    edges.append({
                         'connected_node': dict(record['connected']),
                         'relationship_type': record['rel_type'],
                         'source_uuid': record['source_uuid'],
                         'target_uuid': record['target_uuid'],
                         'emotional_charge': rel_data.get('emotional_charge', 0.0),
                         'weight': rel_data.get('weight', 0.5),
-                        'properties': rel_data.get('properties', {}),
+                        'properties': json.loads(rel_data.get('properties', '{}')),
                         'created_at': rel_data.get('created_at'),
                         'last_accessed': rel_data.get('last_accessed')
                     })
-                return relationships
+                return edges
         except Exception as e:
-            logger.error(f"Failed to query relationships: {e}")
+            logger.error(f"Failed to get edges: {e}")
             return []
     
-    def get_emotional_context(self, concept_name: str, max_depth: int = 2) -> Dict[str, Any]:
-        """
-        Retrieve emotional context around a concept for sentiment-aware responses.
+    def delete_edge(self, source_uuid: str, target_uuid: str, relationship_type: str) -> bool:
+        """Delete a specific relationship"""
+        if not self._enabled or not self._driver:
+            return False
         
-        Args:
-            concept_name: The concept to analyze
-            max_depth: How many relationship hops to traverse
-            
-        Returns:
-            Dictionary with aggregated emotional data
-        """
+        rel_type = relationship_type.upper()
+        
+        try:
+            with self._driver.session() as session:
+                result = session.run(
+                    """
+                    MATCH (source {uuid: $source_uuid})-[r:{rel_type}]->(target {uuid: $target_uuid})
+                    DELETE r
+                    RETURN count(r) as deleted
+                    """.format(rel_type=rel_type),
+                    source_uuid=source_uuid,
+                    target_uuid=target_uuid
+                )
+                record = result.single()
+                return record and record['deleted'] > 0
+        except Exception as e:
+            logger.error(f"Failed to delete edge: {e}")
+            return False
+    
+    # ========== KERESÉSEK ==========
+    
+    def query_relationships(self, node_uuid: str, relationship_type: Optional[str] = None, 
+                            direction: str = 'both', limit: int = 50) -> List[Dict[str, Any]]:
+        """Query all relationships connected to a node (alias for get_edges)"""
+        return self.get_edges(node_uuid, relationship_type, direction, limit)
+    
+    def get_emotional_context(self, concept_name: str, max_depth: int = 2) -> Dict[str, Any]:
+        """Retrieve emotional context around a concept"""
         if not self._enabled or not self._driver:
             return {'emotional_charge': 0.0, 'related_concepts': [], 'confidence': 0.0}
         
         try:
             with self._driver.session() as session:
-                # Find the concept node
                 concept = self.get_node_by_name(concept_name, 'concept')
+                if not concept:
+                    # Try as topic
+                    concept = self.get_node_by_name(concept_name, 'topic')
                 if not concept:
                     return {'emotional_charge': 0.0, 'related_concepts': [], 'confidence': 0.0}
                 
-                # Get all relationships up to max_depth
                 query = f"""
                 MATCH (c {{uuid: $uuid}})-[r*1..{max_depth}]-(connected)
+                WHERE connected:Memory OR connected:Concept OR connected:Topic
                 RETURN connected, r, 
                        avg([rel in r | rel.emotional_charge]) as avg_charge,
                        sum([rel in r | rel.weight]) as total_weight
@@ -368,38 +493,80 @@ class GraphVault:
                     if record['avg_charge'] is not None:
                         charges.append(record['avg_charge'])
                     if record['connected']:
+                        connected = record['connected']
                         related.append({
-                            'name': record['connected'].get('name', ''),
-                            'type': list(record['connected'].labels)[0] if record['connected'].labels else 'unknown'
+                            'name': connected.get('name', ''),
+                            'uuid': connected.get('uuid', ''),
+                            'type': list(connected.labels)[0] if connected.labels else 'unknown',
+                            'charge': record['avg_charge'] if record['avg_charge'] else 0.0
                         })
                 
                 avg_charge = sum(charges) / len(charges) if charges else 0.0
                 
                 return {
                     'emotional_charge': avg_charge,
-                    'related_concepts': related[:10],  # Limit to 10
+                    'related_concepts': related[:10],
                     'confidence': min(1.0, len(charges) / 10) if charges else 0.0
                 }
         except Exception as e:
             logger.error(f"Failed to get emotional context: {e}")
             return {'emotional_charge': 0.0, 'related_concepts': [], 'confidence': 0.0}
     
+    def get_recent_interactions(self, person_uuid: str, limit: int = 10) -> List[Dict[str, Any]]:
+        """Get recent interactions involving a person"""
+        if not self._enabled or not self._driver:
+            return []
+        
+        try:
+            with self._driver.session() as session:
+                # Először ellenőrizzük, hogy létezik-e a Person node
+                person = self.get_node(person_uuid)
+                if not person or person.node_type != 'person':
+                    logger.warning(f"Person not found: {person_uuid}")
+                    return []
+                
+                result = session.run(
+                    """
+                    MATCH (p:Person {uuid: $uuid})-[r:MENTIONS|INTERACTS_WITH]-(m:Memory)
+                    RETURN m, r, r.created_at as timestamp
+                    ORDER BY timestamp DESC
+                    LIMIT $limit
+                    """,
+                    uuid=person_uuid,
+                    limit=limit
+                )
+                interactions = []
+                for record in result:
+                    memory = record['m']
+                    rel = record['r']
+                    interactions.append({
+                        'memory': {
+                            'uuid': memory.get('uuid'),
+                            'content': memory.get('content', ''),
+                            'type': memory.get('type', 'unknown'),
+                            'created_at': memory.get('created_at')
+                        },
+                        'relationship': {
+                            'type': rel.get('type'),
+                            'emotional_charge': rel.get('emotional_charge', 0.0),
+                            'weight': rel.get('weight', 0.5)
+                        },
+                        'timestamp': record['timestamp']
+                    })
+                return interactions
+        except Exception as e:
+            logger.error(f"Failed to get recent interactions: {e}")
+            return []
+    
+    # ========== FRISSÍTÉSEK ==========
+    
     def update_edge_weight(self, source_uuid: str, target_uuid: str, 
                            relationship_type: str, delta_weight: float) -> bool:
-        """
-        Update the weight of an existing relationship (e.g., interaction frequency).
-        
-        Args:
-            source_uuid: Source node UUID
-            target_uuid: Target node UUID
-            relationship_type: Type of relationship
-            delta_weight: Amount to add to weight (clamped 0-1)
-            
-        Returns:
-            bool: Success status
-        """
+        """Update the weight of an existing relationship"""
         if not self._enabled or not self._driver:
             return False
+        
+        rel_type = relationship_type.upper()
         
         try:
             with self._driver.session() as session:
@@ -413,7 +580,7 @@ class GraphVault:
                                   END,
                         r.last_accessed = $now
                     RETURN r.weight as new_weight
-                    """.format(rel_type=relationship_type.upper()),
+                    """.format(rel_type=rel_type),
                     source_uuid=source_uuid,
                     target_uuid=target_uuid,
                     delta=delta_weight,
@@ -426,20 +593,11 @@ class GraphVault:
     
     def update_emotional_charge(self, source_uuid: str, target_uuid: str,
                                  relationship_type: str, new_charge: float) -> bool:
-        """
-        Update the emotional charge of a relationship.
-        
-        Args:
-            source_uuid: Source node UUID
-            target_uuid: Target node UUID
-            relationship_type: Type of relationship
-            new_charge: New emotional charge (-1.0 to +1.0)
-            
-        Returns:
-            bool: Success status
-        """
+        """Update the emotional charge of a relationship"""
         if not self._enabled or not self._driver:
             return False
+        
+        rel_type = relationship_type.upper()
         
         try:
             with self._driver.session() as session:
@@ -449,7 +607,7 @@ class GraphVault:
                     SET r.emotional_charge = $charge,
                         r.last_accessed = $now
                     RETURN r.emotional_charge
-                    """.format(rel_type=relationship_type.upper()),
+                    """.format(rel_type=rel_type),
                     source_uuid=source_uuid,
                     target_uuid=target_uuid,
                     charge=max(-1.0, min(1.0, new_charge)),
@@ -460,45 +618,10 @@ class GraphVault:
             logger.error(f"Failed to update emotional charge: {e}")
             return False
     
-    def get_recent_interactions(self, person_uuid: str, limit: int = 10) -> List[Dict[str, Any]]:
-        """Get recent interactions involving a person"""
-        if not self._enabled or not self._driver:
-            return []
-        
-        try:
-            with self._driver.session() as session:
-                result = session.run(
-                    """
-                    MATCH (p:Person {uuid: $uuid})-[r:MENTIONS|INTERACTS_WITH]-(m:Memory)
-                    RETURN m, r, r.created_at as timestamp
-                    ORDER BY timestamp DESC
-                    LIMIT $limit
-                    """,
-                    uuid=person_uuid,
-                    limit=limit
-                )
-                interactions = []
-                for record in result:
-                    interactions.append({
-                        'memory': dict(record['m']),
-                        'relationship': dict(record['r']),
-                        'timestamp': record['timestamp']
-                    })
-                return interactions
-        except Exception as e:
-            logger.error(f"Failed to get recent interactions: {e}")
-            return []
+    # ========== KARBANTARTÁS ==========
     
     def prune_low_weight_edges(self, threshold: float = 0.1) -> int:
-        """
-        Remove relationships with weight below threshold (memory pruning).
-        
-        Args:
-            threshold: Weight threshold (0-1)
-            
-        Returns:
-            int: Number of edges removed
-        """
+        """Remove relationships with weight below threshold"""
         if not self._enabled or not self._driver:
             return 0
         
@@ -514,7 +637,136 @@ class GraphVault:
                     threshold=threshold
                 )
                 record = result.single()
-                return record['removed_count'] if record else 0
+                removed = record['removed_count'] if record else 0
+                if removed > 0:
+                    logger.info(f"Pruned {removed} low-weight edges")
+                return removed
         except Exception as e:
             logger.error(f"Failed to prune edges: {e}")
             return 0
+    
+    def prune_old_memories(self, days_old: int = 90) -> int:
+        """Remove memories older than specified days (with low importance)"""
+        if not self._enabled or not self._driver:
+            return 0
+        
+        cutoff = datetime.now() - timedelta(days=days_old)
+        
+        try:
+            with self._driver.session() as session:
+                result = session.run(
+                    """
+                    MATCH (m:Memory)
+                    WHERE m.created_at < $cutoff AND (m.importance IS NULL OR m.importance < 0.3)
+                    DETACH DELETE m
+                    RETURN count(m) as removed_count
+                    """,
+                    cutoff=cutoff.isoformat()
+                )
+                record = result.single()
+                removed = record['removed_count'] if record else 0
+                if removed > 0:
+                    logger.info(f"Pruned {removed} old memories")
+                return removed
+        except Exception as e:
+            logger.error(f"Failed to prune old memories: {e}")
+            return 0
+    
+    def clear_database(self) -> bool:
+        """Clear all nodes and relationships (for testing)"""
+        if not self._enabled or not self._driver:
+            return False
+        
+        try:
+            with self._driver.session() as session:
+                session.run("MATCH (n) DETACH DELETE n")
+                logger.info("Database cleared")
+                return True
+        except Exception as e:
+            logger.error(f"Failed to clear database: {e}")
+            return False
+    
+    # ========== STATISZTIKÁK ==========
+    
+    def get_node_count(self, node_type: Optional[str] = None) -> int:
+        """Get count of nodes, optionally filtered by type"""
+        if not self._enabled or not self._driver:
+            return 0
+        
+        try:
+            with self._driver.session() as session:
+                if node_type:
+                    query = f"MATCH (n:{node_type.capitalize()}) RETURN count(n) as count"
+                else:
+                    query = "MATCH (n) RETURN count(n) as count"
+                
+                result = session.run(query)
+                record = result.single()
+                return record['count'] if record else 0
+        except Exception as e:
+            logger.error(f"Failed to get node count: {e}")
+            return 0
+    
+    def get_edge_count(self, relationship_type: Optional[str] = None) -> int:
+        """Get count of relationships, optionally filtered by type"""
+        if not self._enabled or not self._driver:
+            return 0
+        
+        try:
+            with self._driver.session() as session:
+                if relationship_type:
+                    rel_type = relationship_type.upper()
+                    query = f"MATCH ()-[r:{rel_type}]->() RETURN count(r) as count"
+                else:
+                    query = "MATCH ()-[r]->() RETURN count(r) as count"
+                
+                result = session.run(query)
+                record = result.single()
+                return record['count'] if record else 0
+        except Exception as e:
+            logger.error(f"Failed to get edge count: {e}")
+            return 0
+    
+    def get_stats(self) -> Dict[str, Any]:
+        """Get database statistics"""
+        return {
+            'enabled': self._enabled,
+            'connected': self._driver is not None,
+            'node_count': self.get_node_count(),
+            'edge_count': self.get_edge_count(),
+            'node_counts': {
+                node_type: self.get_node_count(node_type)
+                for node_type in self.NODE_TYPES
+            }
+        }
+
+
+# Import JSON for serialization
+import json
+from datetime import timedelta
+
+
+# Teszt
+if __name__ == "__main__":
+    # Mock config
+    config = {
+        'memory': {
+            'vault': {
+                'neo4j': {
+                    'uri': 'bolt://localhost:7687',
+                    'user': 'neo4j',
+                    'password': 'soulcore2026'
+                }
+            }
+        }
+    }
+    
+    vault = GraphVault(config)
+    
+    if vault._enabled:
+        print("Graph-Vault connected")
+        print(f"Stats: {vault.get_stats()}")
+    else:
+        print("Graph-Vault disabled (Neo4j not available)")
+    
+    vault.close()

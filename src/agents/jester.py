@@ -101,7 +101,8 @@ class Jester:
             'perplexity_threshold': 50.0,
             'perplexity_window': 5,
             'max_warnings': 20,
-            'identity_injection_path': 'config/identity.inf'
+            'identity_injection_path': 'config/identity.inf',
+            'internal_monologue_check_interval': 60  # 1 perc
         }
         
         for key, value in default_config.items():
@@ -111,6 +112,7 @@ class Jester:
         # ========== ÁLLAPOT ==========
         self.issues = deque(maxlen=self.config['max_warnings'])
         self.last_check = time.time()
+        self.last_monologue_check = time.time()
         self.check_count = 0
         
         self.mood_history = deque(maxlen=self.config['max_mood_history'])
@@ -126,8 +128,12 @@ class Jester:
             'last_response_time': 0,
             'last_response_text': '',
             'response_count': 0,
-            'errors': []
+            'errors': [],
+            'last_internal_monologue': ''  # <-- HOZZÁADVA!
         }
+        
+        # Aktuális trace ID
+        self.current_trace_id = None
         
         # Betöltjük az identitás fájlt
         self.identity_prompt = self._load_identity_prompt()
@@ -209,7 +215,8 @@ class Jester:
         ]
         
         # Feliratkozás a buszra - hallja a Király beszédét
-        self.bus.subscribe(self.name, self._on_message)
+        if self.bus:
+            self.bus.subscribe(self.name, self._on_message)
         
         print("🎭 Jester: Bohóc-Doktor ügyeletben. Hallgatom a Király szavát.")
     
@@ -222,6 +229,12 @@ class Jester:
         """
         header = message.get('header', {})
         payload = message.get('payload', {})
+        
+        # Rendszeres ellenőrzés: olvassuk a King belső monológját
+        now = time.time()
+        if now - self.last_monologue_check > self.config['internal_monologue_check_interval']:
+            self.last_monologue_check = now
+            self._read_king_monologue()
         
         # Csak a Király beszédére reagálunk
         if header.get('sender') != 'king':
@@ -462,6 +475,8 @@ class Jester:
                 'content': internal_text[:500],
                 'analyzed': False
             })
+            # Frissítjük az állapot cache-t is
+            self.king_state['last_internal_monologue'] = internal_text
             return internal_text
         return None
     
@@ -497,6 +512,32 @@ class Jester:
             self.current_mood = new_mood
             self.current_mood_value = mood_value
             self.stats['mood_shifts'] += 1
+    
+    def _read_king_monologue(self):
+        """Király belső monológjának olvasása a scratchpad-ből"""
+        monologue = self.scratchpad.read_note('king', 'internal_monologue')
+        if monologue and isinstance(monologue, dict):
+            text = monologue.get('text', '')
+            if text:
+                # Frissítjük a belső monológot az állapot cache-ben
+                self.king_state['last_internal_monologue'] = text
+                
+                # Elemzés és hangulatfrissítés
+                mood, value = self.analyze_king_mood(text)
+                self.update_mood(mood, value)
+                
+                # Terápia, ha kell
+                if value < self.config['critical_mood_threshold']:
+                    self._send_therapy(mood)
+    
+    def _send_therapy(self, mood_type: str):
+        """
+        Terápiás üzenet küldése a Kingnek.
+        """
+        therapy = self.therapy_payloads.get(mood_type, self.therapy_payloads['existential'])
+        self._send_intervention(therapy)
+        self.stats['therapeutic_sessions'] += 1
+        print(f"🎭 Jester: Terápia küldve ({mood_type})")
     
     # ========== FELHASZNÁLÓ FELÉ ==========
     

@@ -35,7 +35,7 @@ class Heartbeat:
     
     def __init__(self, scratchpad, message_bus=None, config: Dict = None):
         self.scratchpad = scratchpad
-        self.bus = message_bus  # Opcionális - broadcast módhoz
+        self.bus = message_bus
         self.name = "heartbeat"
         self.config = config or {}
         
@@ -63,7 +63,6 @@ class Heartbeat:
             }
         }
         
-        # Konfiguráció összefésülése
         for key, value in default_config.items():
             if key not in self.config:
                 self.config[key] = value
@@ -140,6 +139,7 @@ class Heartbeat:
         Proaktív üzenet küldése a buszon.
         """
         if not self.bus:
+            print("💓 Proaktív üzenet: nincs busz, nem küldve")
             return
         
         trace_id = str(uuid.uuid4())
@@ -164,15 +164,18 @@ class Heartbeat:
             }
         }
         
-        self.bus.broadcast(message)
-        
-        # Állapot frissítés
-        self.state['proactive_count'] += 1
-        self.state['last_proactive'] = time.time()
-        self.state['last_proactive_date'] = datetime.now().date()
-        self.state['proactive_today'] = True
-        
-        print(f"💓 Proaktív üzenet küldve: {data.get('type')} - {data.get('topic')}")
+        try:
+            self.bus.broadcast(message)
+            
+            # Állapot frissítés
+            self.state['proactive_count'] += 1
+            self.state['last_proactive'] = time.time()
+            self.state['last_proactive_date'] = datetime.now().date()
+            self.state['proactive_today'] = True
+            
+            print(f"💓 Proaktív üzenet küldve: {data.get('type')} - {data.get('topic')}")
+        except Exception as e:
+            print(f"💓 Proaktív üzenet küldési hiba: {e}")
     
     # ========== FŐ CIKLUS ==========
     
@@ -318,6 +321,12 @@ class Heartbeat:
         if pro_config.get('once_per_day', True):
             today = datetime.now().date()
             last_date = self.state.get('last_proactive_date')
+            # Ha last_date string, alakítsuk át
+            if last_date and isinstance(last_date, str):
+                try:
+                    last_date = datetime.fromisoformat(last_date).date()
+                except:
+                    last_date = None
             if last_date == today:
                 return
         
@@ -328,7 +337,7 @@ class Heartbeat:
         
         # 4. Utolsó téma lekérése
         last_topic = self._get_last_topic()
-        if not last_topic:
+        if not last_topic or last_topic == 'unknown':
             return
         
         # 5. Téma szűrés
@@ -354,6 +363,8 @@ class Heartbeat:
         notes = self.scratchpad.read_all_notes()
         today = datetime.now().strftime("%Y%m%d")
         user_language = self.scratchpad.get_state('user_language', 'en')
+        if not user_language:
+            user_language = 'en'
         
         for module, notes_dict in notes.items():
             if not isinstance(notes_dict, dict):
@@ -400,8 +411,16 @@ class Heartbeat:
         if last_intent:
             content = last_intent.get('content', {})
             if isinstance(content, dict):
-                intent = content.get('payload', {}).get('intent', {})
-                return intent.get('class', '')
+                # Próbáljuk a payload-ból kiolvasni
+                payload = content.get('payload', {})
+                intent = payload.get('intent', {})
+                topic = intent.get('class', '')
+                if topic:
+                    return topic
+                
+                # Ha nincs, próbáljuk a header-ből
+                header = content.get('header', {})
+                return header.get('intent', '')
         return ''
     
     # ========== EMLÉKEZTETŐ LÉTREHOZÁS ==========
@@ -412,6 +431,7 @@ class Heartbeat:
         """
         date = self._extract_date(text, language)
         if not date:
+            print(f"💓 Nem sikerült dátumot kinyerni: {text[:50]}...")
             return None
         
         topic = self._extract_topic(text)
@@ -420,6 +440,12 @@ class Heartbeat:
         
         date_str = date.strftime("%Y%m%d")
         key = f"reminder_{date_str}_{topic}"
+        
+        # Ellenőrizzük, hogy már létezik-e
+        existing = self.scratchpad.read_note('heartbeat', key)
+        if existing:
+            print(f"💓 Emlékeztető már létezik: {key}")
+            return key
         
         self.scratchpad.write_note('heartbeat', key, {
             'text': text,
@@ -431,10 +457,10 @@ class Heartbeat:
             'created': time.time()
         })
         
-        print(f"💓 Emlékeztető létrehozva: {key}")
+        print(f"💓 Emlékeztető létrehozva: {key} - {date_str}")
         return key
     
-    def _extract_date(self, text: str, language: str = "en"):
+    def _extract_date(self, text: str, language: str = "en") -> Optional[datetime]:
         """Dátum kinyerése szövegből"""
         text_lower = text.lower()
         
@@ -461,7 +487,9 @@ class Heartbeat:
         for pattern, handler in patterns:
             match = re.search(pattern, text_lower)
             if match:
-                return handler(match)
+                result = handler(match)
+                if result:
+                    return result
         
         return None
     
@@ -511,6 +539,8 @@ class Heartbeat:
             return today
         elif word in ['tomorrow', 'holnap']:
             return today + timedelta(days=1)
+        elif word in ['holnapután']:
+            return today + timedelta(days=2)
         
         return None
     
@@ -575,7 +605,8 @@ class Heartbeat:
         topic_words = []
         
         skip_words = ['megyek', 'vásárol', 'csinál', 'hoz', 'visz', 'lesz', 'van',
-                      'go', 'buy', 'do', 'bring', 'take', 'will', 'is', 'be']
+                      'go', 'buy', 'do', 'bring', 'take', 'will', 'is', 'be',
+                      'remind', 'emlékeztess', 'emlékeztető', 'jegyezd', 'meg']
         
         for word in words:
             word_lower = word.lower()
@@ -691,11 +722,20 @@ if __name__ == "__main__":
     s = Scratchpad()
     
     class MockBus:
+        def __init__(self):
+            self.subscribers = {}
+        
         def subscribe(self, name, callback):
-            self.callback = callback
+            self.subscribers[name] = callback
         
         def broadcast(self, message):
             print(f"📡 Broadcast: {message.get('payload', {}).get('type')}")
+            # Meghívjuk a callback-et is (teszteléshez)
+            for cb in self.subscribers.values():
+                try:
+                    cb(message)
+                except:
+                    pass
     
     bus = MockBus()
     
@@ -703,7 +743,9 @@ if __name__ == "__main__":
     hb.start()
     
     # Emlékeztető teszt
+    print("\n--- Emlékeztető teszt ---")
     hb.create_reminder("Kedden megyek vásárolni", language="hu")
+    hb.create_reminder("Remind me to buy milk tomorrow", language="en")
     
     time.sleep(2)
     

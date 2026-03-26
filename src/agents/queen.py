@@ -88,7 +88,7 @@ class Queen:
     def __init__(self, scratchpad, model_wrapper=None, message_bus=None, config: Dict = None):
         self.scratchpad = scratchpad
         self.model = model_wrapper
-        self.bus = message_bus  # Opcionális - ha nincs, fallback a régi mód
+        self.bus = message_bus
         self.name = "queen"
         self.config = config or {}
         
@@ -105,7 +105,8 @@ class Queen:
             'confidence_threshold': 0.6,
             'enable_thought_validation': True,
             'cache_ttl': 300,
-            'max_cache_size': 100
+            'max_cache_size': 100,
+            'complexity_threshold': 0.6  # Komplexitás küszöb a Queen bekapcsolásához
         }
         
         for key, value in default_config.items():
@@ -167,6 +168,9 @@ class Queen:
         Hallja a buszon érkező üzeneteket.
         Ha a Király royal_decree-je érkezik és kéri a Queen-t, dolgozik.
         """
+        if not self.bus:
+            return
+        
         header = message.get('header', {})
         payload = message.get('payload', {})
         
@@ -187,8 +191,14 @@ class Queen:
         user_message = payload.get('user_message', '')
         interpretation = payload.get('interpretation', {})
         
+        # Komplexitás ellenőrzés - ha alacsony, nem kell Queen
+        complexity = interpretation.get('complexity', 'medium')
+        if complexity == 'low' and self.config.get('skip_low_complexity', True):
+            print(f"👸 Queen: Alacsony komplexitás, kihagyás ({trace_id[:8]})")
+            return
+        
         # Logikai levezetés végzése
-        thought = self._think(user_message, interpretation, payload.get('context', {}))
+        thought = self._think(user_message, interpretation, {})
         
         # Válasz küldése a Kingnek
         response = {
@@ -284,7 +294,11 @@ class Queen:
         intent_class = interpretation.get('intent', {}).get('class', 'unknown')
         facts.append(f"INTENT: {intent_class}")
         
-        # Kontextus (Valet-től)
+        # Komplexitás
+        complexity = interpretation.get('complexity', 'medium')
+        facts.append(f"COMPLEXITY: {complexity}")
+        
+        # Kontextus (Valet-től) - itt jöhet a Valet-től kapott context
         if context:
             ctx_facts = context.get('facts', [])
             if isinstance(ctx_facts, list):
@@ -443,7 +457,10 @@ class Queen:
                     temporal.append(fact[:100])
                     break
         
-        return f"{len(temporal)} temporal items: {temporal[0][:80]}" if temporal else None
+        if temporal:
+            count = len(temporal)
+            return f"{count} temporal items"
+        return None
     
     def _check_causal_in_facts(self, facts: List[str]) -> Optional[str]:
         """Oksági kapcsolatok"""
@@ -454,7 +471,9 @@ class Queen:
             if any(word in fact.lower() for word in self.causal_words):
                 causal.append(fact[:100])
         
-        return f"{len(causal)} causal relationships" if causal else None
+        if causal:
+            return f"{len(causal)} causal relationships"
+        return None
     
     def _detect_fallacy_in_text(self, text: str) -> Optional[str]:
         """Logikai hibák detektálása"""
@@ -464,8 +483,11 @@ class Queen:
         text_lower = text.lower()
         for fallacy_name, patterns in self.LOGICAL_FALLACIES.items():
             for pattern in patterns:
-                if re.search(pattern, text_lower, re.IGNORECASE):
-                    return fallacy_name.replace('_', ' ')
+                try:
+                    if re.search(pattern, text_lower, re.IGNORECASE):
+                        return fallacy_name.replace('_', ' ')
+                except:
+                    continue
         return None
     
     def _validate_thought(self, thought_steps: List[str]) -> List[str]:
@@ -515,20 +537,14 @@ class Queen:
             return None
         
         try:
-            prompt = f"""Task: Logical deduction based on facts.
+            # Egyszerűbb prompt a gyorsaságért
+            facts_text = "\n".join([f"- {f}" for f in facts[:5]])
+            prompt = f"""Facts:
+{facts_text}
 
-Facts:
-{chr(10).join(f'- {fact}' for fact in facts[:8])}
+Question: {user_text}
 
-Question/Statement: {user_text}
-
-Think step by step:
-1. Key facts
-2. Relationships
-3. Contradictions
-4. Conclusion
-
-Response (concise, logical):"""
+Logical conclusion:"""
             
             response = self.model.generate(
                 prompt=prompt,
@@ -538,7 +554,7 @@ Response (concise, logical):"""
             
             if isinstance(response, str):
                 lines = response.strip().split('\n')
-                return [line.strip() for line in lines if line.strip() and len(line) > 10]
+                return [line.strip() for line in lines if line.strip() and len(line) > 10][:5]
             return None
             
         except Exception as e:
@@ -651,6 +667,11 @@ Response (concise, logical):"""
     def clear_cache(self):
         self.thought_cache.clear()
         print("👸 Queen: Cache törölve.")
+    
+    def set_complexity_threshold(self, threshold: float):
+        """Komplexitás küszöb beállítása"""
+        self.config['complexity_threshold'] = max(0.0, min(1.0, threshold))
+        print(f"👸 Queen: Komplexitás küszöb: {self.config['complexity_threshold']}")
 
 
 # Teszt

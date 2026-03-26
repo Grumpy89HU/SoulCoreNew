@@ -18,6 +18,7 @@ import threading
 import random
 import hashlib
 import uuid
+import re
 from typing import Dict, Any, Optional, List, Tuple
 from collections import deque
 from dataclasses import dataclass, asdict, field
@@ -40,7 +41,7 @@ class KingState:
     average_response_time: float = 0
     errors: List[str] = field(default_factory=list)
     current_task: str = None
-    current_conversation_id: int = None  # <-- HOZZÁADVA!
+    current_conversation_id: int = None
     model_loaded: bool = False
     total_tokens_generated: int = 0
     total_processing_time: float = 0
@@ -88,7 +89,7 @@ class King:
     def __init__(self, scratchpad, model_wrapper, message_bus=None, config: Dict = None):
         self.scratchpad = scratchpad
         self.model = model_wrapper
-        self.bus = message_bus  # Opcionális - ha nincs, fallback a régi mód
+        self.bus = message_bus
         self.name = "king"
         self.config = config or {}
         
@@ -154,13 +155,19 @@ class King:
     # ========== BUSZ KOMMUNIKÁCIÓ (BROADCAST MÓD) ==========
     
     def _on_message(self, message: Dict):
-        """Hallja a buszon érkező üzeneteket (csak a neki szóló válaszok)"""
+        """Hallja a buszon érkező üzeneteket"""
         if not self.bus:
             return
         
         header = message.get('header', {})
+        payload = message.get('payload', {})
         
-        # Csak a Kingnek szóló üzenetek
+        # PROAKTÍV ÜZENET KEZELÉSE (először)
+        if payload.get('type') == 'proactive_message':
+            self._handle_proactive_message(payload)
+            return
+        
+        # Csak a Kingnek szóló válaszok
         if header.get('target') != self.name:
             return
         
@@ -174,6 +181,29 @@ class King:
             
             sender = header.get('sender', 'unknown')
             self.pending_responses[trace_id][sender] = message
+    
+    def _handle_proactive_message(self, payload: Dict):
+        """Proaktív üzenet kezelése - King magától megszólal"""
+        subtype = payload.get('subtype', 'interest')
+        topic = payload.get('topic', '')
+        idle_hours = payload.get('idle_hours', 0)
+        note = payload.get('note', '')
+        
+        if subtype == 'interest':
+            prompt = f"User has been silent for {idle_hours} hours. Last topic was about {topic}. Send a short, casual message to check in."
+        elif subtype == 'reminder':
+            prompt = f"Reminder: {note}. Send a brief reminder to the user."
+        else:
+            return
+        
+        # Válasz generálása
+        response = self._generate_response(prompt)
+        
+        # Callback a WebApp felé (ha van)
+        if self.response_callback:
+            self.response_callback(response, None, str(uuid.uuid4()))
+        
+        print(f"👑 King: Proaktív üzenet küldve ({subtype})")
     
     def _wait_for_responses(self, trace_id: str, required_agents: List[str], timeout: float = 5.0) -> Dict:
         """Vár a szolgák válaszára (broadcast mód)"""
@@ -261,13 +291,11 @@ class King:
         Ha van busz, ezt használja.
         """
         if not self.bus:
-            # Fallback a régi módra
             return self.generate_response(user_text, trace_id, conversation_id)
         
         if not trace_id:
             trace_id = str(uuid.uuid4())
         
-        # Mentjük a conversation_id-t a state-be
         if conversation_id:
             self.state.current_conversation_id = conversation_id
         
@@ -288,19 +316,18 @@ class King:
         # 4. Várunk a válaszokra
         responses = self._wait_for_responses(trace_id, required_agents, timeout=5.0)
         
-        # 5. Válasz generálása
+        # 5. Válasz generálása (belső monológ is)
         response_text = self._generate_response_with_context(user_text, interpretation, responses)
         
         # 6. Állapot frissítés
         processing_time = time.time() - start_time
         self._update_state(response_text, processing_time, len(response_text.split()), responses)
         
-        # 7. Callback - 3 paraméter átadása (JAVÍTVA!)
+        # 7. Callback
         if self.response_callback:
-            # conversation_id a state-ből vagy a paraméterből
             conv_id = conversation_id if conversation_id is not None else self.state.current_conversation_id
             if conv_id is None:
-                conv_id = trace_id  # fallback
+                conv_id = trace_id
             self.response_callback(response_text, conv_id, trace_id)
         
         return response_text
@@ -320,10 +347,28 @@ class King:
         return required
     
     def _generate_response_with_context(self, user_text: str, interpretation: Dict, responses: Dict) -> str:
-        """Válasz generálása a szolgák válaszaival"""
+        """Válasz generálása a szolgák válaszaival + belső monológ"""
         context = self._extract_context_from_responses(responses)
         prompt = self._build_response_prompt(user_text, interpretation, context)
         
+        # Belső monológ generálása
+        try:
+            internal_prompt = f"Generate an internal monologue (1-2 sentences) about how you feel about this user message: {user_text}"
+            internal_monologue = self.model.generate(
+                prompt=internal_prompt,
+                max_tokens=100,
+                temperature=0.7
+            )
+            # Belső monológ mentése a scratchpad-be (Jester olvassa)
+            self.scratchpad.write_note('king', 'internal_monologue', {
+                'text': internal_monologue,
+                'timestamp': time.time(),
+                'in_response_to': user_text[:100]
+            })
+        except Exception as e:
+            self.state.errors.append(f"Internal monologue error: {e}")
+        
+        # Válasz generálása
         try:
             response = self.model.generate(
                 prompt=prompt,
@@ -368,10 +413,7 @@ class King:
     # ========== RÉGI API (KOMPATIBILITÁS) ==========
     
     def process_request(self, request: Dict) -> Dict:
-        """
-        JSON kérés feldolgozása (régi API).
-        Ha van busz, broadcast módot használ, egyébként a régi módot.
-        """
+        """JSON kérés feldolgozása (régi API)"""
         start_time = time.time()
         
         if not isinstance(request, dict):
@@ -382,7 +424,6 @@ class King:
         user_text = payload.get('text', '')
         conversation_id = payload.get('conversation_id')
         
-        # Ha van busz, használjuk a broadcast módot
         if self.bus:
             response_text = self.process_user_message(user_text, trace_id, conversation_id)
             
@@ -401,7 +442,6 @@ class King:
                 }
             }
         
-        # Régi mód (ha nincs busz)
         return self._process_request_legacy(request)
     
     def _process_request_legacy(self, request: Dict) -> Dict:
@@ -435,7 +475,6 @@ class King:
             
             self._update_state(response_text, processing_time, tokens_used, {})
             
-            # Callback - 3 paraméter (JAVÍTVA!)
             if self.response_callback:
                 conversation_id = payload.get('conversation_id')
                 if conversation_id is None:
@@ -468,11 +507,9 @@ class King:
         if not trace_id:
             trace_id = str(uuid.uuid4())
         
-        # Ha van busz, használjuk a broadcast módot
         if self.bus:
             return self.process_user_message(user_text, trace_id, conversation_id)
         
-        # Régi mód
         request = {
             "type": "king_request",
             "target": "king",
@@ -528,7 +565,7 @@ class King:
         
         return None
     
-    # ========== MEGLÉVŐ SEGÉDFÜGGVÉNYEK (RÉGI) ==========
+    # ========== MEGLÉVŐ SEGÉDFÜGGVÉNYEK ==========
     
     def _interpret(self, text: str) -> Dict:
         """King értelmezi a kérést"""
@@ -547,7 +584,6 @@ Return JSON:
         
         try:
             response = self.model.generate(prompt, max_tokens=256, temperature=0.3)
-            import re
             json_match = re.search(r'\{.*\}', response, re.DOTALL)
             if json_match:
                 return json.loads(json_match.group())
@@ -853,7 +889,46 @@ Return JSON:
             }
         }
     
-    # ========== PUBLIKUS API (MEGTARTVA) ==========
+    # ========== SCRIPT GENERÁLÁS ==========
+    
+    def generate_script(self, task: str) -> Optional[str]:
+        """Python script generálása a feladat alapján"""
+        prompt = f"""Write a Python script to accomplish this task: {task}
+
+Requirements:
+- Use only standard library
+- Include error handling
+- Print the result
+- Keep it concise (max 30 lines)
+
+Return only the code, no explanation."""
+        
+        try:
+            response = self.model.generate(prompt, max_tokens=500, temperature=0.3)
+            code = self._extract_code(response)
+            return code
+        except Exception as e:
+            self.state.errors.append(f"Script generation error: {e}")
+            return None
+    
+    def _extract_code(self, response: str) -> str:
+        """
+        Kód kinyerése a modell válaszából.
+        """
+        # Keresünk ```python ... ``` blokkokat
+        code_match = re.search(r'```python\s*(.*?)\s*```', response, re.DOTALL)
+        if code_match:
+            return code_match.group(1).strip()
+        
+        # Keresünk ``` ... ``` blokkokat
+        code_match = re.search(r'```\s*(.*?)\s*```', response, re.DOTALL)
+        if code_match:
+            return code_match.group(1).strip()
+        
+        # Ha nincs kódblokk, az egész válasz a kód
+        return response.strip()
+    
+    # ========== PUBLIKUS API ==========
     
     def get_state(self) -> Dict:
         return {
@@ -905,12 +980,10 @@ Return JSON:
         return {"status": "ok", "identity": self.identity, "timestamp": time.time()}
     
     def set_temperature(self, temperature: float):
-        """Jester hívja (identitás reset esetén)"""
         self.generation_params['temperature'] = max(0.1, min(2.0, temperature))
         self.state.temperature = self.generation_params['temperature']
     
     def set_identity_prompt(self, prompt: str):
-        """Jester hívja (identitás reset esetén)"""
         self.identity['personality'] = prompt
         self.scratchpad.write_note(self.name, 'personality', prompt)
     

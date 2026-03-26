@@ -79,7 +79,7 @@ class Valet:
     
     def __init__(self, scratchpad, message_bus=None, config: Dict = None):
         self.scratchpad = scratchpad
-        self.bus = message_bus  # Opcionális - broadcast módhoz
+        self.bus = message_bus
         self.name = "valet"
         self.config = config or {}
         
@@ -232,6 +232,9 @@ class Valet:
             'facts': [],
             'recent': [],
             'warnings': [],
+            'rag_results': [],
+            'graph_context': [],
+            'vector_context': [],
             'emotional_context': {},
             'important_memories': [],
             'token_estimate': 0,
@@ -252,10 +255,13 @@ class Valet:
             important = self._get_important_memories(interpretation, 3)
             context['important_memories'] = important
             
-            # 4. RAG keresés (ha be van kapcsolva)
+            # 4. RAG keresés (ha be van kapcsolva) - JAVÍTVA! (eltávolított felesleges szóköz)
             if self.config['enable_rag']:
-                rag_results = self._rag_search(user_message, interpretation, facts, important)
-                context['rag_results'] = rag_results.get('combined', [])[:3]
+                rag_context = self._rag_search(user_message, interpretation, facts, important)
+                context['rag_results'] = rag_context.get('combined', [])[:3]
+                context['graph_context'] = rag_context.get('graph', [])
+                context['vector_context'] = rag_context.get('vector', [])
+                self.state['rag_searches'] += 1
             
             # 5. Érzelmi kontextus
             context['emotional_context'] = self._get_emotional_context(interpretation)
@@ -271,7 +277,9 @@ class Valet:
             
             # 7. Hallucináció-gát
             if self.config['enable_validation']:
-                warning = self._validate_context(user_message, facts, context.get('rag_results', []))
+                warning = self._validate_context(
+                    user_message, facts, context.get('rag_results', [])
+                )
                 if warning:
                     context['warnings'].append(warning)
                     self.state['warnings_issued'] += 1
@@ -332,7 +340,7 @@ class Valet:
         return result
     
     def _graph_search(self, text: str, intent: str) -> List[str]:
-        """Gráf keresés Neo4j-ben"""
+        """Gráf keresés Neo4j-ben - kapcsolatok, érzelmi töltés"""
         results = []
         
         if not self.graph_available:
@@ -340,16 +348,17 @@ class Valet:
         
         try:
             with self.graph_driver.session() as session:
-                # Kapcsolatok keresése
+                # Kapcsolatok keresése az aktuális témához
                 query = """
-                MATCH (m:Memory)-[:MENTIONS]->(e:Entity)
-                WHERE m.content CONTAINS $text OR e.name CONTAINS $text
-                RETURN e.name as entity, m.content as content, m.emotional_charge as charge
+                MATCH (t:Topic {name: $topic})<-[:MENTIONS]-(m:Memory)-[:MENTIONS]->(e:Entity)
+                WHERE m.emotional_charge IS NOT NULL
+                RETURN e.name as entity, m.emotional_charge as charge, 
+                       m.created_at as created
                 ORDER BY m.created_at DESC
                 LIMIT 5
                 """
                 
-                result = session.run(query, text=text[:100])
+                result = session.run(query, topic=intent if intent else text[:50])
                 for record in result:
                     entity = record.get('entity', '')
                     charge = record.get('charge', 0)
@@ -357,25 +366,44 @@ class Valet:
                         charge_str = "😊" if charge > 0.3 else "😐" if charge > -0.3 else "😞"
                         results.append(f"{entity} {charge_str}")
                 
+                # Kapcsolatok a felhasználóhoz (általános)
+                query2 = """
+                MATCH (p:Person)-[r:RELATIONSHIP]-(e:Entity)
+                WHERE r.emotional_charge IS NOT NULL
+                RETURN e.name as entity, r.type as type, r.emotional_charge as charge
+                ORDER BY r.updated_at DESC
+                LIMIT 5
+                """
+                
+                result = session.run(query2)
+                for record in result:
+                    entity = record.get('entity', '')
+                    charge = record.get('charge', 0)
+                    if entity and abs(charge) > 0.3:
+                        rel_type = record.get('type', 'kapcsolat')
+                        results.append(f"{entity} ({rel_type})")
+                    
         except Exception as e:
             self.state['errors'].append(f"Gráf keresési hiba: {e}")
         
         return results
     
     def _vector_search(self, text: str) -> List[str]:
-        """Vektoros keresés Qdrant-ben"""
+        """Vektoros keresés Qdrant-ben - szemantikus hasonlóság"""
         results = []
         
         if not self.qdrant_available or not self.embedder:
             return results
         
         try:
+            # Embedding generálás
             embedding = self.embedder.embed(text)
             if not embedding:
                 return results
             
+            # Keresés a globális tudásban
             search_result = self.qdrant_client.search(
-                collection_name='personal_memories',
+                collection_name='global_knowledge',
                 query_vector=embedding,
                 limit=self.config['vector_search_limit'],
                 score_threshold=self.config['similarity_threshold']
@@ -385,6 +413,19 @@ class Valet:
                 if hit.payload and 'content' in hit.payload:
                     content = hit.payload['content'][:150]
                     results.append(f"{content} (score: {hit.score:.2f})")
+            
+            # Keresés a személyes emlékekben
+            personal_result = self.qdrant_client.search(
+                collection_name='personal_memories',
+                query_vector=embedding,
+                limit=3,
+                score_threshold=self.config['similarity_threshold']
+            )
+            
+            for hit in personal_result:
+                if hit.payload and 'content' in hit.payload:
+                    content = hit.payload['content'][:150]
+                    results.append(f"[Személyes] {content}")
                     
         except Exception as e:
             self.state['errors'].append(f"Vektoros keresési hiba: {e}")

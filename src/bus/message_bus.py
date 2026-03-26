@@ -6,6 +6,7 @@ King speaks once, everyone hears it.
 import json
 import threading
 import time
+import logging
 from typing import Dict, Any, Callable, List, Optional
 from queue import Queue, Empty
 
@@ -17,6 +18,8 @@ except ImportError:
     print("⚠️ ZMQ not available, falling back to in-memory bus")
 
 from src.bus.message_types import BroadcastMessage, MessageHeader, MessageTarget, MessageType
+
+logger = logging.getLogger(__name__)
 
 
 class MessageBus:
@@ -60,6 +63,11 @@ class MessageBus:
         
         # Track pending requests (trace_id -> set of required agents)
         self.pending_requests: Dict[str, Dict] = {}
+        self.pending_lock = threading.RLock()
+        
+        # Cleanup thread
+        self.cleanup_interval = 60  # 1 perc
+        self.last_cleanup = time.time()
         
         print("📡 Message Bus: ZMQ broadcast bus inicializálva")
     
@@ -76,10 +84,14 @@ class MessageBus:
             # ROUTER socket (for broadcasting to all)
             self.router_socket = self.context.socket(zmq.ROUTER)
             self.router_socket.bind(f"tcp://*:{self.router_port}")
+            self.router_socket.setsockopt(zmq.RCVTIMEO, 1000)  # 1 second timeout
+            self.router_socket.setsockopt(zmq.LINGER, 0)
             
             # DEALER socket (for responses)
             self.dealer_socket = self.context.socket(zmq.DEALER)
             self.dealer_socket.bind(f"tcp://*:{self.dealer_port}")
+            self.dealer_socket.setsockopt(zmq.RCVTIMEO, 1000)
+            self.dealer_socket.setsockopt(zmq.LINGER, 0)
             
             self.running = True
             self.thread = threading.Thread(target=self._run, daemon=True)
@@ -106,13 +118,28 @@ class MessageBus:
                 
                 # ROUTER socket - broadcast messages
                 if self.router_socket in socks:
-                    message = self.router_socket.recv_json()
-                    self._handle_broadcast(message)
+                    try:
+                        message = self.router_socket.recv_json()
+                        self._handle_broadcast(message)
+                    except json.JSONDecodeError as e:
+                        print(f"📡 JSON decode hiba (broadcast): {e}")
+                    except Exception as e:
+                        print(f"📡 Broadcast recv hiba: {e}")
                 
                 # DEALER socket - responses
                 if self.dealer_socket in socks:
-                    message = self.dealer_socket.recv_json()
-                    self._handle_response(message)
+                    try:
+                        message = self.dealer_socket.recv_json()
+                        self._handle_response(message)
+                    except json.JSONDecodeError as e:
+                        print(f"📡 JSON decode hiba (response): {e}")
+                    except Exception as e:
+                        print(f"📡 Response recv hiba: {e}")
+                
+                # Időzített takarítás
+                if time.time() - self.last_cleanup > self.cleanup_interval:
+                    self._cleanup_old_requests()
+                    self.last_cleanup = time.time()
                     
             except Exception as e:
                 print(f"📡 Message Bus hiba: {e}")
@@ -125,13 +152,21 @@ class MessageBus:
         trace_id = header.get('trace_id', 'unknown')
         required_agents = payload.get('required_agents', [])
         
-        # Register pending request
-        self.pending_requests[trace_id] = {
-            'required': set(required_agents),
-            'received': set(),
-            'responses': {},
-            'timestamp': time.time()
-        }
+        # Biztosítsuk, hogy lista legyen
+        if not isinstance(required_agents, list):
+            if isinstance(required_agents, str):
+                required_agents = [required_agents]
+            else:
+                required_agents = []
+        
+        with self.pending_lock:
+            # Register pending request
+            self.pending_requests[trace_id] = {
+                'required': set(required_agents),
+                'received': set(),
+                'responses': {},
+                'timestamp': time.time()
+            }
         
         # Notify subscribers
         for agent_name, callbacks in self.subscribers.items():
@@ -146,31 +181,60 @@ class MessageBus:
         header = message.get('header', {})
         in_response_to = header.get('in_response_to', '')
         
-        if in_response_to in self.pending_requests:
-            pending = self.pending_requests[in_response_to]
-            sender = header.get('sender', 'unknown')
-            pending['received'].add(sender)
-            pending['responses'][sender] = message
+        if not in_response_to:
+            return
+        
+        with self.pending_lock:
+            if in_response_to in self.pending_requests:
+                pending = self.pending_requests[in_response_to]
+                sender = header.get('sender', 'unknown')
+                pending['received'].add(sender)
+                pending['responses'][sender] = message
+                
+                # Put in response queue for King
+                self.response_queue.put({
+                    'trace_id': in_response_to,
+                    'sender': sender,
+                    'message': message,
+                    'timestamp': time.time()
+                })
+    
+    def _cleanup_old_requests(self):
+        """Régi pending request-ek törlése (5 percnél régebbiek)"""
+        now = time.time()
+        to_delete = []
+        
+        with self.pending_lock:
+            for trace_id, pending in self.pending_requests.items():
+                if now - pending['timestamp'] > 300:  # 5 perc
+                    to_delete.append(trace_id)
             
-            # Put in response queue for King
-            self.response_queue.put({
-                'trace_id': in_response_to,
-                'sender': sender,
-                'message': message
-            })
+            for trace_id in to_delete:
+                del self.pending_requests[trace_id]
+            
+            if to_delete:
+                print(f"📡 {len(to_delete)} régi pending request törölve")
     
     def broadcast(self, message: Dict):
         """
         Broadcast a message to all agents.
         King calls this.
         """
+        if not self.running:
+            print("📡 Broadcast: busz nem fut")
+            return
+        
         if not ZMQ_AVAILABLE:
             # In-memory fallback
             self._handle_broadcast(message)
             return
         
         try:
-            self.router_socket.send_json(message)
+            self.router_socket.send_json(message, flags=zmq.NOBLOCK)
+        except zmq.ZMQError as e:
+            print(f"📡 Broadcast hiba: {e}")
+            # Fallback in-memory
+            self._handle_broadcast(message)
         except Exception as e:
             print(f"📡 Broadcast hiba: {e}")
     
@@ -183,6 +247,21 @@ class MessageBus:
             self.subscribers[agent_name] = []
         self.subscribers[agent_name].append(callback)
         print(f"📡 {agent_name} feliratkozott a buszra")
+    
+    def unsubscribe(self, agent_name: str, callback: Callable = None):
+        """
+        Unsubscribe an agent from the bus.
+        """
+        if agent_name in self.subscribers:
+            if callback is None:
+                # Remove all callbacks for this agent
+                self.subscribers[agent_name] = []
+                print(f"📡 {agent_name} összes callback eltávolítva")
+            else:
+                # Remove specific callback
+                if callback in self.subscribers[agent_name]:
+                    self.subscribers[agent_name].remove(callback)
+                    print(f"📡 {agent_name} callback eltávolítva")
     
     def wait_for_responses(self, trace_id: str, required_agents: List[str], 
                            timeout: float = 5.0) -> Dict[str, Any]:
@@ -212,7 +291,7 @@ class MessageBus:
                 if set(responses.keys()) >= required_set:
                     break
                 
-                time.sleep(0.05)  # Small wait
+                time.sleep(0.05)
                 
             except Exception as e:
                 print(f"📡 Várakozási hiba: {e}")
@@ -229,22 +308,115 @@ class MessageBus:
         Send response to King.
         Agents call this.
         """
+        if not self.running:
+            print("📡 send_response: busz nem fut")
+            return
+        
         if not ZMQ_AVAILABLE:
             self._handle_response(message)
             return
         
         try:
-            self.dealer_socket.send_json(message)
+            self.dealer_socket.send_json(message, flags=zmq.NOBLOCK)
+        except zmq.ZMQError as e:
+            print(f"📡 Response hiba: {e}")
+            self._handle_response(message)
         except Exception as e:
             print(f"📡 Response hiba: {e}")
     
+    def get_pending_requests(self) -> Dict:
+        """Aktív pending request-ek lekérése"""
+        with self.pending_lock:
+            return {
+                trace_id: {
+                    'required': list(pending['required']),
+                    'received': list(pending['received']),
+                    'age': time.time() - pending['timestamp'],
+                    'timestamp': pending['timestamp']
+                }
+                for trace_id, pending in self.pending_requests.items()
+            }
+    
+    def get_stats(self) -> Dict:
+        """Statisztikák lekérése"""
+        with self.pending_lock:
+            return {
+                'running': self.running,
+                'zmq_available': ZMQ_AVAILABLE,
+                'subscribers': len(self.subscribers),
+                'pending_requests': len(self.pending_requests),
+                'queue_size': self.response_queue.qsize(),
+                'config': {
+                    'router_port': self.router_port,
+                    'dealer_port': self.dealer_port
+                }
+            }
+    
     def stop(self):
         """Stop the message bus"""
+        print("📡 Message Bus: leállítás...")
         self.running = False
+        
         if self.thread:
             self.thread.join(timeout=2)
         
         if self.context:
-            self.context.term()
+            try:
+                self.context.term()
+            except:
+                pass
+        
+        self.subscribers.clear()
+        
+        with self.pending_lock:
+            self.pending_requests.clear()
+        
+        # Clear queue
+        while not self.response_queue.empty():
+            try:
+                self.response_queue.get_nowait()
+            except Empty:
+                break
         
         print("📡 Message Bus: leállt")
+    
+    def is_running(self) -> bool:
+        """Visszaadja, hogy a busz fut-e"""
+        return self.running
+
+
+# Teszt
+if __name__ == "__main__":
+    bus = MessageBus()
+    bus.start()
+    
+    # Teszt callback
+    def on_message(msg):
+        print(f"📨 Üzenet érkezett: {msg.get('payload', {}).get('type', 'unknown')}")
+    
+    bus.subscribe("test_agent", on_message)
+    
+    # Teszt broadcast
+    test_message = {
+        "header": {
+            "trace_id": "test_001",
+            "timestamp": time.time(),
+            "sender": "test",
+            "target": "kernel",
+            "broadcast": True
+        },
+        "payload": {
+            "type": "test_message",
+            "data": "Hello, world!"
+        }
+    }
+    
+    print("\n--- Broadcast teszt ---")
+    bus.broadcast(test_message)
+    
+    time.sleep(0.5)
+    
+    print("\n--- Statisztika ---")
+    print(bus.get_stats())
+    
+    bus.stop()

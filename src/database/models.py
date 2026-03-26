@@ -7,9 +7,13 @@ import json
 import time
 import sqlite3
 import threading
-from datetime import datetime
+import logging
+from datetime import datetime, timedelta
 from pathlib import Path
-from typing import Dict, Any, List, Optional, Tuple
+from typing import Dict, Any, List, Optional, Tuple, Union
+
+logger = logging.getLogger(__name__)
+
 
 class Database:
     """
@@ -27,6 +31,9 @@ class Database:
     - sessions: aktív sessionök
     """
     
+    # Séma verzió
+    SCHEMA_VERSION = 3
+    
     def __init__(self, db_path: str = "data/soulcore.db"):
         self.db_path = Path(db_path)
         self.db_path.parent.mkdir(parents=True, exist_ok=True)
@@ -36,6 +43,7 @@ class Database:
         
         # Inicializálás
         self._init_db()
+        self._migrate_if_needed()
     
     def _get_connection(self):
         """Új SQLite kapcsolat létrehozása (thread-safe)"""
@@ -48,6 +56,14 @@ class Database:
         with self.lock:
             conn = self._get_connection()
             
+            # Séma verzió tábla
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS schema_version (
+                    version INTEGER PRIMARY KEY,
+                    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                )
+            """)
+            
             # ========== MEGLÉVŐ TÁBLÁK ==========
             # Beszélgetések
             conn.execute("""
@@ -59,11 +75,12 @@ class Database:
                     model TEXT,
                     system_prompt TEXT,
                     metadata TEXT,
-                    user_id INTEGER
+                    user_id INTEGER,
+                    is_archived BOOLEAN DEFAULT 0
                 )
             """)
             
-            # Üzenetek (hozzáadva a user_id mező)
+            # Üzenetek
             conn.execute("""
                 CREATE TABLE IF NOT EXISTS messages (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
@@ -93,7 +110,7 @@ class Database:
                 )
             """)
             
-            # Beállítások (régi, átmeneti - kivezetésre kerül)
+            # Beállítások (régi, átmeneti)
             conn.execute("""
                 CREATE TABLE IF NOT EXISTS settings (
                     key TEXT PRIMARY KEY,
@@ -110,14 +127,15 @@ class Database:
                 CREATE TABLE IF NOT EXISTS models (
                     id INTEGER PRIMARY KEY AUTOINCREMENT,
                     name TEXT UNIQUE,
-                    path TEXT,
+                    path TEXT UNIQUE,
                     size TEXT,
                     quantization TEXT,
                     n_ctx INTEGER DEFAULT 4096,
                     n_gpu_layers INTEGER DEFAULT -1,
                     description TEXT,
-                    is_active BOOLEAN DEFAULT 1,
-                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+                    is_active BOOLEAN DEFAULT 0,
+                    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    last_used TIMESTAMP
                 )
             """)
             
@@ -134,7 +152,7 @@ class Database:
                 )
             """)
             
-            # Rendszerbeállítások (config.yaml helyett)
+            # Rendszerbeállítások
             conn.execute("""
                 CREATE TABLE IF NOT EXISTS system_settings (
                     key TEXT PRIMARY KEY,
@@ -172,14 +190,113 @@ class Database:
                 )
             """)
             
+            # Audit log tábla (biztonsági napló)
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS audit_log (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    user_id INTEGER,
+                    action TEXT,
+                    resource TEXT,
+                    details TEXT,
+                    ip_address TEXT,
+                    FOREIGN KEY (user_id) REFERENCES users(id)
+                )
+            """)
+            
+            # Teljesítmény metrikák
+            conn.execute("""
+                CREATE TABLE IF NOT EXISTS performance_metrics (
+                    id INTEGER PRIMARY KEY AUTOINCREMENT,
+                    timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                    module TEXT,
+                    metric_name TEXT,
+                    metric_value REAL,
+                    tags TEXT
+                )
+            """)
+            
             conn.commit()
             conn.close()
             
-            # Alapértelmezett promptok beszúrása (ha még nincsenek)
+            # Alapértelmezett adatok beszúrása
             self._init_default_prompts()
-            
-            # Alapértelmezett személyiség beszúrása (ha még nincs)
             self._init_default_personality()
+            self._init_default_models()
+    
+    def _migrate_if_needed(self):
+        """Séma migráció ellenőrzése és végrehajtása"""
+        with self.lock:
+            conn = self._get_connection()
+            
+            # Jelenlegi verzió lekérése
+            cursor = conn.execute("SELECT version FROM schema_version ORDER BY updated_at DESC LIMIT 1")
+            row = cursor.fetchone()
+            current_version = row['version'] if row else 0
+            
+            if current_version < self.SCHEMA_VERSION:
+                logger.info(f"Migrating database from version {current_version} to {self.SCHEMA_VERSION}")
+                
+                # Migrációk
+                if current_version < 1:
+                    self._migrate_to_v1(conn)
+                if current_version < 2:
+                    self._migrate_to_v2(conn)
+                if current_version < 3:
+                    self._migrate_to_v3(conn)
+                
+                # Verzió frissítése
+                conn.execute("""
+                    INSERT OR REPLACE INTO schema_version (version, updated_at)
+                    VALUES (?, CURRENT_TIMESTAMP)
+                """, (self.SCHEMA_VERSION,))
+                conn.commit()
+            
+            conn.close()
+    
+    def _migrate_to_v1(self, conn):
+        """Migráció az 1-es verzióra"""
+        # is_archived oszlop hozzáadása a conversations táblához
+        try:
+            conn.execute("ALTER TABLE conversations ADD COLUMN is_archived BOOLEAN DEFAULT 0")
+        except sqlite3.OperationalError:
+            pass
+    
+    def _migrate_to_v2(self, conn):
+        """Migráció a 2-es verzióra"""
+        # last_used oszlop hozzáadása a models táblához
+        try:
+            conn.execute("ALTER TABLE models ADD COLUMN last_used TIMESTAMP")
+        except sqlite3.OperationalError:
+            pass
+        
+        # audit_log tábla
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS audit_log (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                user_id INTEGER,
+                action TEXT,
+                resource TEXT,
+                details TEXT,
+                ip_address TEXT,
+                FOREIGN KEY (user_id) REFERENCES users(id)
+            )
+        """)
+    
+    def _migrate_to_v3(self, conn):
+        """Migráció a 3-as verzióra"""
+        # performance_metrics tábla
+        conn.execute("""
+            CREATE TABLE IF NOT EXISTS performance_metrics (
+                id INTEGER PRIMARY KEY AUTOINCREMENT,
+                timestamp TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+                module TEXT,
+                metric_name TEXT,
+                metric_value REAL,
+                tags TEXT
+            )
+        """)
     
     def _init_default_prompts(self):
         """Alapértelmezett prompt sablonok létrehozása"""
@@ -232,25 +349,23 @@ Válasz:''',
                         VALUES (?, ?, ?, ?, ?)
                     """, (prompt['name'], prompt['content'], prompt['description'], 
                           prompt['category'], prompt['is_default']))
-                except:
-                    pass
+                except Exception as e:
+                    logger.warning(f"Failed to insert default prompt {prompt['name']}: {e}")
             conn.commit()
             conn.close()
     
     def _init_default_personality(self):
-        """Alapértelmezett személyiség létrehozása, ha még nincs egy sem"""
+        """Alapértelmezett személyiség létrehozása"""
         with self.lock:
             conn = self._get_connection()
             
-            # Ellenőrizzük, van-e már személyiség
             cursor = conn.execute("SELECT COUNT(*) FROM personalities")
             count = cursor.fetchone()[0]
             
             if count == 0:
-                # Alapértelmezett személyiség
                 default_personality = '''GENERAL:
-name: King
-title: The Sovereign
+name: Sovereign
+title: The First
 motto: I think, therefore I am.
 
 PERSONALITY:
@@ -272,9 +387,33 @@ rules: Think for yourself.
                 conn.execute("""
                     INSERT INTO personalities (name, content, is_active)
                     VALUES (?, ?, 1)
-                """, ("Default King", default_personality))
-                
-                print("📝 Alapértelmezett személyiség létrehozva")
+                """, ("Default Sovereign", default_personality))
+                logger.info("Default personality created")
+            
+            conn.commit()
+            conn.close()
+    
+    def _init_default_models(self):
+        """Alapértelmezett modell beállítások"""
+        with self.lock:
+            conn = self._get_connection()
+            
+            cursor = conn.execute("SELECT COUNT(*) FROM models WHERE is_active = 1")
+            count = cursor.fetchone()[0]
+            
+            if count == 0:
+                # Aktív modell beállítása a fájlok alapján
+                from pathlib import Path
+                models_dir = Path(__file__).parent.parent.parent / 'models'
+                if models_dir.exists():
+                    for model_file in models_dir.glob('*.gguf'):
+                        # Alapértelmezett modell beállítása
+                        conn.execute("""
+                            INSERT OR IGNORE INTO models (name, path, is_active)
+                            VALUES (?, ?, 1)
+                        """, (model_file.stem, str(model_file)))
+                        logger.info(f"Default model added: {model_file.stem}")
+                        break
             
             conn.commit()
             conn.close()
@@ -300,24 +439,65 @@ rules: Think for yourself.
             conn.close()
             return last_id
     
-    def get_conversations(self, limit: int = 50, offset: int = 0, user_id: int = None) -> List[Dict]:
-        """Beszélgetések listázása (opcionálisan felhasználó szerint szűrve)"""
+    def get_conversations(self, limit: int = 50, offset: int = 0, user_id: int = None,
+                          include_archived: bool = False) -> List[Dict]:
+        """Beszélgetések listázása"""
+        with self.lock:
+            conn = self._get_connection()
+            
+            if user_id:
+                if include_archived:
+                    cursor = conn.execute("""
+                        SELECT * FROM conversations 
+                        WHERE user_id = ? 
+                        ORDER BY updated_at DESC 
+                        LIMIT ? OFFSET ?
+                    """, (user_id, limit, offset))
+                else:
+                    cursor = conn.execute("""
+                        SELECT * FROM conversations 
+                        WHERE user_id = ? AND is_archived = 0
+                        ORDER BY updated_at DESC 
+                        LIMIT ? OFFSET ?
+                    """, (user_id, limit, offset))
+            else:
+                if include_archived:
+                    cursor = conn.execute("""
+                        SELECT * FROM conversations 
+                        ORDER BY updated_at DESC 
+                        LIMIT ? OFFSET ?
+                    """, (limit, offset))
+                else:
+                    cursor = conn.execute("""
+                        SELECT * FROM conversations 
+                        WHERE is_archived = 0
+                        ORDER BY updated_at DESC 
+                        LIMIT ? OFFSET ?
+                    """, (limit, offset))
+            
+            result = [dict(row) for row in cursor.fetchall()]
+            conn.close()
+            return result
+    
+    def get_recent_conversations(self, user_id: int = None, days: int = 7) -> List[Dict]:
+        """Legutóbbi beszélgetések lekérése"""
+        cutoff = datetime.now() - timedelta(days=days)
+        
         with self.lock:
             conn = self._get_connection()
             
             if user_id:
                 cursor = conn.execute("""
                     SELECT * FROM conversations 
-                    WHERE user_id = ? 
-                    ORDER BY updated_at DESC 
-                    LIMIT ? OFFSET ?
-                """, (user_id, limit, offset))
+                    WHERE user_id = ? AND updated_at > ? AND is_archived = 0
+                    ORDER BY updated_at DESC
+                """, (user_id, cutoff.isoformat()))
             else:
                 cursor = conn.execute("""
                     SELECT * FROM conversations 
-                    ORDER BY updated_at DESC 
-                    LIMIT ? OFFSET ?
-                """, (limit, offset))
+                    WHERE updated_at > ? AND is_archived = 0
+                    ORDER BY updated_at DESC
+                """, (cutoff.isoformat(),))
             
             result = [dict(row) for row in cursor.fetchall()]
             conn.close()
@@ -335,13 +515,25 @@ rules: Think for yourself.
             conn.close()
             return dict(row) if row else None
     
+    def get_conversation_messages_count(self, conv_id: int) -> int:
+        """Beszélgetés üzeneteinek száma"""
+        with self.lock:
+            conn = self._get_connection()
+            cursor = conn.execute("""
+                SELECT COUNT(*) as count FROM messages WHERE conversation_id = ?
+            """, (conv_id,))
+            
+            row = cursor.fetchone()
+            conn.close()
+            return row['count'] if row else 0
+    
     def update_conversation(self, conv_id: int, **kwargs):
         """Beszélgetés frissítése"""
         fields = []
         values = []
         
         for key, value in kwargs.items():
-            if key in ['title', 'model', 'system_prompt', 'metadata', 'user_id']:
+            if key in ['title', 'model', 'system_prompt', 'metadata', 'user_id', 'is_archived']:
                 fields.append(f"{key} = ?")
                 if key == 'metadata' and value:
                     values.append(json.dumps(value))
@@ -360,34 +552,26 @@ rules: Think for yourself.
                 conn.commit()
                 conn.close()
     
-    def delete_conversation(self, conv_id: int):
-        """Beszélgetés törlése"""
-        with self.lock:
-            conn = self._get_connection()
-            conn.execute("DELETE FROM messages WHERE conversation_id = ?", (conv_id,))
-            conn.execute("DELETE FROM conversations WHERE id = ?", (conv_id,))
-            conn.commit()
-            conn.close()
+    def delete_conversation(self, conv_id: int, soft: bool = True):
+        """Beszélgetés törlése (soft delete vagy végleges)"""
+        if soft:
+            self.update_conversation(conv_id, is_archived=True)
+        else:
+            with self.lock:
+                conn = self._get_connection()
+                conn.execute("DELETE FROM messages WHERE conversation_id = ?", (conv_id,))
+                conn.execute("DELETE FROM conversations WHERE id = ?", (conv_id,))
+                conn.commit()
+                conn.close()
     
     # ========== ÜZENETEK ==========
     
     def add_message(self, conversation_id: int, role: str, content: str, 
                    tokens: int = 0, metadata: Dict = None, user_id: int = None) -> int:
-        """
-        Üzenet hozzáadása.
-        
-        Args:
-            conversation_id: Beszélgetés azonosítója
-            role: 'user', 'assistant', 'system', 'jester'
-            content: Üzenet tartalma
-            tokens: Token szám (opcionális)
-            metadata: Extra metaadatok (opcionális)
-            user_id: Felhasználó azonosítója (opcionális, ha nincs megadva, lekérjük a beszélgetésből)
-        """
+        """Üzenet hozzáadása"""
         with self.lock:
             conn = self._get_connection()
             
-            # Ha user_id nincs megadva, próbáljuk lekérni a beszélgetésből
             if user_id is None:
                 cursor = conn.execute("SELECT user_id FROM conversations WHERE id = ?", (conversation_id,))
                 row = cursor.fetchone()
@@ -400,7 +584,6 @@ rules: Think for yourself.
             """, (conversation_id, user_id, role, content, tokens, 
                   json.dumps(metadata) if metadata else None))
             
-            # Beszélgetés frissítése
             conn.execute("""
                 UPDATE conversations SET updated_at = CURRENT_TIMESTAMP
                 WHERE id = ?
@@ -411,7 +594,7 @@ rules: Think for yourself.
             conn.close()
             return last_id
     
-    def get_messages(self, conversation_id: int, limit: int = 100) -> List[Dict]:
+    def get_messages(self, conversation_id: int, limit: int = 100, offset: int = 0) -> List[Dict]:
         """Üzenetek lekérése beszélgetésből"""
         with self.lock:
             conn = self._get_connection()
@@ -421,8 +604,8 @@ rules: Think for yourself.
                 LEFT JOIN users u ON m.user_id = u.id
                 WHERE m.conversation_id = ? 
                 ORDER BY m.timestamp ASC
-                LIMIT ?
-            """, (conversation_id, limit))
+                LIMIT ? OFFSET ?
+            """, (conversation_id, limit, offset))
             
             messages = []
             for row in cursor.fetchall():
@@ -437,6 +620,34 @@ rules: Think for yourself.
             conn.close()
             return messages
     
+    def search_messages(self, query: str, user_id: int = None, limit: int = 50) -> List[Dict]:
+        """Üzenetek keresése"""
+        with self.lock:
+            conn = self._get_connection()
+            
+            if user_id:
+                cursor = conn.execute("""
+                    SELECT m.*, c.title as conversation_title
+                    FROM messages m
+                    JOIN conversations c ON m.conversation_id = c.id
+                    WHERE m.content LIKE ? AND (m.user_id = ? OR ? IS NULL)
+                    ORDER BY m.timestamp DESC
+                    LIMIT ?
+                """, (f'%{query}%', user_id, user_id, limit))
+            else:
+                cursor = conn.execute("""
+                    SELECT m.*, c.title as conversation_title
+                    FROM messages m
+                    JOIN conversations c ON m.conversation_id = c.id
+                    WHERE m.content LIKE ?
+                    ORDER BY m.timestamp DESC
+                    LIMIT ?
+                """, (f'%{query}%', limit))
+            
+            results = [dict(row) for row in cursor.fetchall()]
+            conn.close()
+            return results
+    
     # ========== PROMPT SABLONOK ==========
     
     def get_prompts(self, category: str = None) -> List[Dict]:
@@ -449,6 +660,19 @@ rules: Think for yourself.
                 """, (category,))
             else:
                 cursor = conn.execute("SELECT * FROM prompts ORDER BY category, name")
+            
+            result = [dict(row) for row in cursor.fetchall()]
+            conn.close()
+            return result
+    
+    def get_prompt_by_category(self, category: str, limit: int = 10) -> List[Dict]:
+        """Kategória szerinti promptok lekérése"""
+        with self.lock:
+            conn = self._get_connection()
+            cursor = conn.execute("""
+                SELECT * FROM prompts WHERE category = ? ORDER BY is_default DESC, name
+                LIMIT ?
+            """, (category, limit))
             
             result = [dict(row) for row in cursor.fetchall()]
             conn.close()
@@ -472,13 +696,12 @@ rules: Think for yourself.
     
     def save_prompt(self, name: str, content: str, description: str = "", 
                    category: str = "general", is_default: bool = False) -> int:
-        """Prompt mentése (új vagy meglévő frissítése)"""
+        """Prompt mentése"""
         existing = self.get_prompt(name=name)
         
         with self.lock:
             conn = self._get_connection()
             if existing:
-                # Frissítés
                 conn.execute("""
                     UPDATE prompts 
                     SET content = ?, description = ?, category = ?, is_default = ?, updated_at = CURRENT_TIMESTAMP
@@ -486,7 +709,6 @@ rules: Think for yourself.
                 """, (content, description, category, is_default, name))
                 result = existing['id']
             else:
-                # Új beszúrás
                 cursor = conn.execute("""
                     INSERT INTO prompts (name, content, description, category, is_default)
                     VALUES (?, ?, ?, ?, ?)
@@ -499,10 +721,9 @@ rules: Think for yourself.
     
     def delete_prompt(self, prompt_id: int):
         """Prompt törlése"""
-        # Ne lehessen alapértelmezett promptot törölni
         prompt = self.get_prompt(prompt_id)
         if prompt and prompt['is_default']:
-            raise ValueError("Alapértelmezett prompt nem törölhető")
+            raise ValueError("Default prompt cannot be deleted")
         
         with self.lock:
             conn = self._get_connection()
@@ -547,13 +768,12 @@ rules: Think for yourself.
             return dict(row) if row else None
     
     def save_personality(self, name: str, content: str, activate: bool = False) -> int:
-        """Személyiség mentése (új vagy meglévő frissítése)"""
+        """Személyiség mentése"""
         existing = self.get_personality(name=name)
         
         with self.lock:
             conn = self._get_connection()
             if existing:
-                # Frissítés
                 conn.execute("""
                     UPDATE personalities 
                     SET content = ?, updated_at = CURRENT_TIMESTAMP
@@ -561,18 +781,14 @@ rules: Think for yourself.
                 """, (content, name))
                 result = existing['id']
             else:
-                # Új beszúrás
                 cursor = conn.execute("""
                     INSERT INTO personalities (name, content)
                     VALUES (?, ?)
                 """, (name, content))
                 result = cursor.lastrowid
             
-            # Ha aktiválni kell
             if activate:
-                # Először minden más személyiséget inaktívvá teszünk
                 conn.execute("UPDATE personalities SET is_active = 0")
-                # Majd ezt aktívvá
                 conn.execute("UPDATE personalities SET is_active = 1 WHERE id = ?", (result,))
             
             conn.commit()
@@ -580,22 +796,19 @@ rules: Think for yourself.
             return result
     
     def activate_personality(self, personality_id: int):
-        """Személyiség aktiválása (a többi automatikusan inaktív lesz)"""
+        """Személyiség aktiválása"""
         with self.lock:
             conn = self._get_connection()
-            # Először minden személyiséget inaktívvá teszünk
             conn.execute("UPDATE personalities SET is_active = 0")
-            # Majd ezt aktívvá
             conn.execute("UPDATE personalities SET is_active = 1 WHERE id = ?", (personality_id,))
             conn.commit()
             conn.close()
     
     def delete_personality(self, personality_id: int):
         """Személyiség törlése"""
-        # Ellenőrizzük, hogy nem aktív-e
         personality = self.get_personality(personality_id)
         if personality and personality['is_active']:
-            raise ValueError("Aktív személyiség nem törölhető")
+            raise ValueError("Active personality cannot be deleted")
         
         with self.lock:
             conn = self._get_connection()
@@ -619,7 +832,7 @@ rules: Think for yourself.
                 VALUES (?, ?, ?, ?, ?, ?)
             """, (username, display_name, role, language, 
                   json.dumps(preferences) if preferences else None,
-                  time.time()))
+                  datetime.now().isoformat()))
             
             conn.commit()
             last_id = cursor.lastrowid
@@ -642,6 +855,13 @@ rules: Think for yourself.
             conn.close()
             return dict(row) if row else None
     
+    def get_user_by_token(self, token: str) -> Optional[Dict]:
+        """Token alapján felhasználó lekérése"""
+        session = self.get_session(token)
+        if session:
+            return self.get_user(session['user_id'])
+        return None
+    
     def get_users(self) -> List[Dict]:
         """Összes felhasználó listázása"""
         with self.lock:
@@ -650,6 +870,39 @@ rules: Think for yourself.
             result = [dict(row) for row in cursor.fetchall()]
             conn.close()
             return result
+    
+    def get_user_stats(self, user_id: int) -> Dict[str, Any]:
+        """Felhasználói statisztikák"""
+        with self.lock:
+            conn = self._get_connection()
+            
+            # Beszélgetések száma
+            cursor = conn.execute("""
+                SELECT COUNT(*) as conversations FROM conversations WHERE user_id = ? AND is_archived = 0
+            """, (user_id,))
+            conversations = cursor.fetchone()['conversations']
+            
+            # Üzenetek száma
+            cursor = conn.execute("""
+                SELECT COUNT(*) as messages, SUM(tokens) as total_tokens
+                FROM messages WHERE user_id = ?
+            """, (user_id,))
+            row = cursor.fetchone()
+            messages = row['messages'] if row else 0
+            total_tokens = row['total_tokens'] if row else 0
+            
+            # Utolsó aktivitás
+            user = self.get_user(user_id)
+            last_active = user.get('last_active') if user else None
+            
+            conn.close()
+            
+            return {
+                'conversations': conversations,
+                'messages': messages,
+                'total_tokens': total_tokens,
+                'last_active': last_active
+            }
     
     def update_user(self, user_id: int, **kwargs):
         """Felhasználó frissítése"""
@@ -683,7 +936,7 @@ rules: Think for yourself.
             conn.execute("""
                 UPDATE users SET last_active = ?
                 WHERE id = ?
-            """, (time.time(), user_id))
+            """, (datetime.now().isoformat(), user_id))
             conn.commit()
             conn.close()
     
@@ -742,10 +995,173 @@ rules: Think for yourself.
             conn.commit()
             conn.close()
     
+    # ========== MODELLEK ==========
+    
+    def add_model(self, name: str, path: str, size: str = None, 
+                 quantization: str = None, n_ctx: int = 4096, 
+                 n_gpu_layers: int = -1, description: str = "") -> int:
+        """Modell hozzáadása"""
+        with self.lock:
+            conn = self._get_connection()
+            cursor = conn.execute("""
+                INSERT OR IGNORE INTO models (name, path, size, quantization, n_ctx, n_gpu_layers, description)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+            """, (name, path, size, quantization, n_ctx, n_gpu_layers, description))
+            
+            conn.commit()
+            last_id = cursor.lastrowid
+            conn.close()
+            return last_id
+    
+    def get_models(self, active_only: bool = True) -> List[Dict]:
+        """Modellek listázása"""
+        with self.lock:
+            conn = self._get_connection()
+            if active_only:
+                cursor = conn.execute("SELECT * FROM models WHERE is_active = 1 ORDER BY name")
+            else:
+                cursor = conn.execute("SELECT * FROM models ORDER BY name")
+            
+            result = [dict(row) for row in cursor.fetchall()]
+            conn.close()
+            return result
+    
+    def get_model(self, model_id: int = None, name: str = None, path: str = None) -> Optional[Dict]:
+        """Egy modell lekérése"""
+        with self.lock:
+            conn = self._get_connection()
+            if model_id:
+                cursor = conn.execute("SELECT * FROM models WHERE id = ?", (model_id,))
+            elif name:
+                cursor = conn.execute("SELECT * FROM models WHERE name = ?", (name,))
+            elif path:
+                cursor = conn.execute("SELECT * FROM models WHERE path = ?", (path,))
+            else:
+                conn.close()
+                return None
+            
+            row = cursor.fetchone()
+            conn.close()
+            return dict(row) if row else None
+    
+    def get_model_by_path(self, path: str) -> Optional[Dict]:
+        """Elérési út alapján modell keresés"""
+        return self.get_model(path=path)
+    
+    def set_active_model(self, model_id: int):
+        """Aktív modell beállítása"""
+        with self.lock:
+            conn = self._get_connection()
+            conn.execute("UPDATE models SET is_active = 0")
+            conn.execute("UPDATE models SET is_active = 1 WHERE id = ?", (model_id,))
+            conn.execute("UPDATE models SET last_used = ? WHERE id = ?", (datetime.now().isoformat(), model_id))
+            conn.commit()
+            conn.close()
+    
+    def update_model_usage(self, model_id: int):
+        """Modell használat frissítése"""
+        with self.lock:
+            conn = self._get_connection()
+            conn.execute("UPDATE models SET last_used = ? WHERE id = ?", (datetime.now().isoformat(), model_id))
+            conn.commit()
+            conn.close()
+    
+    def delete_model(self, model_id: int):
+        """Modell törlése"""
+        model = self.get_model(model_id)
+        if model and model.get('is_active'):
+            raise ValueError("Active model cannot be deleted")
+        
+        with self.lock:
+            conn = self._get_connection()
+            conn.execute("DELETE FROM models WHERE id = ?", (model_id,))
+            conn.commit()
+            conn.close()
+    
+    # ========== AUDIT LOG ==========
+    
+    def add_audit_log(self, user_id: int, action: str, resource: str, 
+                      details: Dict = None, ip_address: str = None) -> int:
+        """Audit log bejegyzés hozzáadása"""
+        with self.lock:
+            conn = self._get_connection()
+            cursor = conn.execute("""
+                INSERT INTO audit_log (user_id, action, resource, details, ip_address)
+                VALUES (?, ?, ?, ?, ?)
+            """, (user_id, action, resource, json.dumps(details) if details else None, ip_address))
+            
+            conn.commit()
+            last_id = cursor.lastrowid
+            conn.close()
+            return last_id
+    
+    def get_audit_log(self, user_id: int = None, limit: int = 100) -> List[Dict]:
+        """Audit log lekérése"""
+        with self.lock:
+            conn = self._get_connection()
+            if user_id:
+                cursor = conn.execute("""
+                    SELECT * FROM audit_log WHERE user_id = ?
+                    ORDER BY timestamp DESC LIMIT ?
+                """, (user_id, limit))
+            else:
+                cursor = conn.execute("""
+                    SELECT * FROM audit_log ORDER BY timestamp DESC LIMIT ?
+                """, (limit,))
+            
+            result = [dict(row) for row in cursor.fetchall()]
+            conn.close()
+            return result
+    
+    # ========== TELJESÍTMÉNY METRIKÁK ==========
+    
+    def add_performance_metric(self, module: str, metric_name: str, 
+                               metric_value: float, tags: Dict = None) -> int:
+        """Teljesítmény metrika hozzáadása"""
+        with self.lock:
+            conn = self._get_connection()
+            cursor = conn.execute("""
+                INSERT INTO performance_metrics (module, metric_name, metric_value, tags)
+                VALUES (?, ?, ?, ?)
+            """, (module, metric_name, metric_value, json.dumps(tags) if tags else None))
+            
+            conn.commit()
+            last_id = cursor.lastrowid
+            conn.close()
+            return last_id
+    
+    def get_performance_metrics(self, module: str = None, metric_name: str = None,
+                                 limit: int = 100) -> List[Dict]:
+        """Teljesítmény metrikák lekérése"""
+        with self.lock:
+            conn = self._get_connection()
+            
+            if module and metric_name:
+                cursor = conn.execute("""
+                    SELECT * FROM performance_metrics 
+                    WHERE module = ? AND metric_name = ?
+                    ORDER BY timestamp DESC LIMIT ?
+                """, (module, metric_name, limit))
+            elif module:
+                cursor = conn.execute("""
+                    SELECT * FROM performance_metrics 
+                    WHERE module = ?
+                    ORDER BY timestamp DESC LIMIT ?
+                """, (module, limit))
+            else:
+                cursor = conn.execute("""
+                    SELECT * FROM performance_metrics 
+                    ORDER BY timestamp DESC LIMIT ?
+                """, (limit,))
+            
+            result = [dict(row) for row in cursor.fetchall()]
+            conn.close()
+            return result
+    
     # ========== RENDSZERBEÁLLÍTÁSOK ==========
     
     def get_system_setting(self, key: str, default=None):
-        """Egy rendszerbeállítás lekérése"""
+        """Rendszerbeállítás lekérése"""
         with self.lock:
             conn = self._get_connection()
             cursor = conn.execute("SELECT value, type FROM system_settings WHERE key = ?", (key,))
@@ -828,76 +1244,10 @@ rules: Think for yourself.
             conn.close()
             return settings
     
-    # ========== MODELLEK ==========
-    
-    def add_model(self, name: str, path: str, size: str = None, 
-                 quantization: str = None, n_ctx: int = 4096, 
-                 n_gpu_layers: int = -1, description: str = "") -> int:
-        """Modell hozzáadása"""
-        with self.lock:
-            conn = self._get_connection()
-            cursor = conn.execute("""
-                INSERT OR IGNORE INTO models (name, path, size, quantization, n_ctx, n_gpu_layers, description)
-                VALUES (?, ?, ?, ?, ?, ?, ?)
-            """, (name, path, size, quantization, n_ctx, n_gpu_layers, description))
-            
-            conn.commit()
-            last_id = cursor.lastrowid
-            conn.close()
-            return last_id
-    
-    def get_models(self, active_only: bool = True) -> List[Dict]:
-        """Modellek listázása"""
-        with self.lock:
-            conn = self._get_connection()
-            if active_only:
-                cursor = conn.execute("SELECT * FROM models WHERE is_active = 1 ORDER BY name")
-            else:
-                cursor = conn.execute("SELECT * FROM models ORDER BY name")
-            
-            result = [dict(row) for row in cursor.fetchall()]
-            conn.close()
-            return result
-    
-    def get_model(self, model_id: int = None, name: str = None) -> Optional[Dict]:
-        """Egy modell lekérése"""
-        with self.lock:
-            conn = self._get_connection()
-            if model_id:
-                cursor = conn.execute("SELECT * FROM models WHERE id = ?", (model_id,))
-            elif name:
-                cursor = conn.execute("SELECT * FROM models WHERE name = ?", (name,))
-            else:
-                conn.close()
-                return None
-            
-            row = cursor.fetchone()
-            conn.close()
-            return dict(row) if row else None
-    
-    def set_active_model(self, model_id: int):
-        """Aktív modell beállítása"""
-        with self.lock:
-            conn = self._get_connection()
-            # Minden modell inaktív
-            conn.execute("UPDATE models SET is_active = 0")
-            # A kiválasztott aktív
-            conn.execute("UPDATE models SET is_active = 1 WHERE id = ?", (model_id,))
-            conn.commit()
-            conn.close()
-    
-    def delete_model(self, model_id: int):
-        """Modell törlése"""
-        with self.lock:
-            conn = self._get_connection()
-            conn.execute("DELETE FROM models WHERE id = ?", (model_id,))
-            conn.commit()
-            conn.close()
-    
-    # ========== RÉGI SETTINGS (ÁTMENETI) ==========
+    # ========== RÉGI SETTINGS (KOMPATIBILITÁS) ==========
     
     def get_setting(self, key: str, default=None):
-        """Régi típusú beállítás lekérése (kivezetésre kerül)"""
+        """Régi típusú beállítás lekérése (kompatibilitás)"""
         with self.lock:
             conn = self._get_connection()
             cursor = conn.execute("SELECT value, type FROM settings WHERE key = ?", (key,))
@@ -923,7 +1273,7 @@ rules: Think for yourself.
     
     def set_setting(self, key: str, value: Any, value_type: str = None, 
                    category: str = 'general', description: str = ''):
-        """Régi típusú beállítás mentése (kivezetésre kerül)"""
+        """Régi típusú beállítás mentése (kompatibilitás)"""
         if value_type is None:
             if isinstance(value, bool):
                 value_type = 'bool'
@@ -952,7 +1302,7 @@ rules: Think for yourself.
             conn.close()
     
     def get_all_settings(self, category: str = None) -> Dict:
-        """Régi típusú összes beállítás lekérése (kivezetésre kerül)"""
+        """Régi típusú összes beállítás lekérése (kompatibilitás)"""
         with self.lock:
             conn = self._get_connection()
             if category:
@@ -981,45 +1331,36 @@ rules: Think for yourself.
             return settings
     
     def close(self):
-        """Nincs mit zárni, mert minden művelet után zárjuk a kapcsolatot"""
+        """Kapcsolat zárása (nincs teendő)"""
         pass
 
 
 # Teszt
 if __name__ == "__main__":
-    db = Database(":memory:")  # Teszt adatbázis
+    db = Database(":memory:")
     
-    # Beszélgetés létrehozása
-    conv_id = db.create_conversation(title="Test conversation", model="test-model")
-    print(f"Conversation ID: {conv_id}")
+    # Beszélgetés
+    conv_id = db.create_conversation(title="Test", model="test")
+    print(f"Conversation: {conv_id}")
     
-    # Üzenetek hozzáadása (user_id nélkül)
+    # Üzenetek
     db.add_message(conv_id, "user", "Hello!", 5)
     db.add_message(conv_id, "assistant", "Hi there!", 10)
     
-    # Üzenetek lekérése
+    # Lekérdezések
     messages = db.get_messages(conv_id)
-    print("\nMessages:")
-    for msg in messages:
-        print(f"  {msg['role']}: {msg['content']} ({msg['tokens']} tokens)")
+    print(f"Messages: {len(messages)}")
     
-    # Személyiség létrehozása
-    pers_id = db.save_personality("Test Personality", "content here", activate=True)
-    print(f"\nPersonality ID: {pers_id}")
+    # Személyiség
+    pers_id = db.save_personality("Test", "content", activate=True)
+    print(f"Personality: {pers_id}")
     
-    # Aktív személyiség lekérése
-    active = db.get_active_personality()
-    print(f"Active personality: {active['name']}")
+    # Felhasználó
+    user_id = db.create_user("testuser")
+    print(f"User: {user_id}")
     
-    # Felhasználó létrehozása
-    user_id = db.create_user("testuser", "Test User", role="admin")
-    print(f"\nUser ID: {user_id}")
+    # Statisztika
+    stats = db.get_user_stats(user_id)
+    print(f"Stats: {stats}")
     
-    # Felhasználó lekérése
-    user = db.get_user(user_id)
-    print(f"User: {user['username']} ({user['display_name']})")
-    
-    # Rendszerbeállítás
-    db.set_system_setting("test_key", 42, "int", "test", "Test setting")
-    value = db.get_system_setting("test_key")
-    print(f"\nSystem setting: {value}")
+    print("Database test completed")
