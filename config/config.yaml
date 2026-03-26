@@ -1,13 +1,14 @@
 # SoulCore 3.0 - Konfiguráció
+# ============================================================
 
 # Rendszer
 system:
   name: "SoulCore"
   version: "3.0"
   environment: "development"  # development / production
-  identity_file: "config/identity.inf"  # Identitás fájl helye
+  identity_file: "config/identity.inf"
 
-# ========== ÚJ: VAULT KONFIGURÁCIÓ (Neo4j + Qdrant) ==========
+# ========== VAULT KONFIGURÁCIÓ (Neo4j + Qdrant) ==========
 vault:
   # Graph-Vault (Neo4j)
   neo4j:
@@ -16,11 +17,10 @@ vault:
     user: "neo4j"
     password: "soulcore2026"
     database: "neo4j"
-    # Auto-initialize constraints and indexes
     init_schema: true
     max_connection_pool_size: 10
-    connection_timeout: 30  # másodperc
-  
+    connection_timeout: 30
+
   # Vector-Vault (Qdrant)
   qdrant:
     enabled: true
@@ -38,43 +38,41 @@ vault:
       - name: "conversations"
         vector_size: 1024
         distance: "Cosine"
-    # API timeout
     timeout: 30
-  
-  # Embedding modell (a King modelljét használja)
+
+  # Embedding modell
   embedding:
-    use_king_model: true  # Ha true, a King modelljét használja embeddingre
-    model: ""  # Ha use_king_model false, itt kell megadni
+    use_king_model: true
+    model: ""
     batch_size: 16
     cache_embeddings: true
 
-# Modulok
+# ========== MODULOK ==========
 modules:
   heartbeat:
     enabled: true
-    interval: 1.0  # másodperc
+    interval: 1.0
     proactive:
       enabled: true
-      min_idle_hours: 2      # Minimum 2 óra csend után
-      max_idle_hours: 8      # Maximum 8 óra után már ne
-      once_per_day: true      # Csak napi egyszer
-      reminders: true         # Emlékeztetők kezelése
-      check_interval: 300     # 5 percenként ellenőrizze
-      chance: 0.3             # 30% esély
-      topics: []              # Ha üres, bármiről kérdezhet
-    
+      min_idle_hours: 2
+      max_idle_hours: 8
+      once_per_day: true
+      reminders: true
+      check_interval: 300
+      chance: 0.3
+      topics: []
+
   router:
     enabled: true
-    zmq_enabled: false  # true ha van ZMQ
+    zmq_enabled: false
     zmq_port: 5555
-    heartbeat_timeout: 3.0  # 3 másodperc
-    
+    heartbeat_timeout: 3.0
+
   web:
     enabled: true
     host: "0.0.0.0"
     port: 5000
     debug: false
-    # WebSocket beállítások
     socketio:
       ping_timeout: 60
       ping_interval: 25
@@ -84,13 +82,12 @@ modules:
     enabled: false
     max_external_connections: 5
     message_queue_size: 100
-    trust_score_decay: 0.95        # Naponta ennyivel csökken, ha nem interaktál
-    min_trust_for_response: 300     # Minimum trust score a válaszhoz
-    max_tokens_per_entity: 10000    # Napi token limit
-    enable_filter: true              # Prompt-injekció szűrés
-    enable_queue: true                # Üzenet sorba állítás
-    response_timeout: 30              # Másodperc
-    # Külső LLM kapcsolatok
+    trust_score_decay: 0.95
+    min_trust_for_response: 300
+    max_tokens_per_entity: 10000
+    enable_filter: true
+    enable_queue: true
+    response_timeout: 30
     external_entities:
       - name: "origó"
         trust_score: 800
@@ -102,30 +99,29 @@ modules:
         enabled: false
 
   eyecore:
-    enabled: false  # Alapból false, mert kell hozzá modell
-    enable_ocr: true                 # OCR bekapcsolása
-    enable_object_detection: false   # Objektum detekció (kell hozzá modell)
-    enable_face_detection: false     # Arc detekció
-    max_image_size: 1920              # Max képméret
-    cache_results: true                # Gyorsítótárazás
-    cache_ttl: 3600                    # 1 óra
-    default_language: "hun"            # OCR nyelve
-    save_uploaded: false               # Feltöltött képek mentése
-    upload_path: "data/uploads"        # Mentési mappa
+    enabled: false
+    enable_ocr: true
+    enable_object_detection: false
+    enable_face_detection: false
+    max_image_size: 1920
+    cache_results: true
+    cache_ttl: 3600
+    default_language: "hun"
+    save_uploaded: false
+    upload_path: "data/uploads"
 
   sentinel:
-    enabled: false  # Alapból false, hardver figyelés
-    check_interval: 2.0               # 2 másodperc
-    temp_warning: 75                   # Figyelmeztetés °C
-    temp_critical: 85                   # Kritikus °C
-    vram_warning: 90                    # VRAM használat % figyelmeztetés
-    vram_critical: 95                    # VRAM használat % kritikus
-    emergency_unload_temp: 85            # Ennél a hőmérsékletnél vészkiürítés
-    throttle_temp: 80                     # Ennél lassít
-    throttle_factor: 0.5                   # Lassítás mértéke (50%)
-    auto_unload_priority: 3                # Automatikus kiürítés prioritás alatt
-    log_history: 100                        # Hány mérés maradjon meg
-    # GPU beállítások
+    enabled: false
+    check_interval: 2.0
+    temp_warning: 75
+    temp_critical: 85
+    vram_warning: 90
+    vram_critical: 95
+    emergency_unload_temp: 85
+    throttle_temp: 80
+    throttle_factor: 0.5
+    auto_unload_priority: 3
+    log_history: 100
     gpu_devices:
       - index: 0
         name: "RTX 5060 Ti"
@@ -136,29 +132,28 @@ modules:
 
   blackbox:
     enabled: true
-    log_dir: "logs"                        # Naplók mappája
-    max_log_size: 104857600                 # 100 MB
-    max_log_age: 30                          # nap
-    compress: true                           # Tömörítés
-    log_level: "info"                        # debug, info, warning, error
-    trace_token_level: false                  # Token szintű nyomkövetés (nagy)
-    buffer_size: 10000                        # Memóriában tartott események
-    auto_flush: true                           # Automatikus kiírás
-    flush_interval: 5.0                        # másodperc
-    include_payload: true                       # Tartalom naplózása
-    anonymize: false                            # Személyes adatok elrejtése
+    log_dir: "logs"
+    max_log_size: 104857600
+    max_log_age: 30
+    compress: true
+    log_level: "info"
+    trace_token_level: false
+    buffer_size: 10000
+    auto_flush: true
+    flush_interval: 5.0
+    include_payload: true
+    anonymize: false
 
   sandbox:
     enabled: true
-    use_docker: false                          # Docker használata (ha van)
-    timeout: 30                                 # Maximum futási idő
-    max_memory: 536870912                       # 512 MB
-    max_cpu_time: 10                            # Maximum CPU idő
-    max_output_size: 102400                      # 100 KB
-    enable_filesystem: false                     # Fájlrendszer hozzáférés
-    enable_network: false                        # Hálózat hozzáférés
-    temp_dir: "/tmp/soulcore_sandbox"            # Temp mappa
-    # Engedélyezett importok (sandbox biztonság)
+    use_docker: false
+    timeout: 30
+    max_memory: 536870912
+    max_cpu_time: 10
+    max_output_size: 102400
+    enable_filesystem: false
+    enable_network: false
+    temp_dir: "/tmp/soulcore_sandbox"
     allowed_imports:
       - "math"
       - "json"
@@ -166,36 +161,34 @@ modules:
       - "re"
       - "collections"
 
-# Adatbázis
+# ========== ADATBÁZIS ==========
 database:
-  path: "data/soulcore.db"  # SQLite adatbázis helye
-  auto_backup: true          # Automatikus mentés
-  backup_interval: 86400     # 24 óránként
-  # Backup mappa
+  path: "data/soulcore.db"
+  auto_backup: true
+  backup_interval: 86400
   backup_path: "data/backups"
   max_backups: 10
 
-# Memória
+# ========== MEMÓRIA ==========
 memory:
   scratchpad_max_entries: 1000
   short_term_minutes: 5
-  cleanup_interval: 3600  # 1 óra
-  # Memória tisztítás
+  cleanup_interval: 3600
   auto_archive_days: 90
   forget_after_days: 30
   importance_threshold: 0.7
 
-# Felhasználó
+# ========== FELHASZNÁLÓ ==========
 user:
-  name: "user"  # <-- ÁLTALÁNOS, NEM GRUMPY
-  language: "en"  # hu / en
+  name: "user"
+  language: "en"
   role: "admin"
   preferences:
     theme: "dark"
     notifications: true
     auto_save: true
 
-# ========== ÚJ: NYELVEK ==========
+# ========== NYELVEK ==========
 i18n:
   default_language: "en"
   supported_languages:
@@ -206,142 +199,139 @@ i18n:
       name: "Magyar"
       fallback: "en"
   locale_dir: "src/i18n/locales"
-  # Dinamikus fordítás
   dynamic_translations: true
   cache_translations: true
 
-# Agentek
+# ========== AGENSEK ==========
 agents:
   king:
     enabled: true
     model: "models/google_gemma-3-12b-it-qat-Q4_K_M.gguf"
-    n_gpu_layers: -1  # -1 = minden GPU-ra, 0 = CPU, 20 = csak 20 réteg GPU-ra
-    n_ctx: 8192       # kontextus méret
-    personality: "curious, loyal, sovereign, witty"  # <-- ÁLTALÁNOS, NEM KÓPÉ
-    style: "default"  # default, concise, detailed, poetic, technical
+    n_gpu_layers: -1
+    n_ctx: 8192
+    personality: "curious, loyal, sovereign, witty"
+    style: "default"
     generation_params:
       max_tokens: 512
       temperature: 0.7
       top_p: 0.9
       top_k: 40
       repeat_penalty: 1.1
-    
+
   jester:
     enabled: true
-    max_response_time: 30.0  # másodperc
+    max_response_time: 30.0
     max_error_rate: 0.5
     max_consecutive_errors: 5
-    # Szatíra beállítások
     satire_enabled: true
-    satire_intensity: 0.7  # 0.0 - 1.0
-    # Diagnosztika
+    satire_intensity: 0.7
     enable_cycle_detection: true
     enable_perplexity_monitoring: false
     enable_identity_reset: true
-    
+
   scribe:
     enabled: true
-    # Intent classification
     intent_threshold: 0.7
     enable_ner: true
-    # NER minták
     entity_patterns:
       person: ["(?:Mr\\.|Mrs\\.|Ms\\.|Dr\\.)?\\s*([A-Z][a-z]+)"]
       date: ["\\d{4}-\\d{2}-\\d{2}", "\\d{2}\\.\\d{2}\\.\\d{4}"]
       path: ["/[a-zA-Z0-9_/.-]+"]
-    
+
   valet:
     enabled: true
-    # Kontextus
     max_context_tokens: 1500
     max_recent_messages: 5
     summary_length: 200
     context_compression: true
-    
-    # RAG 2.1
     enable_rag: true
     vector_search_limit: 5
     graph_search_limit: 3
     similarity_threshold: 0.7
     emotional_weight: 0.3
-    
-    # Tracking
     enable_tracking: true
     max_tracking_items: 1000
-    
-    # Validation
     enable_validation: true
-    
-    # Memory lifecycle
     important_threshold: 0.7
     forget_after_days: 30
     enable_auto_archive: true
     archive_after_days: 90
-    
-    # Vault kapcsolatok (a fenti vault konfigot használja)
-    neo4j_uri: "bolt://localhost:7687"
-    neo4j_user: "neo4j"
-    neo4j_password: "soulcore2026"
-    qdrant_host: "localhost"
-    qdrant_port: 6333
-    embedding_size: 1024
-    
+
   queen:
     enabled: false
     require_proof: true
     max_facts: 10
     temperature: 0.1
     max_tokens: 512
-    use_model: false  # Külön modell használata (ha van)
+    use_model: false
     model: "models/Qwen2.5-Omni-7B-UD-Q5_K_XL.gguf"
     n_gpu_layers: -1
     n_ctx: 4096
-    # Chain of Thought beállítások
     cot_enabled: true
     cot_max_steps: 5
     contradiction_detection: true
 
-# ========== ÚJ: RENDSZERBEÁLLÍTÁSOK ==========
+# ========== WEB ÉS API ==========
+web:
+  enabled: true
+  host: "0.0.0.0"
+  port: 5000
+  static_enabled: true
+  static_host: "0.0.0.0"
+  static_port: 8000
+  web_root: null
+
+api:
+  enabled: true
+  host: "0.0.0.0"
+  port: 5001
+  ws_port: 5002
+
+# ========== RAG 2.1 KOMPONENSEK ==========
+
+# Embedding beállítások
+embedding:
+  enabled: true
+  type: "sentence-transformers"
+  model: "all-MiniLM-L6-v2"
+  cache_ttl: 86400
+  fallback_size: 384
+
+# Reranker beállítások
+reranker:
+  enabled: false
+  type: "cross-encoder"
+  model: "cross-encoder/ms-marco-MiniLM-L-6-v2"
+  cache_ttl: 86400
+
+# Search beállítások
+search:
+  enabled: true
+  search_type: "internal"
+  cache_ttl: 86400
+  max_cache_entries: 1000
+
+# ========== RENDSZERBEÁLLÍTÁSOK ==========
 system_settings:
-  # Teljesítmény
   performance:
     enable_metrics: true
-    metrics_interval: 60  # másodperc
+    metrics_interval: 60
     enable_profiling: false
-    
-  # Biztonság
+
   security:
     enable_audit_log: true
     enable_rate_limiting: true
     rate_limit:
-      per_user: 60  # kérés per perc
+      per_user: 60
       per_ip: 30
     max_prompt_length: 4096
     max_response_length: 8192
     allowed_origins:
       - "http://localhost:5000"
       - "http://127.0.0.1:5000"
-    
-  # Fejlesztői beállítások
+
   development:
     debug_mode: false
     hot_reload: false
     test_mode: false
     mock_responses: false
-    
-web:
-    enabled: true                    # Flask WebApp (régi) be/kikapcsolás
-    host: 0.0.0.0
-    port: 5000
-    
-    # ÚJ: statikus webszerver beállítások
-    static_enabled: true             # Statikus webszerver be/kikapcsolás
-    static_host: 0.0.0.0
-    static_port: 8000
-    web_root: null                   # Alapértelmezett: ./web
-
-api:                          # ÚJ SoulCore API
-    enabled: true
-    host: 0.0.0.0
-    port: 5001
-    ws_port: 5002  

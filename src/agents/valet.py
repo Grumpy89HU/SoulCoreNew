@@ -25,6 +25,11 @@ from typing import Dict, Any, List, Optional, Tuple, Union
 from collections import defaultdict, deque
 from pathlib import Path
 
+# RAG komponensek
+from src.rag.embedding_manager import EmbeddingManager
+from src.rag.reranker_manager import RerankerManager
+from src.rag.search_manager import SearchManager
+
 # Neo4j import
 try:
     from neo4j import GraphDatabase
@@ -150,6 +155,11 @@ class Valet:
             'qdrant_connected': False,
         }
         
+        # ========== RAG 2.1 KOMPONENSEK ==========
+        self.embedding_manager = None
+        self.reranker_manager = None
+        self.search_manager = None
+        
         # ========== HOSSZÚ TÁVÚ MEMÓRIA (Vault) ==========
         self.graph_driver = None
         self.graph_available = False
@@ -163,6 +173,11 @@ class Valet:
         
         # Jelenlegi kérés trace_id (válaszokhoz)
         self.current_trace_id = None
+        
+        # RAG komponensek inicializálása (Vault után)
+        self._init_embedding()
+        self._init_reranker()
+        self._init_search()
         
         # Ha van busz, feliratkozunk
         if self.bus:
@@ -255,7 +270,7 @@ class Valet:
             important = self._get_important_memories(interpretation, 3)
             context['important_memories'] = important
             
-            # 4. RAG keresés (ha be van kapcsolva) - JAVÍTVA! (eltávolított felesleges szóköz)
+            # 4. RAG keresés (ha be van kapcsolva)
             if self.config['enable_rag']:
                 rag_context = self._rag_search(user_message, interpretation, facts, important)
                 context['rag_results'] = rag_context.get('combined', [])[:3]
@@ -297,7 +312,7 @@ class Valet:
     def _rag_search(self, user_message: str, interpretation: Dict, 
                     facts: List[str], important_memories: List[str]) -> Dict[str, List[str]]:
         """
-        RAG keresés - kétkulcsos (vektor + gráf)
+        RAG 2.1 keresés - kétkulcsos (vektor + gráf) + embedding + reranker + search cache
         """
         result = {
             'graph': [],
@@ -308,39 +323,78 @@ class Valet:
         try:
             intent = interpretation.get('intent', {}).get('class', 'unknown')
             
-            # 1. Gráf keresés
+            # 1. SEARCH CACHE (ha van) - KERESÉSI ELŐZMÉNYEK
+            search_results = []
+            if self.search_manager:
+                search_results = self.search_manager.search(
+                    query=user_message,
+                    limit=self.config['vector_search_limit'] * 2,
+                    filters={'intent': intent}
+                )
+            
+            # 2. GRÁF KERESÉS (Neo4j)
             if self.graph_available:
                 graph_results = self._graph_search(user_message, intent)
                 result['graph'] = graph_results
             
-            # 2. Vektoros keresés
-            if self.qdrant_available and self.embedder:
-                vector_results = self._vector_search(user_message)
+            # 3. VEKTOROS KERESÉS (Qdrant) - embedding használatával
+            if self.qdrant_available and self.embedding_manager:
+                vector_results = self._vector_search_with_embedding(user_message)
                 result['vector'] = vector_results
             
-            # 3. Eredmények összefésülése
-            all_results = []
-            all_results.extend(result['graph'])
-            all_results.extend(result['vector'])
-            all_results.extend([f"[Emlék] {m}" for m in important_memories])
+            # 4. ÖSSZES JELÖLT ÖSSZEGYŰJTÉSE (rerankerhez)
+            all_candidates = []
             
-            # Duplikáció szűrés
-            seen = set()
-            for res in all_results:
-                key = hashlib.md5(res.encode()).hexdigest()
-                if key not in seen:
-                    seen.add(key)
-                    result['combined'].append(res)
+            for r in result['graph']:
+                all_candidates.append({'text': r, 'source': 'graph', 'score': 0.8})
+            for r in result['vector']:
+                all_candidates.append({'text': r, 'source': 'vector', 'score': 0.7})
+            for f in facts:
+                all_candidates.append({'text': f, 'source': 'facts', 'score': 0.6})
+            for m in important_memories:
+                all_candidates.append({'text': m, 'source': 'memory', 'score': 0.5})
+            for sr in search_results:
+                if isinstance(sr, dict) and 'text' in sr:
+                    all_candidates.append({'text': sr['text'], 'source': 'cache', 'score': sr.get('score', 0.7)})
+            
+            # 5. RERANKER (ha van) VAGY EGYSZERŰ ÖSSZEFÉSÜLÉS
+            if self.reranker_manager and len(all_candidates) > 1:
+                reranked = self.reranker_manager.rerank_with_scores(
+                    query=user_message,
+                    documents=all_candidates,
+                    top_k=self.config['vector_search_limit']
+                )
+                for item in reranked:
+                    source_prefix = item['source'].upper()
+                    result['combined'].append(f"[{source_prefix}] {item['text']}")
+            else:
+                # Egyszerű összefésülés (reranker nélkül)
+                all_results = []
+                all_results.extend([f"[Gráf] {r}" for r in result['graph']])
+                all_results.extend([f"[Vektor] {r}" for r in result['vector']])
+                all_results.extend([f"[Tény] {f}" for f in facts])
+                all_results.extend([f"[Emlék] {m}" for m in important_memories])
+                for sr in search_results:
+                    if isinstance(sr, dict) and 'text' in sr:
+                        all_results.append(f"[Cache] {sr['text'][:150]}")
+                
+                # Duplikáció szűrés
+                seen = set()
+                for res in all_results:
+                    key = hashlib.md5(res.encode()).hexdigest()
+                    if key not in seen:
+                        seen.add(key)
+                        result['combined'].append(res)
             
             self.state['rag_searches'] += 1
-            
+                
         except Exception as e:
             self.state['errors'].append(f"RAG keresési hiba: {e}")
         
         return result
     
     def _graph_search(self, text: str, intent: str) -> List[str]:
-        """Gráf keresés Neo4j-ben - kapcsolatok, érzelmi töltés"""
+        """Gráf keresés Neo4j-ben"""
         results = []
         
         if not self.graph_available:
@@ -348,7 +402,6 @@ class Valet:
         
         try:
             with self.graph_driver.session() as session:
-                # Kapcsolatok keresése az aktuális témához
                 query = """
                 MATCH (t:Topic {name: $topic})<-[:MENTIONS]-(m:Memory)-[:MENTIONS]->(e:Entity)
                 WHERE m.emotional_charge IS NOT NULL
@@ -366,7 +419,6 @@ class Valet:
                         charge_str = "😊" if charge > 0.3 else "😐" if charge > -0.3 else "😞"
                         results.append(f"{entity} {charge_str}")
                 
-                # Kapcsolatok a felhasználóhoz (általános)
                 query2 = """
                 MATCH (p:Person)-[r:RELATIONSHIP]-(e:Entity)
                 WHERE r.emotional_charge IS NOT NULL
@@ -388,22 +440,22 @@ class Valet:
         
         return results
     
-    def _vector_search(self, text: str) -> List[str]:
-        """Vektoros keresés Qdrant-ben - szemantikus hasonlóság"""
+    def _vector_search_with_embedding(self, text: str) -> List[str]:
+        """
+        Vektoros keresés az embedding manager használatával.
+        """
         results = []
         
-        if not self.qdrant_available or not self.embedder:
+        if not self.qdrant_available or not self.embedding_manager:
             return results
         
         try:
-            # Embedding generálás
-            embedding = self.embedder.embed(text)
+            embedding = self.embedding_manager.embed(text)
             if not embedding:
                 return results
             
-            # Keresés a globális tudásban
             search_result = self.qdrant_client.search(
-                collection_name='global_knowledge',
+                collection_name='personal_memories',
                 query_vector=embedding,
                 limit=self.config['vector_search_limit'],
                 score_threshold=self.config['similarity_threshold']
@@ -413,24 +465,50 @@ class Valet:
                 if hit.payload and 'content' in hit.payload:
                     content = hit.payload['content'][:150]
                     results.append(f"{content} (score: {hit.score:.2f})")
-            
-            # Keresés a személyes emlékekben
-            personal_result = self.qdrant_client.search(
-                collection_name='personal_memories',
-                query_vector=embedding,
-                limit=3,
-                score_threshold=self.config['similarity_threshold']
-            )
-            
-            for hit in personal_result:
-                if hit.payload and 'content' in hit.payload:
-                    content = hit.payload['content'][:150]
-                    results.append(f"[Személyes] {content}")
                     
         except Exception as e:
             self.state['errors'].append(f"Vektoros keresési hiba: {e}")
         
         return results
+    
+    def _vector_search_for_cache(self, query: str, limit: int, filters: Dict) -> List[Dict]:
+        """
+        Cache-elt kereséshez használt vektoros keresés.
+        A SearchManager számára készített formátumban ad vissza eredményt.
+        """
+        results = []
+        
+        if not self.qdrant_available or not self.embedding_manager:
+            return results
+        
+        try:
+            embedding = self.embedding_manager.embed(query)
+            if not embedding:
+                return results
+            
+            search_result = self.qdrant_client.search(
+                collection_name='personal_memories',
+                query_vector=embedding,
+                limit=limit,
+                score_threshold=self.config['similarity_threshold']
+            )
+            
+            for hit in search_result:
+                if hit.payload:
+                    results.append({
+                        'text': hit.payload.get('content', '')[:200],
+                        'score': hit.score,
+                        'metadata': {k: v for k, v in hit.payload.items() if k != 'content'}
+                    })
+                    
+        except Exception as e:
+            self.state['errors'].append(f"Cache keresési hiba: {e}")
+        
+        return results
+    
+    def _vector_search(self, text: str) -> List[str]:
+        """Régi vektoros keresés (kompatibilitás)"""
+        return self._vector_search_with_embedding(text)
     
     def _get_emotional_context(self, interpretation: Dict) -> Dict:
         """Érzelmi kontextus lekérése"""
@@ -489,7 +567,7 @@ class Valet:
                 self._store_in_graph(key, value, memory_type, emotional_charge, entities)
             
             # 2. Qdrant (Vector-Vault)
-            if self.qdrant_available and self.embedder and isinstance(value, str):
+            if self.qdrant_available and self.embedding_manager and isinstance(value, str):
                 self._store_in_vector(key, value, memory_type, importance)
             
             # 3. Scratchpad
@@ -538,11 +616,11 @@ class Valet:
     
     def _store_in_vector(self, key: str, value: str, memory_type: str, importance: float):
         """Tárolás Qdrant-ben"""
-        if not self.qdrant_available or not self.embedder:
+        if not self.qdrant_available or not self.embedding_manager:
             return
         
         try:
-            embedding = self.embedder.embed(value)
+            embedding = self.embedding_manager.embed(value)
             if not embedding:
                 return
             
@@ -884,10 +962,60 @@ class Valet:
         
         print(f"   Vault: {', '.join(status)}")
     
+    # ========== RAG KOMPONENSEK INICIALIZÁLÁSA ==========
+    
+    def _init_embedding(self):
+        """Embedding manager inicializálása"""
+        try:
+            embedding_config = self.config.get('embedding', {})
+            if embedding_config.get('enabled', True):
+                self.embedding_manager = EmbeddingManager(embedding_config)
+                self.embedder = self.embedding_manager.embed
+                print("   ✅ Embedding Manager inicializálva")
+            else:
+                print("   ⚠️ Embedding kikapcsolva")
+                self.embedding_manager = None
+                self.embedder = None
+        except Exception as e:
+            print(f"   ❌ Embedding Manager hiba: {e}")
+            self.embedding_manager = None
+            self.embedder = None
+    
+    def _init_reranker(self):
+        """Reranker manager inicializálása"""
+        try:
+            reranker_config = self.config.get('reranker', {})
+            if reranker_config.get('enabled', False):
+                self.reranker_manager = RerankerManager(reranker_config)
+                print("   ✅ Reranker Manager inicializálva")
+            else:
+                print("   ⚠️ Reranker kikapcsolva")
+                self.reranker_manager = None
+        except Exception as e:
+            print(f"   ❌ Reranker Manager hiba: {e}")
+            self.reranker_manager = None
+    
+    def _init_search(self):
+        """Search manager inicializálása"""
+        try:
+            search_config = self.config.get('search', {})
+            if search_config.get('enabled', True):
+                self.search_manager = SearchManager(
+                    config=search_config,
+                    search_function=self._vector_search_for_cache
+                )
+                print("   ✅ Search Manager inicializálva (24h cache)")
+            else:
+                print("   ⚠️ Search kikapcsolva")
+                self.search_manager = None
+        except Exception as e:
+            print(f"   ❌ Search Manager hiba: {e}")
+            self.search_manager = None
+    
     # ========== PUBLIKUS API ==========
     
     def set_embedder(self, embedder):
-        """Embedding modell beállítása"""
+        """Embedding modell beállítása (kompatibilitás)"""
         self.embedder = embedder
         print("   ✅ Embedding modell beállítva")
     
@@ -933,6 +1061,11 @@ class Valet:
             'tracking': {
                 'topics': len(self.tracking['topics']),
                 'entities': len(self.tracking['entities']),
+            },
+            'rag': {
+                'embedding': self.embedding_manager.get_stats() if self.embedding_manager else None,
+                'reranker': self.reranker_manager.get_stats() if self.reranker_manager else None,
+                'search': self.search_manager.get_stats() if self.search_manager else None
             }
         }
 
