@@ -111,7 +111,7 @@ modules:
     upload_path: "data/uploads"
 
   sentinel:
-    enabled: false
+    enabled: true
     check_interval: 2.0
     temp_warning: 75
     temp_critical: 85
@@ -122,6 +122,15 @@ modules:
     throttle_factor: 0.5
     auto_unload_priority: 3
     log_history: 100
+    enable_emergency_protocol: true
+    recovery_after_seconds: 300
+    max_consecutive_critical: 3
+    enable_throttle: true
+    enable_dynamic_swap: true
+    enable_fragmentation_shield: true
+    temperature_trend_window: 60
+    temperature_rise_warning: 5
+    vram_reserve_mb: 512
     gpu_devices:
       - index: 0
         name: "RTX 5060 Ti"
@@ -129,6 +138,18 @@ modules:
       - index: 1
         name: "RTX 5060 Ti"
         max_temp: 85
+    # Modellek VRAM igénye (MB) - a config-ból olvassa a Sentinel
+    model_vram_estimates:
+      default: 2000          # alapértelmezett, ha nincs más beállítás
+      king: 8000             # 27B modell (Gemma 27B)
+      queen: 4000            # 7B modell (Qwen 7B)
+      scribe: 2000           # 1B modell
+      jester: 1500           # 1B modell (TinyLlama)
+      valet: 1500            # embedding modell
+      vision: 4000           # Moondream vagy Llava
+      # Konkrét modell fájlnevekhez is lehet beállítás
+      "google_gemma-3-12b-it-qat-Q4_K_M.gguf": 8000
+      "Qwen2.5-Omni-7B-UD-Q5_K_XL.gguf": 4000
 
   blackbox:
     enabled: true

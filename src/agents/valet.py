@@ -26,9 +26,14 @@ from collections import defaultdict, deque
 from pathlib import Path
 
 # RAG komponensek
-from src.rag.embedding_manager import EmbeddingManager
-from src.rag.reranker_manager import RerankerManager
-from src.rag.search_manager import SearchManager
+try:
+    from src.rag.embedding_manager import EmbeddingManager
+    from src.rag.reranker_manager import RerankerManager
+    from src.rag.search_manager import SearchManager
+    RAG_AVAILABLE = True
+except ImportError:
+    RAG_AVAILABLE = False
+    print("⚠️ Valet: RAG komponensek nem elérhetők.")
 
 # Neo4j import
 try:
@@ -82,46 +87,18 @@ class Valet:
         'decision': 8,
     }
     
-    def __init__(self, scratchpad, message_bus=None, config: Dict = None):
+    def __init__(self, scratchpad, message_bus=None, config: Dict = None, config_path: str = None):
         self.scratchpad = scratchpad
         self.bus = message_bus
         self.name = "valet"
-        self.config = config or {}
+        
+        # Konfiguráció betöltése
+        self.config = self._load_config(config, config_path)
         
         # Fordító (i18n)
         self.translator = None
         if I18N_AVAILABLE:
             self.translator = get_translator('en')
-        
-        # ========== KONFIGURÁCIÓ ==========
-        default_config = {
-            'max_context_tokens': 1500,
-            'max_recent_messages': 5,
-            'summary_length': 200,
-            'context_compression': True,
-            'enable_tracking': True,
-            'max_tracking_items': 1000,
-            'enable_validation': True,
-            'enable_rag': True,
-            'vector_search_limit': 5,
-            'graph_search_limit': 3,
-            'similarity_threshold': 0.7,
-            'emotional_weight': 0.3,
-            'important_threshold': 0.7,
-            'forget_after_days': 30,
-            'enable_auto_archive': True,
-            'archive_after_days': 90,
-            'neo4j_uri': 'bolt://localhost:7687',
-            'neo4j_user': 'neo4j',
-            'neo4j_password': 'soulcore2026',
-            'qdrant_host': 'localhost',
-            'qdrant_port': 6333,
-            'embedding_size': 1024,
-        }
-        
-        for key, value in default_config.items():
-            if key not in self.config:
-                self.config[key] = value
         
         # ========== RÖVID TÁVÚ MEMÓRIA ==========
         self.tracking = {
@@ -188,6 +165,96 @@ class Valet:
         if self.bus:
             print("👔 Valet: Broadcast módban működöm, hallgatom a Király szavát.")
     
+    def _load_config(self, config: Dict = None, config_path: str = None) -> Dict:
+        """Konfiguráció betöltése fájlból vagy dict-ből"""
+        
+        # Alapértelmezett konfiguráció
+        default_config = {
+            'max_context_tokens': 1500,
+            'max_recent_messages': 5,
+            'summary_length': 200,
+            'context_compression': True,
+            'enable_tracking': True,
+            'max_tracking_items': 1000,
+            'enable_validation': True,
+            'enable_rag': True,
+            'vector_search_limit': 5,
+            'graph_search_limit': 3,
+            'similarity_threshold': 0.7,
+            'emotional_weight': 0.3,
+            'important_threshold': 0.7,
+            'forget_after_days': 30,
+            'enable_auto_archive': True,
+            'archive_after_days': 90,
+            'neo4j_uri': 'bolt://localhost:7687',
+            'neo4j_user': 'neo4j',
+            'neo4j_password': 'soulcore2026',
+            'qdrant_host': 'localhost',
+            'qdrant_port': 6333,
+            'embedding_size': 1024,
+            'embedding': {
+                'enabled': True,
+                'type': 'sentence-transformers',
+                'model': 'all-MiniLM-L6-v2',
+                'cache_ttl': 86400,
+                'fallback_size': 384
+            },
+            'reranker': {
+                'enabled': False,
+                'type': 'cross-encoder',
+                'model': 'cross-encoder/ms-marco-MiniLM-L-6-v2',
+                'cache_ttl': 86400
+            },
+            'search': {
+                'enabled': True,
+                'search_type': 'internal',
+                'cache_ttl': 86400,
+                'max_cache_entries': 1000
+            }
+        }
+        
+        # Ha van átadott config dict, azzal bővítjük
+        if config:
+            for key, value in config.items():
+                if key in default_config and isinstance(value, dict) and isinstance(default_config[key], dict):
+                    default_config[key].update(value)
+                else:
+                    default_config[key] = value
+        
+        # Ha van config fájl, betöltjük
+        if config_path and Path(config_path).exists():
+            try:
+                import yaml
+                with open(config_path, 'r', encoding='utf-8') as f:
+                    file_config = yaml.safe_load(f)
+                    if file_config:
+                        if 'valet' in file_config:
+                            for key, value in file_config['valet'].items():
+                                if key in default_config and isinstance(value, dict) and isinstance(default_config[key], dict):
+                                    default_config[key].update(value)
+                                else:
+                                    default_config[key] = value
+                        if 'vault' in file_config:
+                            vault_config = file_config['vault']
+                            if 'neo4j' in vault_config:
+                                default_config['neo4j_uri'] = vault_config['neo4j'].get('uri', default_config['neo4j_uri'])
+                                default_config['neo4j_user'] = vault_config['neo4j'].get('user', default_config['neo4j_user'])
+                                default_config['neo4j_password'] = vault_config['neo4j'].get('password', default_config['neo4j_password'])
+                            if 'qdrant' in vault_config:
+                                default_config['qdrant_host'] = vault_config['qdrant'].get('host', default_config['qdrant_host'])
+                                default_config['qdrant_port'] = vault_config['qdrant'].get('port', default_config['qdrant_port'])
+                        if 'embedding' in file_config:
+                            default_config['embedding'].update(file_config['embedding'])
+                        if 'reranker' in file_config:
+                            default_config['reranker'].update(file_config['reranker'])
+                        if 'search' in file_config:
+                            default_config['search'].update(file_config['search'])
+                print(f"👔 Valet: Konfiguráció betöltve: {config_path}")
+            except Exception as e:
+                print(f"⚠️ Valet: Konfiguráció betöltési hiba: {e}")
+        
+        return default_config
+    
     # ========== BUSZ KOMMUNIKÁCIÓ ==========
     
     def _on_message(self, message: Dict):
@@ -229,12 +296,18 @@ class Valet:
             },
             "payload": {
                 "type": "context_response",
-                "context": context
+                "context": context,
+                "validation_warning": context.get('validation_warning')
             }
         }
         
         self.bus.send_response(response)
-        print(f"👔 Valet: Kontextus küldve a Kingnek ({self.current_trace_id[:8]})")
+        
+        # Naplózás ha van warning
+        if context.get('validation_warning'):
+            print(f"👔 Valet: ⚠️ Hallucináció-gát aktiválva - {context['validation_warning'][:50]}...")
+        else:
+            print(f"👔 Valet: Kontextus küldve a Kingnek ({self.current_trace_id[:8]})")
     
     # ========== KONTEXTUS ÖSSZEÁLLÍTÁS ==========
     
@@ -253,6 +326,7 @@ class Valet:
             'emotional_context': {},
             'important_memories': [],
             'token_estimate': 0,
+            'validation_warning': None,
             'timestamp': time.time()
         }
         
@@ -271,6 +345,7 @@ class Valet:
             context['important_memories'] = important
             
             # 4. RAG keresés (ha be van kapcsolva)
+            rag_context = {'graph': [], 'vector': [], 'combined': []}
             if self.config['enable_rag']:
                 rag_context = self._rag_search(user_message, interpretation, facts, important)
                 context['rag_results'] = rag_context.get('combined', [])[:3]
@@ -290,14 +365,23 @@ class Valet:
             else:
                 context['summary'] = self._create_summary(user_message, facts)
             
-            # 7. Hallucináció-gát
+            # 7. HALLUCINÁCIÓ-GÁT (aktív validáció)
             if self.config['enable_validation']:
-                warning = self._validate_context(
-                    user_message, facts, context.get('rag_results', [])
+                validation_result = self._validate_context(
+                    user_message=user_message,
+                    intent=interpretation.get('intent', {}),
+                    facts=facts,
+                    rag_results=rag_context.get('combined', []),
+                    graph_context=rag_context.get('graph', [])
                 )
-                if warning:
-                    context['warnings'].append(warning)
-                    self.state['warnings_issued'] += 1
+                
+                if validation_result:
+                    context['validation_warning'] = validation_result.get('warning')
+                    context['warnings'].append(validation_result.get('warning'))
+                    
+                    if validation_result.get('has_contradiction'):
+                        self.state['warnings_issued'] += 1
+                        context['summary'] = f"[VALIDATION] {validation_result.get('warning')}\n" + context['summary']
             
             # 8. Token becslés
             context['token_estimate'] = self._estimate_tokens(context)
@@ -321,7 +405,7 @@ class Valet:
         }
         
         try:
-            intent = interpretation.get('intent', {}).get('class', 'unknown')
+            intent = interpretation.get('intent', {}).get('class', 'unknown') if isinstance(interpretation, dict) else 'unknown'
             
             # 1. SEARCH CACHE (ha van) - KERESÉSI ELŐZMÉNYEK
             search_results = []
@@ -346,15 +430,19 @@ class Valet:
             all_candidates = []
             
             for r in result['graph']:
-                all_candidates.append({'text': r, 'source': 'graph', 'score': 0.8})
+                if r:
+                    all_candidates.append({'text': r, 'source': 'graph', 'score': 0.8})
             for r in result['vector']:
-                all_candidates.append({'text': r, 'source': 'vector', 'score': 0.7})
+                if r:
+                    all_candidates.append({'text': r, 'source': 'vector', 'score': 0.7})
             for f in facts:
-                all_candidates.append({'text': f, 'source': 'facts', 'score': 0.6})
+                if f:
+                    all_candidates.append({'text': f, 'source': 'facts', 'score': 0.6})
             for m in important_memories:
-                all_candidates.append({'text': m, 'source': 'memory', 'score': 0.5})
+                if m:
+                    all_candidates.append({'text': m, 'source': 'memory', 'score': 0.5})
             for sr in search_results:
-                if isinstance(sr, dict) and 'text' in sr:
+                if isinstance(sr, dict) and sr.get('text'):
                     all_candidates.append({'text': sr['text'], 'source': 'cache', 'score': sr.get('score', 0.7)})
             
             # 5. RERANKER (ha van) VAGY EGYSZERŰ ÖSSZEFÉSÜLÉS
@@ -365,23 +453,23 @@ class Valet:
                     top_k=self.config['vector_search_limit']
                 )
                 for item in reranked:
-                    source_prefix = item['source'].upper()
-                    result['combined'].append(f"[{source_prefix}] {item['text']}")
+                    source_prefix = item.get('source', 'UNK').upper()
+                    result['combined'].append(f"[{source_prefix}] {item.get('text', '')[:150]}")
             else:
                 # Egyszerű összefésülés (reranker nélkül)
                 all_results = []
-                all_results.extend([f"[Gráf] {r}" for r in result['graph']])
-                all_results.extend([f"[Vektor] {r}" for r in result['vector']])
-                all_results.extend([f"[Tény] {f}" for f in facts])
-                all_results.extend([f"[Emlék] {m}" for m in important_memories])
+                all_results.extend([f"[Gráf] {r[:150]}" for r in result['graph'] if r])
+                all_results.extend([f"[Vektor] {r[:150]}" for r in result['vector'] if r])
+                all_results.extend([f"[Tény] {f[:150]}" for f in facts if f])
+                all_results.extend([f"[Emlék] {m[:150]}" for m in important_memories if m])
                 for sr in search_results:
-                    if isinstance(sr, dict) and 'text' in sr:
+                    if isinstance(sr, dict) and sr.get('text'):
                         all_results.append(f"[Cache] {sr['text'][:150]}")
                 
                 # Duplikáció szűrés
                 seen = set()
                 for res in all_results:
-                    key = hashlib.md5(res.encode()).hexdigest()
+                    key = hashlib.md5(res.encode()).hexdigest() if isinstance(res, str) else str(res)
                     if key not in seen:
                         seen.add(key)
                         result['combined'].append(res)
@@ -414,7 +502,7 @@ class Valet:
                 result = session.run(query, topic=intent if intent else text[:50])
                 for record in result:
                     entity = record.get('entity', '')
-                    charge = record.get('charge', 0)
+                    charge = record.get('charge', 0) if record.get('charge') else 0
                     if entity:
                         charge_str = "😊" if charge > 0.3 else "😐" if charge > -0.3 else "😞"
                         results.append(f"{entity} {charge_str}")
@@ -430,7 +518,7 @@ class Valet:
                 result = session.run(query2)
                 for record in result:
                     entity = record.get('entity', '')
-                    charge = record.get('charge', 0)
+                    charge = record.get('charge', 0) if record.get('charge') else 0
                     if entity and abs(charge) > 0.3:
                         rel_type = record.get('type', 'kapcsolat')
                         results.append(f"{entity} ({rel_type})")
@@ -518,7 +606,7 @@ class Valet:
         }
         
         try:
-            intent = interpretation.get('intent', {}).get('class', 'unknown')
+            intent = interpretation.get('intent', {}).get('class', 'unknown') if isinstance(interpretation, dict) else 'unknown'
             
             if intent in self.tracking['emotional_charge']:
                 emotional['current_charge'] = self.tracking['emotional_charge'][intent]
@@ -534,23 +622,127 @@ class Valet:
         
         return emotional
     
-    def _validate_context(self, user_message: str, facts: List[str], 
-                          rag_results: List[str]) -> Optional[str]:
-        """Hallucináció-gát - tények ellenőrzése"""
+    def _validate_context(self, user_message: str, intent: Dict, facts: List[str], 
+                          rag_results: List[str], graph_context: List[str]) -> Optional[Dict]:
+        """
+        Hallucináció-gát - tények ellenőrzése és összevetése a szándékkal.
+        
+        A dokumentum 3.2 szerint:
+        "Mielőtt a kérés továbbmegy a Királyi Trónra, a Valet összeveti a talált tényeket 
+         a Scribe szándékával. Ha ellentmondást talál, egy WARNING flag-et szúr be a payload-ba."
+        
+        Returns:
+            Dict with 'has_contradiction', 'warning', 'confidence' vagy None ha nincs gond
+        """
+        if not self.config['enable_validation']:
+            return None
+        
         contradictions = []
+        warnings = []
+        confidence = 1.0
         
         try:
-            for fact in facts:
-                if 'nem' in fact.lower() or 'nincs' in fact.lower():
-                    contradictions.append(f"Potential contradiction in: {fact[:50]}")
+            intent_class = intent.get('class', '').lower() if isinstance(intent, dict) else str(intent).lower()
             
-            if contradictions:
-                return f"Validation warning: {contradictions[0]}"
+            # 1. Szándék vs tények összevetése
+            for fact in facts:
+                if not isinstance(fact, str):
+                    continue
+                fact_lower = fact.lower()
                 
+                # Ellenőrizzük, hogy a tény ellentmond-e a szándéknak
+                if intent_class == 'system_control' and 'nem' in fact_lower:
+                    contradictions.append(f"System control requested but fact contradicts: {fact[:50]}")
+                    confidence -= 0.2
+                
+                if intent_class == 'knowledge_retrieval' and 'nincs' in fact_lower and 'információ' in fact_lower:
+                    warnings.append(f"Knowledge retrieval may be incomplete: {fact[:50]}")
+                    confidence -= 0.1
+            
+            # 2. RAG eredmények vs szándék
+            for result in rag_results:
+                if not isinstance(result, str):
+                    continue
+                
+                if 'error' in result.lower() or 'hiba' in result.lower():
+                    warnings.append(f"RAG result indicates potential issue: {result[:50]}")
+                    confidence -= 0.15
+            
+            # 3. Gráf kontextus ellenőrzése
+            for ctx in graph_context:
+                if not isinstance(ctx, str):
+                    continue
+                
+                if '😞' in ctx or '😐' in ctx:
+                    if intent_class in ['knowledge_retrieval', 'system_control']:
+                        warnings.append(f"Emotional context may affect response quality: {ctx[:40]}")
+                        confidence -= 0.1
+            
+            # 4. Duplikáció ellenőrzés
+            seen_facts = set()
+            for fact in facts:
+                if isinstance(fact, str):
+                    fact_hash = hashlib.md5(fact.encode()).hexdigest()[:8]
+                    if fact_hash in seen_facts:
+                        warnings.append(f"Duplicate fact detected: {fact[:30]}...")
+                        confidence -= 0.05
+                    seen_facts.add(fact_hash)
+            
+            # 5. Logikai ellentmondások keresése
+            if len(facts) >= 2:
+                for i, fact1 in enumerate(facts):
+                    for fact2 in facts[i+1:]:
+                        if self._check_logical_contradiction(fact1, fact2):
+                            contradictions.append(f"Logical contradiction: '{fact1[:40]}' vs '{fact2[:40]}'")
+                            confidence -= 0.3
+            
+            # Eredmény összeállítása
+            if contradictions:
+                return {
+                    'has_contradiction': True,
+                    'warning': f"⚠️ VALIDATION: Contradiction detected - {contradictions[0]}",
+                    'confidence': max(0.0, confidence),
+                    'contradictions': contradictions[:3],
+                    'warnings': warnings[:3]
+                }
+            elif warnings:
+                return {
+                    'has_contradiction': False,
+                    'warning': f"⚠️ CAUTION: {warnings[0]}",
+                    'confidence': max(0.0, confidence),
+                    'warnings': warnings[:3]
+                }
+            
+            return None
+            
         except Exception as e:
             self.state['errors'].append(f"Validálási hiba: {e}")
+            return {
+                'has_contradiction': False,
+                'warning': f"Validation error: {e}",
+                'confidence': 0.5
+            }
+    
+    def _check_logical_contradiction(self, fact1: str, fact2: str) -> bool:
+        """
+        Két tény logikai ellentmondásának ellenőrzése.
+        """
+        if not isinstance(fact1, str) or not isinstance(fact2, str):
+            return False
         
-        return None
+        fact1_lower = fact1.lower()
+        fact2_lower = fact2.lower()
+        
+        # Igen/nem ellentmondások
+        if ('nem' in fact1_lower and 'igen' in fact2_lower) or \
+           ('igen' in fact1_lower and 'nem' in fact2_lower):
+            words1 = set(fact1_lower.split())
+            words2 = set(fact2_lower.split())
+            common = words1 & words2
+            if len(common) >= 2:
+                return True
+        
+        return False
     
     # ========== MEMÓRIA TÁROLÁS ==========
     
@@ -559,7 +751,7 @@ class Valet:
                  entities: List[Dict] = None):
         """Információ elmentése a hosszú távú memóriába"""
         try:
-            memory_id = f"{memory_type}_{int(time.time())}_{hashlib.md5(key.encode()).hexdigest()[:8]}"
+            memory_id = f"{memory_type}_{int(time.time())}_{hashlib.md5(str(key).encode()).hexdigest()[:8]}"
             now = time.time()
             
             # 1. Neo4j (Graph-Vault)
@@ -607,8 +799,8 @@ class Valet:
                         emotional_charge: $emotional_charge,
                         created_at: datetime()
                     })
-                """, uuid=hashlib.md5(key.encode()).hexdigest(),
-                    key=key, content=str(value)[:500], type=memory_type,
+                """, uuid=hashlib.md5(str(key).encode()).hexdigest(),
+                    key=str(key)[:200], content=str(value)[:500], type=memory_type,
                     emotional_charge=emotional_charge)
                 
         except Exception as e:
@@ -627,10 +819,10 @@ class Valet:
             self.qdrant_client.upsert(
                 collection_name='personal_memories',
                 points=[qdrant_models.PointStruct(
-                    id=hashlib.md5(key.encode()).hexdigest(),
+                    id=hashlib.md5(str(key).encode()).hexdigest(),
                     vector=embedding,
                     payload={
-                        'key': key,
+                        'key': str(key)[:200],
                         'content': value[:500],
                         'type': memory_type,
                         'importance': importance,
@@ -646,13 +838,14 @@ class Valet:
                          importance: float, emotional_charge: float):
         """Tracking frissítése"""
         try:
-            self.tracking['importance'][key] = max(
-                self.tracking['importance'].get(key, 0), importance
+            key_str = str(key)
+            self.tracking['importance'][key_str] = max(
+                self.tracking['importance'].get(key_str, 0), importance
             )
-            self.tracking['emotional_charge'][key] = emotional_charge
-            self.tracking['first_seen'].setdefault(key, time.time())
-            self.tracking['mention_count'][key] += 1
-            self.tracking['last_mentioned'][key] = time.time()
+            self.tracking['emotional_charge'][key_str] = emotional_charge
+            self.tracking['first_seen'].setdefault(key_str, time.time())
+            self.tracking['mention_count'][key_str] += 1
+            self.tracking['last_mentioned'][key_str] = time.time()
             
             if isinstance(key, str):
                 for word in key.split():
@@ -671,7 +864,7 @@ class Valet:
                         MATCH (m:Memory {key: $key})
                         RETURN m.content as content
                         LIMIT 1
-                    """, key=key).single()
+                    """, key=str(key)[:200]).single()
                     if result:
                         return result['content']
             
@@ -750,7 +943,7 @@ class Valet:
             )[:limit]
             for memory, importance in sorted_memories:
                 if importance > self.config['important_threshold']:
-                    important.append(f"{memory}")
+                    important.append(str(memory))
         except Exception as e:
             self.state['errors'].append(f"Hiba a fontos emlékek lekérésében: {e}")
         return important
@@ -966,6 +1159,12 @@ class Valet:
     
     def _init_embedding(self):
         """Embedding manager inicializálása"""
+        if not RAG_AVAILABLE:
+            self.embedding_manager = None
+            self.embedder = None
+            print("   ⚠️ RAG komponensek nem elérhetők.")
+            return
+            
         try:
             embedding_config = self.config.get('embedding', {})
             if embedding_config.get('enabled', True):
@@ -983,6 +1182,10 @@ class Valet:
     
     def _init_reranker(self):
         """Reranker manager inicializálása"""
+        if not RAG_AVAILABLE:
+            self.reranker_manager = None
+            return
+            
         try:
             reranker_config = self.config.get('reranker', {})
             if reranker_config.get('enabled', False):
@@ -997,6 +1200,10 @@ class Valet:
     
     def _init_search(self):
         """Search manager inicializálása"""
+        if not RAG_AVAILABLE:
+            self.search_manager = None
+            return
+            
         try:
             search_config = self.config.get('search', {})
             if search_config.get('enabled', True):
@@ -1027,13 +1234,15 @@ class Valet:
     def start(self):
         """Valet indítása"""
         self.state['status'] = 'ready'
-        self.scratchpad.set_state('valet_status', 'ready', self.name)
+        if self.scratchpad:
+            self.scratchpad.set_state('valet_status', 'ready', self.name)
         print("👔 Valet: Készen állok.")
     
     def stop(self):
         """Valet leállítása"""
         self.state['status'] = 'stopped'
-        self.scratchpad.set_state('valet_status', 'stopped', self.name)
+        if self.scratchpad:
+            self.scratchpad.set_state('valet_status', 'stopped', self.name)
         if self.graph_driver:
             self.graph_driver.close()
         print("👔 Valet: Leállt.")
@@ -1072,7 +1281,7 @@ class Valet:
 
 # Teszt
 if __name__ == "__main__":
-    from scratchpad import Scratchpad
+    from src.memory.scratchpad import Scratchpad
     
     s = Scratchpad()
     valet = Valet(s)

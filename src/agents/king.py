@@ -134,9 +134,10 @@ class King:
         # Válasz callback (WebApp felé)
         self.response_callback = None
         
-        # Valet és Queen hivatkozások
+        # Valet, Queen és Graph-Vault hivatkozások
         self.valet = None
         self.queen = None
+        self.graph_vault = None  # Érzelmi töltés lekérdezéshez
         
         # Ha van busz, feliratkozunk
         if self.bus:
@@ -275,6 +276,9 @@ class King:
                 context['summary'] = ctx.get('summary', '')
                 context['facts'] = ctx.get('facts', [])
                 context['emotional_charge'] = ctx.get('emotional_charge', 0.0)
+                # Validációs warning átvétele
+                if payload.get('validation_warning'):
+                    context['validation_warning'] = payload.get('validation_warning')
             
             elif sender == 'queen':
                 logic = payload.get('logic', {})
@@ -282,6 +286,79 @@ class King:
                 context['thought'] = logic.get('thought', [])
         
         return context
+    
+    # ========== ÉRZELMI KONTEXTUS (GRAPH-VAULT INTEGRÁCIÓ) ==========
+    
+    def set_graph_vault(self, graph_vault):
+        """Graph-Vault beállítása (érzelmi töltés lekérdezéshez)"""
+        self.graph_vault = graph_vault
+        print("👑 King: Graph-Vault kapcsolódva (érzelmi kontextus)")
+    
+    def _get_emotional_context(self, topic: str) -> Dict:
+        """
+        Érzelmi kontextus lekérése a Graph-Vaultból.
+        
+        A dokumentum XXXVIII. fejezete szerint:
+        "A King a válaszadás előtt leolvassa ezt a térképet, és eszerint igazítja a hangvételét."
+        
+        Returns:
+            {
+                'charge': float,  # -1.0 .. 1.0
+                'mood': str,      # 'positive', 'negative', 'neutral'
+                'warning': str,   # figyelmeztetés ha negatív
+                'related_topics': list
+            }
+        """
+        result = {
+            'charge': 0.0,
+            'mood': 'neutral',
+            'warning': '',
+            'related_topics': []
+        }
+        
+        if not self.graph_vault:
+            return result
+        
+        try:
+            # Lekérjük a téma érzelmi töltését
+            if hasattr(self.graph_vault, 'get_emotional_charge'):
+                charge = self.graph_vault.get_emotional_charge(topic)
+                if charge is not None:
+                    result['charge'] = charge
+                    if charge > 0.3:
+                        result['mood'] = 'positive'
+                    elif charge < -0.3:
+                        result['mood'] = 'negative'
+                        result['warning'] = f"⚠️ Topic '{topic}' has negative emotional charge ({charge:.2f}). Respond carefully."
+            
+            # Lekérjük a kapcsolódó témákat
+            if hasattr(self.graph_vault, 'get_related_topics'):
+                related = self.graph_vault.get_related_topics(topic, limit=3)
+                if related:
+                    result['related_topics'] = related
+                    
+        except Exception as e:
+            self.state.errors.append(f"Emotional context error: {e}")
+        
+        return result
+    
+    def _estimate_emotional_charge(self, text: str) -> float:
+        """Szöveg érzelmi töltésének becslése (-1.0 .. 1.0)"""
+        if not isinstance(text, str):
+            return 0.0
+        
+        text_lower = text.lower()
+        positive_words = ['good', 'great', 'love', 'like', 'happy', 'jó', 'szuper', 'remek', 'köszönöm', 'szíves']
+        negative_words = ['bad', 'terrible', 'hate', 'error', 'rossz', 'szar', 'hiba', 'nem működik', 'dühös']
+        
+        positive_count = sum(1 for w in positive_words if w in text_lower)
+        negative_count = sum(1 for w in negative_words if w in text_lower)
+        total = positive_count + negative_count
+        
+        if total == 0:
+            return 0.0
+        
+        return (positive_count - negative_count) / total
     
     # ========== FŐ FELDOLGOZÓ METÓDUS (BROADCAST MÓD) ==========
     
@@ -321,7 +398,7 @@ class King:
         
         # 6. Állapot frissítés
         processing_time = time.time() - start_time
-        self._update_state(response_text, processing_time, len(response_text.split()), responses)
+        self._update_state(response_text, processing_time, len(response_text.split()), responses, interpretation)
         
         # 7. Callback
         if self.response_callback:
@@ -349,20 +426,35 @@ class King:
     def _generate_response_with_context(self, user_text: str, interpretation: Dict, responses: Dict) -> str:
         """Válasz generálása a szolgák válaszaival + belső monológ"""
         context = self._extract_context_from_responses(responses)
-        prompt = self._build_response_prompt(user_text, interpretation, context)
         
-        # Belső monológ generálása
+        # Érzelmi kontextus lekérése a Graph-Vaultból
+        topic = interpretation.get('intent', {}).get('class', '')
+        emotional_context = self._get_emotional_context(topic)
+        
+        # Ha negatív érzelmi töltés van, finomhangoljuk a hangvételt
+        original_temperature = self.generation_params['temperature']
+        if emotional_context.get('mood') == 'negative':
+            self.generation_params['temperature'] = max(0.5, original_temperature * 0.8)
+        
+        prompt = self._build_response_prompt(user_text, interpretation, context, emotional_context)
+        
+        # Belső monológ generálása (Jester olvassa)
         try:
-            internal_prompt = f"Generate an internal monologue (1-2 sentences) about how you feel about this user message: {user_text}"
+            mood_str = emotional_context.get('mood', 'neutral')
+            internal_prompt = f"""Generate an internal monologue (1-2 sentences) about how you feel about this user message.
+Emotional context of the topic: {mood_str} (charge: {emotional_context.get('charge', 0):.2f})
+User message: {user_text}"""
+            
             internal_monologue = self.model.generate(
                 prompt=internal_prompt,
                 max_tokens=100,
                 temperature=0.7
             )
-            # Belső monológ mentése a scratchpad-be (Jester olvassa)
             self.scratchpad.write_note('king', 'internal_monologue', {
                 'text': internal_monologue,
                 'timestamp': time.time(),
+                'emotional_charge': emotional_context.get('charge', 0),
+                'topic': topic,
                 'in_response_to': user_text[:100]
             })
         except Exception as e:
@@ -378,22 +470,46 @@ class King:
                 top_k=self.generation_params['top_k'],
                 repeat_penalty=self.generation_params['repeat_penalty']
             )
+            # Visszaállítjuk az eredeti temperature-t
+            self.generation_params['temperature'] = original_temperature
             return response.strip()
         except Exception as e:
+            self.generation_params['temperature'] = original_temperature
             self.state.errors.append(str(e))
             return self._get_message('error', error=str(e))
     
-    def _build_response_prompt(self, user_text: str, interpretation: Dict, context: Dict) -> str:
-        """Prompt összeállítása a válaszhoz"""
+    def _build_response_prompt(self, user_text: str, interpretation: Dict, context: Dict, emotional_context: Dict = None) -> str:
+        """Prompt összeállítása a válaszhoz + érzelmi kontextus"""
         language = interpretation.get('language', 'en')
         style = self.identity.get('style', 'default')
         
         parts = []
         
+        # ÉRZELMI KONTEXTUS BLOKK (dokumentum XXXVIII.)
+        if emotional_context:
+            if emotional_context.get('warning'):
+                parts.append(emotional_context['warning'])
+            elif emotional_context.get('mood') == 'positive':
+                if language == 'hu':
+                    parts.append("✨ Pozitív érzelmi töltés kapcsolódik ehhez a témához.")
+                else:
+                    parts.append("✨ Positive emotional charge associated with this topic.")
+            elif emotional_context.get('mood') == 'negative':
+                if language == 'hu':
+                    parts.append("⚠️ Ehhez a témához negatív érzelmi töltés kapcsolódik. Válaszolj óvatosan, empatikusan.")
+                else:
+                    parts.append("⚠️ Negative emotional charge associated with this topic. Respond carefully, with empathy.")
+        
+        # Validációs warning a Valet-től
+        if context.get('validation_warning'):
+            parts.append(context['validation_warning'])
+        
+        # Stílus utasítás
         style_instruction = self._get_style_instruction(style, language)
         if style_instruction:
             parts.append(style_instruction)
         
+        # Kontextus a Valet-től
         if context.get('summary'):
             parts.append(f"Context: {context['summary']}")
         
@@ -473,7 +589,7 @@ class King:
             processing_time = time.time() - start_time
             tokens_used = len(response_text.split())
             
-            self._update_state(response_text, processing_time, tokens_used, {})
+            self._update_state(response_text, processing_time, tokens_used, {}, None)
             
             if self.response_callback:
                 conversation_id = payload.get('conversation_id')
@@ -809,7 +925,7 @@ Return JSON:
             return "calm"
         return "lively"
     
-    def _update_state(self, response_text: str, processing_time: float, tokens_used: int, responses: Dict):
+    def _update_state(self, response_text: str, processing_time: float, tokens_used: int, responses: Dict, interpretation: Dict = None):
         self.state.last_response_time = processing_time
         self.state.last_response_text = response_text[:200]
         self.state.response_count += 1
@@ -824,6 +940,18 @@ Return JSON:
             self.state.average_response_time = processing_time
         else:
             self.state.average_response_time = self.state.average_response_time * 0.9 + processing_time * 0.1
+        
+        # Érzelmi kontextus frissítése a Graph-Vaultban (ha van conversation_id)
+        if self.graph_vault and self.state.current_conversation_id:
+            try:
+                emotional_charge = self._estimate_emotional_charge(response_text)
+                if hasattr(self.graph_vault, 'update_emotional_charge'):
+                    self.graph_vault.update_emotional_charge(
+                        topic=str(self.state.current_conversation_id),
+                        charge=emotional_charge
+                    )
+            except Exception as e:
+                self.state.errors.append(f"Emotional update error: {e}")
         
         self.scratchpad.write_note(self.name, 'state', self.state.to_dict())
     

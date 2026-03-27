@@ -16,10 +16,14 @@ import base64
 import json
 import threading
 import os
+import sys
 import hashlib
 from pathlib import Path
 from datetime import datetime
 from typing import Dict, Any, List, Optional, Tuple, Union
+
+# Add project root to path for imports
+sys.path.insert(0, os.path.dirname(os.path.dirname(os.path.dirname(os.path.abspath(__file__)))))
 
 # Opcionális importok - ha nincsenek, dummy mód
 try:
@@ -51,6 +55,7 @@ try:
 except ImportError:
     I18N_AVAILABLE = False
 
+
 class EyeCore:
     """
     A Vár szeme - vizuális feldolgozás.
@@ -63,36 +68,31 @@ class EyeCore:
     - Vizuális kontextus összeállítása
     """
     
-    def __init__(self, scratchpad, config: Dict = None):
+    # Tesseract nyelvkódok (ISO 639-2/T)
+    TESSERACT_LANG_MAP = {
+        'hun': 'hun',      # magyar
+        'hug': 'hun',      # magyar (alternatív)
+        'eng': 'eng',      # angol
+        'deu': 'deu',      # német
+        'fra': 'fra',      # francia
+        'ita': 'ita',      # olasz
+        'spa': 'spa',      # spanyol
+        'rus': 'rus',      # orosz
+        'cmn': 'chi_sim',  # kínai (egyszerűsített)
+        'jpn': 'jpn',      # japán
+    }
+    
+    def __init__(self, scratchpad=None, config: Dict = None, config_path: str = None):
         self.scratchpad = scratchpad
         self.name = "eyecore"
-        self.config = config or {}
+        
+        # Konfiguráció betöltése
+        self.config = self._load_config(config, config_path)
         
         # Fordító (később állítjuk be)
         self.translator = None
         if I18N_AVAILABLE:
             self.translator = get_translator('en')
-        
-        # Alapértelmezett konfiguráció
-        default_config = {
-            'enabled': True,
-            'enable_ocr': True,
-            'enable_object_detection': False,  # Alapból kikapcs, mert modell kell
-            'enable_face_detection': False,
-            'max_image_size': 1920,              # Max képméret (pixel)
-            'cache_results': True,                # Eredmények gyorsítótárazása
-            'cache_ttl': 3600,                     # 1 óra
-            'default_language': 'hun',             # OCR nyelve
-            'save_uploaded': False,                 # Feltöltött képek mentése
-            'upload_path': 'data/uploads',
-            'enable_url_fetch': True,               # URL-ről kép letöltés
-            'max_url_size': 10 * 1024 * 1024,       # Max 10 MB
-            'timeout': 10                            # Időtúllépés másodpercben
-        }
-        
-        for key, value in default_config.items():
-            if key not in self.config:
-                self.config[key] = value
         
         # Gyorsítótár
         self.cache = {}
@@ -115,6 +115,11 @@ class EyeCore:
         if self.config['enable_object_detection']:
             self._init_object_detection()
         
+        # Haar Cascade (arc detekcióhoz)
+        self.face_cascade = None
+        if self.config['enable_face_detection'] and CV2_AVAILABLE:
+            self._init_face_detection()
+        
         # Feltöltési mappa létrehozása
         if self.config['save_uploaded']:
             upload_path = Path(self.config['upload_path'])
@@ -123,29 +128,168 @@ class EyeCore:
         print("👁️ Eye-Core: A Vár szeme kinyílt.")
         if not CV2_AVAILABLE:
             print("   ⚠️ OpenCV nélkül (korlátozott mód)")
+        if not TESSERACT_AVAILABLE:
+            print("   ⚠️ Tesseract nélkül (OCR nem elérhető)")
+    
+    def _load_config(self, config: Dict = None, config_path: str = None) -> Dict:
+        """Konfiguráció betöltése fájlból vagy dict-ből"""
+        
+        # Alapértelmezett konfiguráció
+        default_config = {
+            'enabled': True,
+            'enable_ocr': True,
+            'enable_object_detection': False,
+            'enable_face_detection': False,
+            'max_image_size': 1920,
+            'cache_results': True,
+            'cache_ttl': 86400,  # 24 óra
+            'default_language': 'eng',
+            'ocr_languages': ['eng'],  # több nyelv támogatása
+            'ocr_preprocess': True,
+            'save_uploaded': False,
+            'upload_path': 'data/uploads',
+            'enable_url_fetch': True,
+            'max_url_size': 10 * 1024 * 1024,
+            'timeout': 10,
+            'confidence_threshold': 0.5,
+            'face_scale_factor': 1.1,
+            'face_min_neighbors': 4,
+            'face_min_size': (30, 30)
+        }
+        
+        # Ha van átadott config dict, azzal bővítjük
+        if config:
+            default_config.update(config)
+        
+        # Ha van config fájl, betöltjük
+        if config_path and os.path.exists(config_path):
+            try:
+                import yaml
+                with open(config_path, 'r', encoding='utf-8') as f:
+                    file_config = yaml.safe_load(f)
+                    if file_config and 'eyecore' in file_config:
+                        default_config.update(file_config['eyecore'])
+                    elif file_config:
+                        default_config.update(file_config)
+                print(f"👁️ Eye-Core: Konfiguráció betöltve: {config_path}")
+            except Exception as e:
+                print(f"⚠️ Eye-Core: Konfiguráció betöltési hiba: {e}")
+        
+        # Ha nincs config_path, próbáljuk az alapértelmezett helyen
+        if not config_path:
+            default_paths = [
+                os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(__file__))), 'config', 'config.yaml'),
+                os.path.join(os.getcwd(), 'config', 'config.yaml'),
+                os.path.join(os.getcwd(), 'config.yaml')
+            ]
+            for path in default_paths:
+                if os.path.exists(path):
+                    try:
+                        import yaml
+                        with open(path, 'r', encoding='utf-8') as f:
+                            file_config = yaml.safe_load(f)
+                            if file_config and 'eyecore' in file_config:
+                                default_config.update(file_config['eyecore'])
+                            elif file_config and 'modules' in file_config and 'eyecore' in file_config['modules']:
+                                default_config.update(file_config['modules']['eyecore'])
+                        print(f"👁️ Eye-Core: Konfiguráció betöltve: {path}")
+                        break
+                    except Exception as e:
+                        print(f"⚠️ Eye-Core: Konfiguráció betöltési hiba {path}: {e}")
+        
+        return default_config
+    
+    def _init_object_detection(self):
+        """Objektum detekciós modell inicializálása"""
+        try:
+            # YOLO vagy más modell betöltése
+            # TODO: YOLO integráció
+            print("👁️ Eye-Core: Objektum detekció inicializálása...")
+            self.state['errors'].append("Object detection not fully implemented yet")
+        except Exception as e:
+            print(f"👁️ Eye-Core: Objektum detekció inicializálási hiba: {e}")
+            self.config['enable_object_detection'] = False
+    
+    def _init_face_detection(self):
+        """Arc detekció inicializálása (Haar Cascade)"""
+        try:
+            cascade_path = cv2.data.haarcascades + 'haarcascade_frontalface_default.xml'
+            if os.path.exists(cascade_path):
+                self.face_cascade = cv2.CascadeClassifier(cascade_path)
+                print("👁️ Eye-Core: Arc detekció inicializálva")
+            else:
+                print(f"⚠️ Eye-Core: Haar Cascade nem található: {cascade_path}")
+                self.config['enable_face_detection'] = False
+        except Exception as e:
+            print(f"👁️ Eye-Core: Arc detekció inicializálási hiba: {e}")
+            self.config['enable_face_detection'] = False
     
     def set_language(self, language: str):
         """Nyelv beállítása (i18n)"""
         if self.translator and I18N_AVAILABLE:
             self.translator.set_language(language)
+        
+        # OCR nyelv beállítása a konfigban
+        lang_code = self.TESSERACT_LANG_MAP.get(language, 'eng')
+        if lang_code not in self.config['ocr_languages']:
+            self.config['ocr_languages'].insert(0, lang_code)
     
     def start(self):
         """Eye-Core indítása"""
         self.state['status'] = 'ready'
-        self.scratchpad.set_state('eyecore_status', 'ready', self.name)
+        if self.scratchpad:
+            self.scratchpad.set_state('eyecore_status', 'ready', self.name)
         print("👁️ Eye-Core: Figyelek.")
     
     def stop(self):
         """Eye-Core leállítása"""
         self.state['status'] = 'stopped'
-        self.scratchpad.set_state('eyecore_status', 'stopped', self.name)
+        if self.scratchpad:
+            self.scratchpad.set_state('eyecore_status', 'stopped', self.name)
         print("👁️ Eye-Core: Becsukom a szemem.")
     
-    def _init_object_detection(self):
-        """Objektum detekciós modell inicializálása"""
-        # Itt lehet majd YOLO vagy más modell
-        print("👁️ Eye-Core: Objektum detekció inicializálása...")
-        self.state['errors'].append("Object detection not implemented yet")
+    def _resize_image(self, image) -> Any:
+        """Kép átméretezése a max_image_size alapján"""
+        if not CV2_AVAILABLE or image is None:
+            return image
+        
+        h, w = image.shape[:2]
+        max_size = self.config['max_image_size']
+        
+        if max(h, w) <= max_size:
+            return image
+        
+        scale = max_size / max(h, w)
+        new_w = int(w * scale)
+        new_h = int(h * scale)
+        
+        return cv2.resize(image, (new_w, new_h))
+    
+    def _preprocess_for_ocr(self, image) -> Any:
+        """
+        Kép előfeldolgozása OCR-hez.
+        - Szürkeárnyalatos
+        - Zajszűrés
+        - Kontraszt növelés
+        - Bináris átalakítás
+        """
+        if not CV2_AVAILABLE:
+            return image
+        
+        # Szürkeárnyalatos
+        gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+        
+        # Zajszűrés (Gaussian blur)
+        gray = cv2.GaussianBlur(gray, (3, 3), 0)
+        
+        # Kontraszt növelés (CLAHE)
+        clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
+        gray = clahe.apply(gray)
+        
+        # Bináris átalakítás (Otsu threshold)
+        _, gray = cv2.threshold(gray, 0, 255, cv2.THRESH_BINARY + cv2.THRESH_OTSU)
+        
+        return gray
     
     # --- KÉP FELDOLGOZÁS ---
     
@@ -162,13 +306,13 @@ class EyeCore:
         
         Visszaad: {
             'success': bool,
-            'description': str,  # Emberi olvasható leírás
-            'ocr_text': str,      # Felismert szöveg
-            'objects': list,       # Detektált objektumok
-            'faces': list,         # Detektált arcok
-            'dimensions': dict,    # Kép mérete
-            'format': str,         # Kép formátum
-            'error': str,          # Hibaüzenet (ha van)
+            'description': str,
+            'ocr_text': str,
+            'objects': list,
+            'faces': list,
+            'dimensions': dict,
+            'format': str,
+            'error': str,
             'processing_time': float
         }
         """
@@ -196,12 +340,18 @@ class EyeCore:
                 result['error'] = self._get_message('load_failed')
                 return result
             
-            result['dimensions'] = dimensions
+            # 2. Kép átméretezése
+            image = self._resize_image(image)
+            
+            # Frissített dimenziók
+            h, w = image.shape[:2]
+            channels = image.shape[2] if len(image.shape) > 2 else 1
+            result['dimensions'] = {'width': w, 'height': h, 'channels': channels}
             result['format'] = img_format
             
-            # 2. Gyorsítótár ellenőrzés
+            # 3. Gyorsítótár ellenőrzés
             cache_key = self._get_cache_key(image)
-            if self.config['cache_results'] and cache_key in self.cache:
+            if self.config['cache_results'] and cache_key and cache_key in self.cache:
                 cached = self.cache[cache_key]
                 if time.time() - cached['time'] < self.config['cache_ttl']:
                     result.update(cached['result'])
@@ -213,40 +363,43 @@ class EyeCore:
             
             self.state['cache_misses'] += 1
             
-            # 3. OCR (ha van)
+            # 4. OCR (ha van)
             if self.config['enable_ocr'] and TESSERACT_AVAILABLE:
                 ocr_text = self._perform_ocr(image)
                 if ocr_text:
                     result['ocr_text'] = ocr_text
                     self.state['ocr_performed'] += 1
             
-            # 4. Objektum detekció (ha van)
+            # 5. Objektum detekció (ha van)
             if self.config['enable_object_detection'] and self.object_model:
                 objects = self._detect_objects(image)
                 if objects:
                     result['objects'] = objects
                     self.state['objects_detected'] += len(objects)
             
-            # 5. Arc detekció (ha van)
-            if self.config['enable_face_detection'] and CV2_AVAILABLE:
+            # 6. Arc detekció (ha van)
+            if self.config['enable_face_detection'] and self.face_cascade:
                 faces = self._detect_faces(image)
                 if faces:
                     result['faces'] = faces
                     self.state['faces_detected'] += len(faces)
             
-            # 6. Leírás generálása
+            # 7. Leírás generálása
             result['description'] = self._generate_description(result)
             
-            # 7. Kép mentése (ha kell)
+            # 8. Kép mentése (ha kell)
             if self.config['save_uploaded']:
                 self._save_image(image, source)
             
             result['success'] = True
             
             # Gyorsítótárazás
-            if self.config['cache_results']:
+            if self.config['cache_results'] and cache_key:
+                # Ne tároljuk a teljes eredményt, csak a fontos részeket
+                cache_result = {k: v for k, v in result.items() 
+                               if k not in ['processing_time', 'timestamp', 'from_cache']}
                 self.cache[cache_key] = {
-                    'result': result,
+                    'result': cache_result,
                     'time': time.time()
                 }
             
@@ -271,7 +424,7 @@ class EyeCore:
             return None, '', {}
         
         # 1. Ha már numpy array (OpenCV kép)
-        if NP_AVAILABLE and isinstance(image_data, np.ndarray):
+        if isinstance(image_data, np.ndarray):
             h, w = image_data.shape[:2]
             channels = image_data.shape[2] if len(image_data.shape) > 2 else 1
             return image_data, 'array', {'width': w, 'height': h, 'channels': channels}
@@ -327,6 +480,7 @@ class EyeCore:
             # Méret ellenőrzés
             content_length = int(response.headers.get('content-length', 0))
             if content_length > self.config['max_url_size']:
+                print(f"👁️ URL kép túl nagy: {content_length} > {self.config['max_url_size']}")
                 return None, '', {}
             
             img_data = response.content
@@ -343,10 +497,10 @@ class EyeCore:
         
         return None, '', {}
     
-    def _get_cache_key(self, image) -> str:  # Típusannotáció nélkül
+    def _get_cache_key(self, image) -> Optional[str]:
         """Gyorsítótár kulcs generálása kép hash alapján"""
         if image is None or not NP_AVAILABLE:
-            return ''
+            return None
         
         try:
             # Kis méretű thumbnail a gyorsítótárhoz
@@ -355,24 +509,31 @@ class EyeCore:
             return hash_str
         except Exception as e:
             print(f"👁️ Cache key hiba: {e}")
-            return ''
+            return None
     
-    def _perform_ocr(self, image) -> str:  # Típusannotáció nélkül
+    def _perform_ocr(self, image) -> str:
         """
         OCR (Optical Character Recognition) - szövegfelismerés.
+        Több nyelv támogatásával.
         """
         if not TESSERACT_AVAILABLE or not CV2_AVAILABLE:
             return ""
         
         try:
             # Előfeldolgozás
-            gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+            if self.config['ocr_preprocess']:
+                processed = self._preprocess_for_ocr(image)
+            else:
+                processed = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
+            
+            # Nyelvek összefűzése
+            langs = '+'.join(self.config['ocr_languages'])
             
             # Szöveg felismerés
             text = pytesseract.image_to_string(
-                gray, 
-                lang=self.config['default_language'],
-                config='--psm 3'
+                processed, 
+                lang=langs,
+                config=f'--psm 3 --oem 3'
             )
             
             return text.strip()
@@ -380,28 +541,28 @@ class EyeCore:
             print(f"👁️ OCR hiba: {e}")
             return ""
     
-    def _detect_objects(self, image) -> List[Dict]:  # Típusannotáció nélkül
+    def _detect_objects(self, image) -> List[Dict]:
         """
         Objektum detekció.
         """
-        # Itt majd YOLO vagy más modell
+        # TODO: YOLO vagy más modell integráció
         return []
     
-    def _detect_faces(self, image) -> List[Dict]:  # Típusannotáció nélkül
+    def _detect_faces(self, image) -> List[Dict]:
         """
-        Arc detekció (ha van).
+        Arc detekció (Haar Cascade).
         """
-        if not CV2_AVAILABLE:
+        if not CV2_AVAILABLE or self.face_cascade is None:
             return []
         
         try:
-            # Haar Cascade használata
-            face_cascade = cv2.CascadeClassifier(
-                cv2.data.haarcascades + 'haarcascade_frontalface_default.xml'
-            )
-            
             gray = cv2.cvtColor(image, cv2.COLOR_BGR2GRAY)
-            faces = face_cascade.detectMultiScale(gray, 1.1, 4)
+            faces = self.face_cascade.detectMultiScale(
+                gray,
+                scaleFactor=self.config['face_scale_factor'],
+                minNeighbors=self.config['face_min_neighbors'],
+                minSize=self.config['face_min_size']
+            )
             
             result = []
             for (x, y, w, h) in faces:
@@ -461,14 +622,15 @@ class EyeCore:
         
         return " ".join(parts)
     
-    def _save_image(self, image, source: str):  # Típusannotáció nélkül
+    def _save_image(self, image, source: str):
         """Kép mentése (debug célra)"""
         if not CV2_AVAILABLE:
             return
         
         try:
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            filename = f"eye_{timestamp}_{source}.jpg"
+            safe_source = source.replace('/', '_').replace('\\', '_')[:50]
+            filename = f"eye_{timestamp}_{safe_source}.jpg"
             filepath = Path(self.config['upload_path']) / filename
             cv2.imwrite(str(filepath), image)
         except Exception as e:
@@ -559,16 +721,24 @@ class EyeCore:
             'config': {
                 'enable_ocr': self.config['enable_ocr'],
                 'enable_object_detection': self.config['enable_object_detection'],
-                'enable_face_detection': self.config['enable_face_detection']
+                'enable_face_detection': self.config['enable_face_detection'],
+                'ocr_languages': self.config['ocr_languages']
             }
         }
 
+
 # Teszt
 if __name__ == "__main__":
-    from scratchpad import Scratchpad
+    # Mock scratchpad a teszteléshez
+    class MockScratchpad:
+        def set_state(self, *args, **kwargs):
+            pass
+        def write(self, *args, **kwargs):
+            pass
     
-    s = Scratchpad()
+    s = MockScratchpad()
     eye = EyeCore(s)
+    eye.start()
     
     # Teszt (ha van kép)
     test_image = "test.jpg"
@@ -579,3 +749,5 @@ if __name__ == "__main__":
         print(eye.get_vision_context(test_image))
     else:
         print("No test image found.")
+    
+    eye.stop()
