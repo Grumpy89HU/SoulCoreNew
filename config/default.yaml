@@ -1,0 +1,62 @@
+# config/default.yaml
+# Alapértelmezett konfiguráció – a felhasználói config.yaml felülírhatja
+
+system:
+  name: "SoulCore"
+  version: "3.0"
+  environment: "development"
+  identity_file: "config/identity.inf"
+
+# Indítási sorrend
+start_order:
+  - scratchpad
+  - router
+  - orchestrator
+  - scribe
+  - valet
+  - queen
+  - king
+  - jester
+  - heartbeat
+  - gateway
+  - eyecore
+  - sentinel
+  - blackbox
+  - sandbox
+  - web
+
+shutdown_order:
+  - web
+  - sandbox
+  - blackbox
+  - sentinel
+  - eyecore
+  - gateway
+  - heartbeat
+  - jester
+  - king
+  - queen
+  - valet
+  - scribe
+  - orchestrator
+  - router
+  - database
+  - identity
+  - scratchpad
+
+# API szerver
+api:
+  enabled: true
+  host: "0.0.0.0"
+  port: 5001
+  ws_port: 5002
+
+# Web felület
+web:
+  enabled: true
+  host: "0.0.0.0"
+  port: 5000
+  static_enabled: true
+  static_host: "0.0.0.0"
+  static_port: 8000
+  web_root_path: "web"

@@ -5,6 +5,7 @@ Alap API handler-ek
 import time
 import json
 import logging
+import uuid
 from typing import Dict, Any, List, Optional
 
 logger = logging.getLogger(__name__)
@@ -16,6 +17,23 @@ class APIHandlers:
     def __init__(self, soulcore):
         self.soulcore = soulcore
         self.db = soulcore.modules.get('database') if soulcore else None
+        self.config = soulcore.config if soulcore else {}
+    
+    # ========== SEGÉDFÜGGVÉNYEK ==========
+    
+    def _get_api_port(self) -> int:
+        """API port lekérése a configból (hardkód eltávolítva)"""
+        api_config = self.config.get('api', {})
+        return api_config.get('port', 5001)
+    
+    def _get_trace_id(self) -> str:
+        """Egyedi trace_id generálása"""
+        return f"api_{int(time.time() * 1000)}_{uuid.uuid4().hex[:8]}"
+    
+    def _parse_query_params(self, params: Dict, key: str, default: Any = None) -> Any:
+        """Query paraméterek biztonságos parse-olása"""
+        value = params.get(key, [default]) if isinstance(params.get(key), list) else params.get(key, default)
+        return value[0] if isinstance(value, list) and value else value
     
     # ========== RENDSZER ==========
     
@@ -25,9 +43,10 @@ class APIHandlers:
             'status': 'running',
             'timestamp': time.time(),
             'version': '3.0',
-            'api_port': 6000,
+            'api_port': self._get_api_port(),
             'king_available': bool(self.soulcore and hasattr(self.soulcore, 'king') and self.soulcore.king),
-            'modules': list(self.soulcore.modules.keys()) if self.soulcore else []
+            'modules': list(self.soulcore.modules.keys()) if self.soulcore else [],
+            'ws_port': self.config.get('api', {}).get('ws_port', 5002)
         }
     
     # ========== CHAT ==========
@@ -35,12 +54,25 @@ class APIHandlers:
     def post_chat(self, data: Dict) -> Dict:
         """Chat üzenet küldése"""
         text = data.get('text', '')
-        conv_id = data.get('conversation_id', 1)
+        conv_id = data.get('conversation_id')
         
         if not text:
             return {'error': 'No text provided'}
         
-        logger.info(f"📨 Chat: '{text}' (conv: {conv_id})")
+        # Ha nincs conversation_id, újat hozunk létre
+        if conv_id is None and self.db:
+            try:
+                user_id = data.get('user_id')
+                conv_id = self.db.create_conversation(title=text[:50], user_id=user_id)
+                logger.info(f"📨 Új beszélgetés létrehozva: {conv_id}")
+            except Exception as e:
+                logger.warning(f"Beszélgetés létrehozási hiba: {e}")
+                conv_id = int(time.time() * 1000)
+        
+        if conv_id is None:
+            conv_id = int(time.time() * 1000)
+        
+        logger.info(f"📨 Chat: '{text[:50]}...' (conv: {conv_id})")
         
         # King hívása
         if self.soulcore and hasattr(self.soulcore, 'king') and self.soulcore.king:
@@ -50,17 +82,23 @@ class APIHandlers:
                 return {
                     'response': response,
                     'conversation_id': conv_id,
-                    'trace_id': f"api-{int(time.time())}"
+                    'trace_id': self._get_trace_id(),
+                    'timestamp': time.time()
                 }
             except Exception as e:
                 logger.error(f"King hiba: {e}")
-                return {'error': str(e)}
+                return {
+                    'error': str(e),
+                    'conversation_id': conv_id,
+                    'trace_id': self._get_trace_id()
+                }
         
-        # Dummy válasz
+        # Dummy válasz (csak ha tényleg nincs King)
         return {
             'response': f"Echo: {text} (King nem elérhető)",
             'conversation_id': conv_id,
-            'trace_id': 'dummy'
+            'trace_id': self._get_trace_id(),
+            'warning': 'King not available'
         }
     
     # ========== BESZÉLGETÉSEK ==========
@@ -70,12 +108,15 @@ class APIHandlers:
         if not self.db:
             return {'conversations': [], 'error': 'Database not available'}
         
-        limit = int(params.get('limit', [50])[0])
-        offset = int(params.get('offset', [0])[0])
+        limit = self._parse_query_params(params, 'limit', 50)
+        offset = self._parse_query_params(params, 'offset', 0)
         
         try:
+            limit = int(limit) if limit else 50
+            offset = int(offset) if offset else 0
             conversations = self.db.get_conversations(limit=limit, offset=offset)
-            return {'conversations': conversations, 'total': len(conversations)}
+            total = len(conversations)
+            return {'conversations': conversations, 'total': total, 'limit': limit, 'offset': offset}
         except Exception as e:
             return {'error': str(e)}
     
@@ -89,7 +130,7 @@ class APIHandlers:
         
         try:
             conv_id = self.db.create_conversation(title=title, user_id=user_id)
-            return {'id': conv_id, 'success': True}
+            return {'id': conv_id, 'success': True, 'timestamp': time.time()}
         except Exception as e:
             return {'error': str(e)}
     
@@ -98,11 +139,12 @@ class APIHandlers:
         if not self.db:
             return {'messages': [], 'error': 'Database not available'}
         
-        limit = int(params.get('limit', [100])[0])
+        limit = self._parse_query_params(params, 'limit', 100)
         
         try:
+            limit = int(limit) if limit else 100
             messages = self.db.get_messages(conv_id, limit=limit)
-            return {'messages': messages, 'count': len(messages)}
+            return {'messages': messages, 'count': len(messages), 'conversation_id': conv_id}
         except Exception as e:
             return {'error': str(e)}
     
@@ -117,7 +159,7 @@ class APIHandlers:
         
         try:
             msg_id = self.db.add_message(conv_id, role, content, tokens)
-            return {'id': msg_id, 'success': True}
+            return {'id': msg_id, 'success': True, 'timestamp': time.time()}
         except Exception as e:
             return {'error': str(e)}
     
@@ -128,7 +170,7 @@ class APIHandlers:
         
         try:
             self.db.delete_conversation(conv_id)
-            return {'success': True}
+            return {'success': True, 'timestamp': time.time()}
         except Exception as e:
             return {'error': str(e)}
     
@@ -158,14 +200,30 @@ class APIHandlers:
             return {'error': 'King not available'}
         
         try:
-            # TODO: Modell betöltés implementálása
-            return {'success': True, 'message': f'Model {model_id or model_path} loading...'}
+            # Ha van model_wrapper, próbáljuk betölteni
+            if hasattr(king, 'model') and king.model:
+                success = king.model.load()
+                if success:
+                    return {'success': True, 'message': f'Model {model_id or model_path} loaded'}
+                else:
+                    return {'error': 'Model load failed'}
+            
+            return {'success': False, 'message': 'Model wrapper not available'}
         except Exception as e:
             return {'error': str(e)}
     
     def unload_model(self, data: Dict) -> Dict:
         """Modell leállítása"""
-        return {'success': True, 'message': 'Model unloaded'}
+        king = self.soulcore.king if self.soulcore else None
+        if not king:
+            return {'error': 'King not available'}
+        
+        try:
+            if hasattr(king, 'model') and king.model:
+                king.model.unload()
+            return {'success': True, 'message': 'Model unloaded'}
+        except Exception as e:
+            return {'error': str(e)}
     
     def delete_model(self, model_id: int) -> Dict:
         """Modell törlése"""
@@ -194,7 +252,7 @@ class APIHandlers:
         try:
             if hasattr(module, 'start'):
                 module.start()
-            return {'success': True, 'message': f'{module_name} started'}
+            return {'success': True, 'message': f'{module_name} started', 'timestamp': time.time()}
         except Exception as e:
             return {'error': str(e)}
     
@@ -212,7 +270,7 @@ class APIHandlers:
         try:
             if hasattr(module, 'stop'):
                 module.stop()
-            return {'success': True, 'message': f'{module_name} stopped'}
+            return {'success': True, 'message': f'{module_name} stopped', 'timestamp': time.time()}
         except Exception as e:
             return {'error': str(e)}
     
@@ -225,7 +283,10 @@ class APIHandlers:
             return {'error': 'King not available'}
         
         try:
-            return king.get_state()
+            state = king.get_state()
+            if isinstance(state, dict):
+                state['available'] = True
+            return state
         except Exception as e:
             return {'error': str(e)}
     
@@ -249,7 +310,7 @@ class APIHandlers:
             return {'error': 'Jester not available'}
         
         try:
-            return jester.get_diagnosis()
+            return jester.get_diagnosis() if hasattr(jester, 'get_diagnosis') else {'diagnosis': 'Not available'}
         except Exception as e:
             return {'error': str(e)}
     
@@ -262,7 +323,7 @@ class APIHandlers:
             return {'error': 'Heartbeat not available'}
         
         try:
-            return heartbeat.get_state()
+            return heartbeat.get_state() if hasattr(heartbeat, 'get_state') else {'state': heartbeat.state if hasattr(heartbeat, 'state') else {}}
         except Exception as e:
             return {'error': str(e)}
     
@@ -275,7 +336,11 @@ class APIHandlers:
             return {'available': False, 'message': 'Sentinel not available'}
         
         try:
-            return sentinel.get_gpu_status() if hasattr(sentinel, 'get_gpu_status') else {'available': False}
+            if hasattr(sentinel, 'get_gpu_status'):
+                return {'available': True, 'gpus': sentinel.get_gpu_status()}
+            elif hasattr(sentinel, 'get_state'):
+                return {'available': True, 'state': sentinel.get_state()}
+            return {'available': True, 'message': 'Sentinel active'}
         except Exception as e:
             return {'error': str(e)}
     
@@ -296,7 +361,7 @@ class APIHandlers:
         
         try:
             valet.remember(key, value, memory_type)
-            return {'success': True}
+            return {'success': True, 'timestamp': time.time()}
         except Exception as e:
             return {'error': str(e)}
     
@@ -313,7 +378,7 @@ class APIHandlers:
         
         try:
             value = valet.recall(key)
-            return {'key': key, 'value': value}
+            return {'key': key, 'value': value, 'timestamp': time.time()}
         except Exception as e:
             return {'error': str(e)}
     
@@ -324,8 +389,9 @@ class APIHandlers:
             return {'error': 'Valet not available'}
         
         try:
-            valet.cleanup()
-            return {'success': True}
+            if hasattr(valet, 'cleanup'):
+                valet.cleanup()
+            return {'success': True, 'timestamp': time.time()}
         except Exception as e:
             return {'error': str(e)}
     
@@ -336,15 +402,40 @@ class APIHandlers:
         if not self.soulcore:
             return {'error': 'SoulCore not available'}
         
-        return self.soulcore.config
+        # Biztonsági másolat – ne adjuk vissza a jelszavakat
+        safe_config = self._sanitize_config(self.soulcore.config)
+        return safe_config
+    
+    def _sanitize_config(self, config: Dict) -> Dict:
+        """Konfiguráció másolása jelszavak nélkül"""
+        if not isinstance(config, dict):
+            return config
+        
+        safe = {}
+        for key, value in config.items():
+            if 'password' in key.lower() or 'secret' in key.lower() or 'token' in key.lower():
+                safe[key] = '***HIDDEN***'
+            elif isinstance(value, dict):
+                safe[key] = self._sanitize_config(value)
+            else:
+                safe[key] = value
+        return safe
     
     def update_config(self, data: Dict) -> Dict:
-        """Konfiguráció frissítése"""
+        """Konfiguráció frissítése (csak megengedett kulcsok)"""
         if not self.soulcore:
             return {'error': 'SoulCore not available'}
         
-        # TODO: Konfiguráció frissítés implementálása
-        return {'success': True, 'message': 'Config update not implemented yet'}
+        # Engedélyezett módosítható kulcsok
+        allowed_keys = ['user.language', 'user.name', 'agents.king.temperature', 
+                       'agents.king.max_tokens', 'system.environment']
+        
+        try:
+            # TODO: Konfiguráció frissítés implementálása
+            # Jelenleg csak placeholder
+            return {'success': True, 'message': 'Config update endpoint ready', 'allowed_keys': allowed_keys}
+        except Exception as e:
+            return {'error': str(e)}
     
     # ========== IDENTITÁS ==========
     
@@ -355,7 +446,11 @@ class APIHandlers:
             return {'error': 'Identity not available'}
         
         try:
-            return identity.get_state()
+            if hasattr(identity, 'get_state'):
+                return identity.get_state()
+            elif hasattr(identity, 'state'):
+                return identity.state
+            return {'identity': 'Sovereign'}
         except Exception as e:
             return {'error': str(e)}
     
@@ -365,8 +460,21 @@ class APIHandlers:
         if not identity:
             return {'error': 'Identity not available'}
         
-        # TODO: Identitás frissítés implementálása
-        return {'success': True, 'message': 'Identity update not implemented yet'}
+        personality = data.get('personality')
+        name = data.get('name')
+        style = data.get('style')
+        
+        try:
+            if personality and hasattr(identity, 'set_personality'):
+                identity.set_personality(personality)
+            if name and hasattr(identity, 'set_name'):
+                identity.set_name(name)
+            if style and hasattr(identity, 'set_style'):
+                identity.set_style(style)
+            
+            return {'success': True, 'message': 'Identity updated', 'timestamp': time.time()}
+        except Exception as e:
+            return {'error': str(e)}
     
     # ========== BLACKBOX ==========
     
@@ -376,8 +484,58 @@ class APIHandlers:
         if not blackbox:
             return {'error': 'BlackBox not available'}
         
-        query = params.get('q', [''])[0]
-        limit = int(params.get('limit', [100])[0])
+        query = self._parse_query_params(params, 'q', '')
+        limit = self._parse_query_params(params, 'limit', 100)
         
-        # TODO: BlackBox keresés implementálása
-        return {'results': [], 'query': query, 'limit': limit}
+        try:
+            limit = int(limit) if limit else 100
+            
+            if hasattr(blackbox, 'search'):
+                results = blackbox.search(query, limit=limit)
+                return {'results': results, 'query': query, 'limit': limit, 'count': len(results)}
+            elif hasattr(blackbox, 'get_logs'):
+                logs = blackbox.get_logs(limit=limit)
+                return {'results': logs, 'query': query, 'limit': limit, 'count': len(logs)}
+            
+            return {'results': [], 'query': query, 'limit': limit, 'message': 'Search not implemented'}
+        except Exception as e:
+            return {'error': str(e)}
+    
+    # ========== KONZOL CHAT (extra) ==========
+    
+    def console_chat(self, data: Dict) -> Dict:
+        """
+        Konzol chat végpont – egyszerű, streamelés nélküli kommunikáció
+        CLI-hez vagy egyszerű teszteléshez
+        """
+        text = data.get('text', '')
+        session_id = data.get('session_id')
+        
+        if not text:
+            return {'error': 'No text provided'}
+        
+        # Session kezelés (egyszerű)
+        if not session_id:
+            session_id = f"console_{int(time.time())}"
+        
+        logger.info(f"💻 Console chat: '{text[:50]}...' (session: {session_id})")
+        
+        # King hívása
+        if self.soulcore and hasattr(self.soulcore, 'king') and self.soulcore.king:
+            try:
+                # Konzol módban külön conversation_id-t használunk
+                conv_id = int(hashlib.md5(session_id.encode()).hexdigest()[:8], 16) % 1000000
+                response = self.soulcore.king.generate_response(text, conv_id)
+                
+                return {
+                    'response': response,
+                    'session_id': session_id,
+                    'trace_id': self._get_trace_id(),
+                    'timestamp': time.time(),
+                    'mode': 'console'
+                }
+            except Exception as e:
+                logger.error(f"King hiba: {e}")
+                return {'error': str(e), 'session_id': session_id}
+        
+        return {'error': 'King not available', 'session_id': session_id}

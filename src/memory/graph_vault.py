@@ -3,11 +3,12 @@ Graph-Vault module for SoulCore - Neo4j based relationship and emotional memory.
 """
 
 import os
+import json
 import logging
 import uuid
 from typing import Dict, List, Any, Optional, Tuple
 from dataclasses import dataclass, asdict
-from datetime import datetime
+from datetime import datetime, timedelta
 
 try:
     from neo4j import GraphDatabase, AsyncGraphDatabase
@@ -137,13 +138,17 @@ class GraphVault:
                 session.run("CREATE CONSTRAINT IF NOT EXISTS FOR (n:Person) REQUIRE n.uuid IS UNIQUE")
                 session.run("CREATE CONSTRAINT IF NOT EXISTS FOR (n:Concept) REQUIRE n.uuid IS UNIQUE")
                 session.run("CREATE CONSTRAINT IF NOT EXISTS FOR (n:Topic) REQUIRE n.name IS UNIQUE")
+                session.run("CREATE CONSTRAINT IF NOT EXISTS FOR (n:Entity) REQUIRE n.name IS UNIQUE")
                 
                 # Indexes
                 session.run("CREATE INDEX IF NOT EXISTS FOR (n:Person) ON (n.name)")
                 session.run("CREATE INDEX IF NOT EXISTS FOR (n:Concept) ON (n.name)")
                 session.run("CREATE INDEX IF NOT EXISTS FOR (n:Memory) ON (n.created_at)")
                 session.run("CREATE INDEX IF NOT EXISTS FOR (n:Topic) ON (n.name)")
+                session.run("CREATE INDEX IF NOT EXISTS FOR (n:Entity) ON (n.name)")
                 session.run("CREATE INDEX IF NOT EXISTS FOR ()-[r:MENTIONS]-() ON (r.emotional_charge)")
+                session.run("CREATE INDEX IF NOT EXISTS FOR ()-[r:RELATED_TO]-() ON (r.emotional_charge)")
+                
         except Exception as e:
             logger.error(f"Failed to create constraints/indexes: {e}")
     
@@ -153,6 +158,34 @@ class GraphVault:
             self._driver.close()
         if self._async_driver:
             self._async_driver.close()
+    
+    # ========== SEGÉDFÜGGVÉNYEK ==========
+    
+    def _safe_json_loads(self, data: Any, default: Dict = None) -> Dict:
+        """Biztonságos JSON betöltés"""
+        if default is None:
+            default = {}
+        if data is None:
+            return default
+        if isinstance(data, dict):
+            return data
+        if isinstance(data, str):
+            try:
+                return json.loads(data)
+            except:
+                return default
+        return default
+    
+    def _safe_json_dumps(self, data: Any) -> str:
+        """Biztonságos JSON mentés"""
+        if data is None:
+            return "{}"
+        if isinstance(data, str):
+            return data
+        try:
+            return json.dumps(data, default=str)
+        except:
+            return "{}"
     
     # ========== NODE MŰVELETEK ==========
     
@@ -175,7 +208,7 @@ class GraphVault:
                     """.format(node_type=node.node_type.capitalize()),
                     uuid=node.uuid,
                     name=node.name,
-                    properties=json.dumps(node.properties),
+                    properties=self._safe_json_dumps(node.properties),
                     created_at=node.created_at.isoformat(),
                     updated_at=node.updated_at.isoformat()
                 )
@@ -202,12 +235,12 @@ class GraphVault:
                 record = result.single()
                 if record:
                     node_data = record['n']
-                    node_type = record['node_type'].lower()
+                    node_type = record['node_type'].lower() if record['node_type'] else 'unknown'
                     return RelationshipNode(
-                        uuid=node_data['uuid'],
+                        uuid=node_data.get('uuid', uuid),
                         name=node_data.get('name', ''),
                         node_type=node_type,
-                        properties=json.loads(node_data.get('properties', '{}')),
+                        properties=self._safe_json_loads(node_data.get('properties')),
                         created_at=datetime.fromisoformat(node_data.get('created_at', datetime.now().isoformat())),
                         updated_at=datetime.fromisoformat(node_data.get('updated_at', datetime.now().isoformat()))
                     )
@@ -243,12 +276,12 @@ class GraphVault:
                 record = result.single()
                 if record:
                     node_data = record['n']
-                    node_type_val = record['node_type'].lower()
+                    node_type_val = record['node_type'].lower() if record['node_type'] else 'unknown'
                     return RelationshipNode(
-                        uuid=node_data['uuid'],
+                        uuid=node_data.get('uuid', ''),
                         name=node_data.get('name', ''),
                         node_type=node_type_val,
-                        properties=json.loads(node_data.get('properties', '{}')),
+                        properties=self._safe_json_loads(node_data.get('properties')),
                         created_at=datetime.fromisoformat(node_data.get('created_at', datetime.now().isoformat())),
                         updated_at=datetime.fromisoformat(node_data.get('updated_at', datetime.now().isoformat()))
                     )
@@ -286,12 +319,12 @@ class GraphVault:
                 nodes = []
                 for record in result:
                     node_data = record['n']
-                    node_type_val = record['node_type'].lower()
+                    node_type_val = record['node_type'].lower() if record['node_type'] else 'unknown'
                     nodes.append(RelationshipNode(
-                        uuid=node_data['uuid'],
+                        uuid=node_data.get('uuid', ''),
                         name=node_data.get('name', ''),
                         node_type=node_type_val,
-                        properties=json.loads(node_data.get('properties', '{}')),
+                        properties=self._safe_json_loads(node_data.get('properties')),
                         created_at=datetime.fromisoformat(node_data.get('created_at', datetime.now().isoformat())),
                         updated_at=datetime.fromisoformat(node_data.get('updated_at', datetime.now().isoformat()))
                     ))
@@ -308,7 +341,6 @@ class GraphVault:
         try:
             with self._driver.session() as session:
                 if cascade:
-                    # Delete node and all its relationships
                     result = session.run(
                         """
                         MATCH (n {uuid: $uuid})
@@ -318,7 +350,6 @@ class GraphVault:
                         uuid=uuid
                     )
                 else:
-                    # Delete only if no relationships
                     result = session.run(
                         """
                         MATCH (n {uuid: $uuid})
@@ -365,7 +396,7 @@ class GraphVault:
                     target_uuid=edge.target_uuid,
                     emotional_charge=edge.emotional_charge,
                     weight=edge.weight,
-                    properties=json.dumps(edge.properties),
+                    properties=self._safe_json_dumps(edge.properties),
                     created_at=edge.created_at.isoformat(),
                     last_accessed=edge.last_accessed.isoformat()
                 )
@@ -416,14 +447,19 @@ class GraphVault:
                 edges = []
                 for record in result:
                     rel_data = record['r']
+                    connected = record['connected']
                     edges.append({
-                        'connected_node': dict(record['connected']),
+                        'connected_node': {
+                            'uuid': connected.get('uuid'),
+                            'name': connected.get('name'),
+                            'labels': list(connected.labels) if connected.labels else []
+                        },
                         'relationship_type': record['rel_type'],
                         'source_uuid': record['source_uuid'],
                         'target_uuid': record['target_uuid'],
                         'emotional_charge': rel_data.get('emotional_charge', 0.0),
                         'weight': rel_data.get('weight', 0.5),
-                        'properties': json.loads(rel_data.get('properties', '{}')),
+                        'properties': self._safe_json_loads(rel_data.get('properties')),
                         'created_at': rel_data.get('created_at'),
                         'last_accessed': rel_data.get('last_accessed')
                     })
@@ -470,20 +506,22 @@ class GraphVault:
         
         try:
             with self._driver.session() as session:
+                # Először próbáljuk concept-ként
                 concept = self.get_node_by_name(concept_name, 'concept')
                 if not concept:
-                    # Try as topic
                     concept = self.get_node_by_name(concept_name, 'topic')
                 if not concept:
                     return {'emotional_charge': 0.0, 'related_concepts': [], 'confidence': 0.0}
                 
-                query = f"""
-                MATCH (c {{uuid: $uuid}})-[r*1..{max_depth}]-(connected)
+                query = """
+                MATCH path = (c {uuid: $uuid})-[r*1..{max_depth}]-(connected)
                 WHERE connected:Memory OR connected:Concept OR connected:Topic
-                RETURN connected, r, 
-                       avg([rel in r | rel.emotional_charge]) as avg_charge,
-                       sum([rel in r | rel.weight]) as total_weight
-                """
+                RETURN connected, 
+                       reduce(charge = 0.0, rel IN r | charge + coalesce(rel.emotional_charge, 0.0)) / size(r) as avg_charge,
+                       reduce(w = 0.0, rel IN r | w + coalesce(rel.weight, 0.0)) as total_weight
+                LIMIT 20
+                """.format(max_depth=max_depth)
+                
                 result = session.run(query, uuid=concept.uuid)
                 
                 charges = []
@@ -494,10 +532,11 @@ class GraphVault:
                         charges.append(record['avg_charge'])
                     if record['connected']:
                         connected = record['connected']
+                        rel_type = list(connected.labels)[0] if connected.labels else 'unknown'
                         related.append({
                             'name': connected.get('name', ''),
                             'uuid': connected.get('uuid', ''),
-                            'type': list(connected.labels)[0] if connected.labels else 'unknown',
+                            'type': rel_type.lower(),
                             'charge': record['avg_charge'] if record['avg_charge'] else 0.0
                         })
                 
@@ -512,6 +551,22 @@ class GraphVault:
             logger.error(f"Failed to get emotional context: {e}")
             return {'emotional_charge': 0.0, 'related_concepts': [], 'confidence': 0.0}
     
+    def get_emotional_charge(self, topic: str) -> Optional[float]:
+        """
+        Egy adott téma érzelmi töltésének lekérése.
+        A King ezt használja a hangulatfüggő válaszadáshoz.
+        """
+        context = self.get_emotional_context(topic, max_depth=1)
+        return context.get('emotional_charge', 0.0)
+    
+    def get_related_topics(self, topic: str, limit: int = 5) -> List[str]:
+        """
+        Kapcsolódó témák lekérése.
+        """
+        context = self.get_emotional_context(topic, max_depth=1)
+        related = context.get('related_concepts', [])
+        return [r.get('name', '') for r in related[:limit] if r.get('name')]
+    
     def get_recent_interactions(self, person_uuid: str, limit: int = 10) -> List[Dict[str, Any]]:
         """Get recent interactions involving a person"""
         if not self._enabled or not self._driver:
@@ -519,12 +574,6 @@ class GraphVault:
         
         try:
             with self._driver.session() as session:
-                # Először ellenőrizzük, hogy létezik-e a Person node
-                person = self.get_node(person_uuid)
-                if not person or person.node_type != 'person':
-                    logger.warning(f"Person not found: {person_uuid}")
-                    return []
-                
                 result = session.run(
                     """
                     MATCH (p:Person {uuid: $uuid})-[r:MENTIONS|INTERACTS_WITH]-(m:Memory)
@@ -696,7 +745,8 @@ class GraphVault:
         try:
             with self._driver.session() as session:
                 if node_type:
-                    query = f"MATCH (n:{node_type.capitalize()}) RETURN count(n) as count"
+                    node_type_cap = node_type.capitalize()
+                    query = f"MATCH (n:{node_type_cap}) RETURN count(n) as count"
                 else:
                     query = "MATCH (n) RETURN count(n) as count"
                 
@@ -739,11 +789,6 @@ class GraphVault:
                 for node_type in self.NODE_TYPES
             }
         }
-
-
-# Import JSON for serialization
-import json
-from datetime import timedelta
 
 
 # Teszt

@@ -103,10 +103,10 @@ class King:
         
         # Identitás
         self.identity = {
-            'name': 'assistant',
-            'title': 'The Sovereign',
-            'personality': 'wise, curious, sovereign',
-            'style': 'default'
+            'name': self.config.get('name', 'assistant'),
+            'title': self.config.get('title', 'The Sovereign'),
+            'personality': self.config.get('personality', 'wise, curious, sovereign'),
+            'style': self.config.get('style', 'default')
         }
         
         # Válaszok gyűjtője a szolgáktól (broadcast módhoz)
@@ -115,21 +115,29 @@ class King:
         
         # Kontextus cache
         self.context_cache = {}
-        self.cache_ttl = 300
+        self.cache_ttl = self.config.get('cache_ttl', 300)
         
         # Legutóbbi válaszok
         self.recent_responses = deque(maxlen=10)
         
-        # Generálási paraméterek
+        # Generálási paraméterek (configból)
+        gen_params = self.config.get('generation_params', {})
         self.generation_params = {
-            'max_tokens': 256,
-            'temperature': 0.7,
-            'top_p': 0.9,
-            'top_k': 40,
-            'repeat_penalty': 1.1,
-            'frequency_penalty': 0.0,
-            'presence_penalty': 0.0
+            'max_tokens': gen_params.get('max_tokens', 128),
+            'temperature': gen_params.get('temperature', 0.7),
+            'top_p': gen_params.get('top_p', 0.8),
+            'top_k': gen_params.get('top_k', 20),
+            'repeat_penalty': gen_params.get('repeat_penalty', 1.1),
+            'frequency_penalty': gen_params.get('frequency_penalty', 0.0),
+            'presence_penalty': gen_params.get('presence_penalty', 0.0)
         }
+        
+        # Belső monológ beállítás (alapból kikapcsolva a sebességért)
+        self.enable_internal_monologue = self.config.get('enable_internal_monologue', False)
+        
+        # Broadcast mód beállítás (alapból kikapcsolva a sebességért)
+        # Ha nincs szükség Scribe/Valet/Queen-re, kapcsold ki!
+        self.enable_broadcast = self.config.get('enable_broadcast', False)
         
         # Válasz callback (WebApp felé)
         self.response_callback = None
@@ -137,7 +145,7 @@ class King:
         # Valet, Queen és Graph-Vault hivatkozások
         self.valet = None
         self.queen = None
-        self.graph_vault = None  # Érzelmi töltés lekérdezéshez
+        self.graph_vault = None
         
         # Ha van busz, feliratkozunk
         if self.bus:
@@ -148,7 +156,7 @@ class King:
             threading.Thread(target=self._load_model, daemon=True).start()
         
         print("👑 King: Király trónra lépett.")
-        if self.bus:
+        if self.bus and self.enable_broadcast:
             print("👑 King: Broadcast módban működöm.")
         else:
             print("👑 King: Hagyományos módban működöm.")
@@ -198,7 +206,7 @@ class King:
             return
         
         # Válasz generálása
-        response = self._generate_response(prompt)
+        response = self._generate_response_direct(prompt)
         
         # Callback a WebApp felé (ha van)
         if self.response_callback:
@@ -276,7 +284,6 @@ class King:
                 context['summary'] = ctx.get('summary', '')
                 context['facts'] = ctx.get('facts', [])
                 context['emotional_charge'] = ctx.get('emotional_charge', 0.0)
-                # Validációs warning átvétele
                 if payload.get('validation_warning'):
                     context['validation_warning'] = payload.get('validation_warning')
             
@@ -295,20 +302,7 @@ class King:
         print("👑 King: Graph-Vault kapcsolódva (érzelmi kontextus)")
     
     def _get_emotional_context(self, topic: str) -> Dict:
-        """
-        Érzelmi kontextus lekérése a Graph-Vaultból.
-        
-        A dokumentum XXXVIII. fejezete szerint:
-        "A King a válaszadás előtt leolvassa ezt a térképet, és eszerint igazítja a hangvételét."
-        
-        Returns:
-            {
-                'charge': float,  # -1.0 .. 1.0
-                'mood': str,      # 'positive', 'negative', 'neutral'
-                'warning': str,   # figyelmeztetés ha negatív
-                'related_topics': list
-            }
-        """
+        """Érzelmi kontextus lekérése a Graph-Vaultból"""
         result = {
             'charge': 0.0,
             'mood': 'neutral',
@@ -320,7 +314,6 @@ class King:
             return result
         
         try:
-            # Lekérjük a téma érzelmi töltését
             if hasattr(self.graph_vault, 'get_emotional_charge'):
                 charge = self.graph_vault.get_emotional_charge(topic)
                 if charge is not None:
@@ -331,7 +324,6 @@ class King:
                         result['mood'] = 'negative'
                         result['warning'] = f"⚠️ Topic '{topic}' has negative emotional charge ({charge:.2f}). Respond carefully."
             
-            # Lekérjük a kapcsolódó témákat
             if hasattr(self.graph_vault, 'get_related_topics'):
                 related = self.graph_vault.get_related_topics(topic, limit=3)
                 if related:
@@ -365,9 +357,9 @@ class King:
     def process_user_message(self, user_text: str, trace_id: str = None, conversation_id: int = None) -> str:
         """
         Felhasználói üzenet feldolgozása BROADCAST móddal.
-        Ha van busz, ezt használja.
+        Csak akkor használjuk, ha tényleg szükség van a szolgákra.
         """
-        if not self.bus:
+        if not self.bus or not self.enable_broadcast:
             return self.generate_response(user_text, trace_id, conversation_id)
         
         if not trace_id:
@@ -380,27 +372,27 @@ class King:
         self.state.status = 'processing'
         self.state.current_task = trace_id
         
-        # 1. Értelmezés
+        # Értelmezés
         interpretation = self._interpret(user_text)
         
-        # 2. Meghatározzuk, kikre van szükség
+        # Meghatározzuk, kikre van szükség
         required_agents = self._determine_required_agents(interpretation)
         
-        # 3. Broadcast
+        # Broadcast
         decree = self._create_royal_decree(trace_id, user_text, interpretation, required_agents)
         self.bus.broadcast(decree)
         
-        # 4. Várunk a válaszokra
+        # Várunk a válaszokra
         responses = self._wait_for_responses(trace_id, required_agents, timeout=5.0)
         
-        # 5. Válasz generálása (belső monológ is)
+        # Válasz generálása
         response_text = self._generate_response_with_context(user_text, interpretation, responses)
         
-        # 6. Állapot frissítés
+        # Állapot frissítés
         processing_time = time.time() - start_time
         self._update_state(response_text, processing_time, len(response_text.split()), responses, interpretation)
         
-        # 7. Callback
+        # Callback
         if self.response_callback:
             conv_id = conversation_id if conversation_id is not None else self.state.current_conversation_id
             if conv_id is None:
@@ -424,7 +416,7 @@ class King:
         return required
     
     def _generate_response_with_context(self, user_text: str, interpretation: Dict, responses: Dict) -> str:
-        """Válasz generálása a szolgák válaszaival + belső monológ"""
+        """Válasz generálása a szolgák válaszaival + opcionális belső monológ"""
         context = self._extract_context_from_responses(responses)
         
         # Érzelmi kontextus lekérése a Graph-Vaultból
@@ -438,27 +430,28 @@ class King:
         
         prompt = self._build_response_prompt(user_text, interpretation, context, emotional_context)
         
-        # Belső monológ generálása (Jester olvassa)
-        try:
-            mood_str = emotional_context.get('mood', 'neutral')
-            internal_prompt = f"""Generate an internal monologue (1-2 sentences) about how you feel about this user message.
+        # Belső monológ CSAK HA BE VAN KAPCSOLVA
+        if self.enable_internal_monologue:
+            try:
+                mood_str = emotional_context.get('mood', 'neutral')
+                internal_prompt = f"""Generate an internal monologue (1-2 sentences) about how you feel about this user message.
 Emotional context of the topic: {mood_str} (charge: {emotional_context.get('charge', 0):.2f})
 User message: {user_text}"""
-            
-            internal_monologue = self.model.generate(
-                prompt=internal_prompt,
-                max_tokens=100,
-                temperature=0.7
-            )
-            self.scratchpad.write_note('king', 'internal_monologue', {
-                'text': internal_monologue,
-                'timestamp': time.time(),
-                'emotional_charge': emotional_context.get('charge', 0),
-                'topic': topic,
-                'in_response_to': user_text[:100]
-            })
-        except Exception as e:
-            self.state.errors.append(f"Internal monologue error: {e}")
+                
+                internal_monologue = self.model.generate(
+                    prompt=internal_prompt,
+                    max_tokens=100,
+                    temperature=0.7
+                )
+                self.scratchpad.write_note('king', 'internal_monologue', {
+                    'text': internal_monologue,
+                    'timestamp': time.time(),
+                    'emotional_charge': emotional_context.get('charge', 0),
+                    'topic': topic,
+                    'in_response_to': user_text[:100]
+                })
+            except Exception as e:
+                self.state.errors.append(f"Internal monologue error: {e}")
         
         # Válasz generálása
         try:
@@ -470,7 +463,6 @@ User message: {user_text}"""
                 top_k=self.generation_params['top_k'],
                 repeat_penalty=self.generation_params['repeat_penalty']
             )
-            # Visszaállítjuk az eredeti temperature-t
             self.generation_params['temperature'] = original_temperature
             return response.strip()
         except Exception as e:
@@ -485,7 +477,7 @@ User message: {user_text}"""
         
         parts = []
         
-        # ÉRZELMI KONTEXTUS BLOKK (dokumentum XXXVIII.)
+        # ÉRZELMI KONTEXTUS BLOKK
         if emotional_context:
             if emotional_context.get('warning'):
                 parts.append(emotional_context['warning'])
@@ -540,7 +532,7 @@ User message: {user_text}"""
         user_text = payload.get('text', '')
         conversation_id = payload.get('conversation_id')
         
-        if self.bus:
+        if self.bus and self.enable_broadcast:
             response_text = self.process_user_message(user_text, trace_id, conversation_id)
             
             return {
@@ -561,7 +553,7 @@ User message: {user_text}"""
         return self._process_request_legacy(request)
     
     def _process_request_legacy(self, request: Dict) -> Dict:
-        """Régi feldolgozó mód (kompatibilitás)"""
+        """Régi feldolgozó mód (kompatibilitás) - OPTIMALIZÁLVA"""
         start_time = time.time()
         
         trace_id = request.get('trace_id', str(uuid.uuid4()))
@@ -584,13 +576,14 @@ User message: {user_text}"""
             conversation_history = payload.get('conversation_history', [])
             
             prompt = self._build_prompt_cached(user_text, rag_context, conversation_history)
-            response_text = self._generate_response(prompt)
+            response_text = self._generate_response_direct(prompt)
             
             processing_time = time.time() - start_time
             tokens_used = len(response_text.split())
             
             self._update_state(response_text, processing_time, tokens_used, {}, None)
             
+            # 🔥 HIÁNYZOTT CALLBACK - MOST MEGVAN!
             if self.response_callback:
                 conversation_id = payload.get('conversation_id')
                 if conversation_id is None:
@@ -619,13 +612,19 @@ User message: {user_text}"""
                          conversation_id: int = None,
                          conversation_history: List[Dict] = None,
                          rag_context: Dict = None) -> str:
-        """Egyszerű belépési pont a WebApp számára (régi API)"""
+        """
+        Egyszerű belépési pont a WebApp számára.
+        
+        OPTIMALIZÁLVA: Csak akkor használ broadcast módot, ha be van kapcsolva.
+        """
         if not trace_id:
             trace_id = str(uuid.uuid4())
         
-        if self.bus:
+        # Broadcast mód HASZNÁLATA CSAK HA BE VAN KAPCSOLVA
+        if self.bus and self.enable_broadcast:
             return self.process_user_message(user_text, trace_id, conversation_id)
         
+        # KÜLÖNBEN HASZNÁLJUK A GYORS, KÖZVETLEN MÓDSZERT
         request = {
             "type": "king_request",
             "target": "king",
@@ -684,7 +683,7 @@ User message: {user_text}"""
     # ========== MEGLÉVŐ SEGÉDFÜGGVÉNYEK ==========
     
     def _interpret(self, text: str) -> Dict:
-        """King értelmezi a kérést"""
+        """King értelmezi a kérést (broadcast módban használjuk)"""
         prompt = f"""Analyze this user message and extract intent and entities.
 
 Message: {text}
@@ -763,7 +762,9 @@ Return JSON:
             hist_str = str([m.get('content', '') for m in conversation_history[-3:]])
             history_hash = hashlib.md5(hist_str.encode()).hexdigest()[:8]
         
-        cache_key = hashlib.md5(f"{user_text}_{language}_{style}_{rag_hash}_{history_hash}".encode()).hexdigest()
+        # Optimalizált hash kulcs
+        cache_tuple = (user_text, language, style, rag_hash, history_hash)
+        cache_key = hashlib.md5(str(cache_tuple).encode()).hexdigest()
         
         if cache_key in self.context_cache:
             cached_time, cached_prompt = self.context_cache[cache_key]
@@ -838,43 +839,21 @@ Return JSON:
         hu, en = instructions.get(style, ('', ''))
         return hu if language == 'hu' else en
     
-    def _generate_response(self, prompt: str) -> str:
+    def _generate_response_direct(self, prompt: str) -> str:
+        """Közvetlen generálás thread overhead nélkül"""
         if self.model and self.state.model_loaded:
             try:
-                import queue
-                result_queue = queue.Queue()
-                
-                def generate_thread():
-                    try:
-                        response = self.model.generate(
-                            prompt=prompt,
-                            max_tokens=self.generation_params.get('max_tokens', 256),
-                            temperature=self.generation_params.get('temperature', 0.7),
-                            top_p=self.generation_params.get('top_p', 0.9),
-                            top_k=self.generation_params.get('top_k', 40),
-                            repeat_penalty=self.generation_params.get('repeat_penalty', 1.1)
-                        )
-                        result_queue.put(('success', response))
-                    except Exception as e:
-                        result_queue.put(('error', str(e)))
-                
-                thread = threading.Thread(target=generate_thread)
-                thread.daemon = True
-                thread.start()
-                thread.join(timeout=30)
-                
-                if thread.is_alive():
-                    return self._get_message('timeout')
-                
-                try:
-                    status, result = result_queue.get_nowait()
-                    if status == 'success':
-                        return result
-                    return self._get_message('error', error=result)
-                except queue.Empty:
-                    return self._get_message('error', error='Empty queue')
-                    
+                response = self.model.generate(
+                    prompt=prompt,
+                    max_tokens=self.generation_params.get('max_tokens', 128),
+                    temperature=self.generation_params.get('temperature', 0.7),
+                    top_p=self.generation_params.get('top_p', 0.8),
+                    top_k=self.generation_params.get('top_k', 20),
+                    repeat_penalty=self.generation_params.get('repeat_penalty', 1.1)
+                )
+                return response.strip()
             except Exception as e:
+                self.state.errors.append(str(e))
                 return self._get_message('error', error=str(e))
         
         elif self.model and not self.state.model_loaded:
@@ -882,6 +861,10 @@ Return JSON:
         
         else:
             return self._get_dummy_response(prompt)
+    
+    def _generate_response(self, prompt: str) -> str:
+        """Régi generálás (kompatibilitás)"""
+        return self._generate_response_direct(prompt)
     
     def _get_dummy_response(self, prompt: str) -> str:
         prompt_lower = prompt.lower()
@@ -941,7 +924,7 @@ Return JSON:
         else:
             self.state.average_response_time = self.state.average_response_time * 0.9 + processing_time * 0.1
         
-        # Érzelmi kontextus frissítése a Graph-Vaultban (ha van conversation_id)
+        # Érzelmi kontextus frissítése a Graph-Vaultban
         if self.graph_vault and self.state.current_conversation_id:
             try:
                 emotional_charge = self._estimate_emotional_charge(response_text)
@@ -1040,20 +1023,15 @@ Return only the code, no explanation."""
             return None
     
     def _extract_code(self, response: str) -> str:
-        """
-        Kód kinyerése a modell válaszából.
-        """
-        # Keresünk ```python ... ``` blokkokat
+        """Kód kinyerése a modell válaszából."""
         code_match = re.search(r'```python\s*(.*?)\s*```', response, re.DOTALL)
         if code_match:
             return code_match.group(1).strip()
         
-        # Keresünk ``` ... ``` blokkokat
         code_match = re.search(r'```\s*(.*?)\s*```', response, re.DOTALL)
         if code_match:
             return code_match.group(1).strip()
         
-        # Ha nincs kódblokk, az egész válasz a kód
         return response.strip()
     
     # ========== PUBLIKUS API ==========

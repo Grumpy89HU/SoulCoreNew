@@ -10,7 +10,8 @@ import logging
 import socket
 import hashlib
 import base64
-from typing import Dict, Set, Optional, Callable
+import uuid
+from typing import Dict, Set, Optional, Callable, Any
 from dataclasses import dataclass, field
 from queue import Queue
 
@@ -27,6 +28,8 @@ class WebSocketConnection:
     last_activity: float
     send_queue: Queue = field(default_factory=Queue)
     subscribed_topics: set = field(default_factory=set)
+    user_id: Optional[int] = None
+    conversation_id: Optional[int] = None
 
 
 class WebSocketHandler:
@@ -43,10 +46,17 @@ class WebSocketHandler:
     OP_PING = 0x9
     OP_PONG = 0xA
     
-    def __init__(self, soulcore, host='0.0.0.0', port=5002):
+    def __init__(self, soulcore, host: str = None, port: int = None):
         self.soulcore = soulcore
-        self.host = host
-        self.port = port
+        self.config = soulcore.config if soulcore else {}
+        
+        # Konfigurációból olvasott értékek (hardkód eltávolítva)
+        api_config = self.config.get('api', {})
+        ws_config = api_config.get('websocket', {})
+        
+        self.host = host or ws_config.get('host', api_config.get('host', '0.0.0.0'))
+        self.port = port or ws_config.get('port', api_config.get('ws_port', 5002))
+        
         self.connections: Dict[str, WebSocketConnection] = {}
         self.connection_lock = threading.RLock()
         self.running = False
@@ -61,6 +71,9 @@ class WebSocketHandler:
         
         # King callback
         self.king_callback_set = False
+        
+        # Aktuális beszélgetés ID-k nyomon követése
+        self.client_conversations: Dict[str, int] = {}
     
     # ========== SZERVER INDÍTÁS/LEÁLLÍTÁS ==========
     
@@ -110,26 +123,39 @@ class WebSocketHandler:
         print("🔌 WebSocket szerver leállítva")
     
     def _setup_king_callback(self):
-        """King válasz callback beállítása"""
+        """King válasz callback beállítása - BIZTONSÁGOS: csak a megfelelő kliens kapja"""
         if not self.soulcore or not hasattr(self.soulcore, 'king'):
             return
         
         king = self.soulcore.king
         
         def king_response_callback(response_text, conversation_id, trace_id):
-            """King válaszának továbbítása a WebSocket-en"""
-            self.broadcast_to_conversation(conversation_id, {
-                'type': 'chat:response',
-                'text': response_text,
-                'conversation_id': conversation_id,
-                'trace_id': trace_id,
-                'timestamp': time.time()
-            })
+            """King válaszának továbbítása a megfelelő kliensnek"""
+            # Megkeressük, melyik klienshez tartozik ez a conversation_id
+            target_client = None
+            with self.connection_lock:
+                for client_id, conn in self.connections.items():
+                    if conn.conversation_id == conversation_id:
+                        target_client = client_id
+                        break
+            
+            if target_client:
+                self.send_to(target_client, {
+                    'type': 'chat:response',
+                    'text': response_text,
+                    'conversation_id': conversation_id,
+                    'trace_id': trace_id,
+                    'timestamp': time.time()
+                })
+                logger.info(f"🔌 King válasz küldve a {conversation_id} beszélgetéshez (client:{target_client[:8]})")
+            else:
+                # Ha nincs ilyen kliens, naplózzuk, de ne küldjünk senkinek
+                logger.warning(f"🔌 King válasz nem lett elküldve: nincs kliens a {conversation_id} beszélgetéshez")
         
         if hasattr(king, 'set_response_callback'):
             king.set_response_callback(king_response_callback)
             self.king_callback_set = True
-            logger.info("🔌 King callback beállítva a WebSocket-hez")
+            logger.info("🔌 King callback beállítva a WebSocket-hez (biztonságos mód)")
     
     # ========== KAPCSOLAT KEZELÉS ==========
     
@@ -156,6 +182,8 @@ class WebSocketHandler:
     
     def _handle_connection(self, client_socket: socket.socket, address):
         """WebSocket kapcsolat kezelése"""
+        client_id = None
+        
         try:
             # WebSocket handshake
             handshake = client_socket.recv(4096).decode('utf-8')
@@ -164,7 +192,7 @@ class WebSocketHandler:
                 return
             
             # Kapcsolat regisztrálása
-            client_id = f"ws_{int(time.time())}_{address[1]}"
+            client_id = f"ws_{int(time.time())}_{address[1]}_{uuid.uuid4().hex[:8]}"
             
             conn = WebSocketConnection(
                 client_id=client_id,
@@ -211,7 +239,8 @@ class WebSocketHandler:
         except Exception as e:
             logger.error(f"WebSocket kezelési hiba: {e}")
         finally:
-            self._close_connection(client_id)
+            if client_id:
+                self._close_connection(client_id)
     
     def _perform_handshake(self, client_socket: socket.socket, handshake: str) -> bool:
         """WebSocket handshake végrehajtása"""
@@ -285,8 +314,8 @@ class WebSocketHandler:
                 except:
                     continue
                 
-                # Üzenet küldése - JAVÍTVA: payload bytes legyen
-                payload = json.dumps(message).encode('utf-8')
+                # Üzenet küldése
+                payload = json.dumps(message, default=str).encode('utf-8')
                 frame = self._create_frame(self.OP_TEXT, payload)
                 conn.socket.send(frame)
                 
@@ -319,13 +348,36 @@ class WebSocketHandler:
         
         if msg_type == 'chat:message':
             text = data.get('text', '')
-            conv_id = data.get('conversation_id', 1)
+            conv_id = data.get('conversation_id')
             
             if text:
+                # ELTÁROLJUK A KLIENSHEZ TARTOZÓ CONVERSATION_ID-T
+                if conv_id is not None:
+                    with self.connection_lock:
+                        if client_id in self.connections:
+                            self.connections[client_id].conversation_id = conv_id
+                            logger.debug(f"📨 WebSocket: conversation_id beállítva a klienshez: {conv_id}")
+                
                 if self.soulcore and hasattr(self.soulcore, 'king') and self.soulcore.king:
                     try:
+                        # Ha nincs conv_id, használjuk a klienshez tárolt értéket
+                        if conv_id is None:
+                            with self.connection_lock:
+                                if client_id in self.connections:
+                                    conv_id = self.connections[client_id].conversation_id
+                        
+                        # Ha még mindig nincs, ne küldjük el
+                        if conv_id is None:
+                            logger.warning(f"📨 WebSocket: Üzenet conversation_id nélkül, nem küldöm el a Kingnek")
+                            self._send_text(client_id, {
+                                'type': 'chat:error',
+                                'error': 'No conversation_id. Please create a conversation first.',
+                                'timestamp': time.time()
+                            })
+                            return
+                        
                         self.soulcore.king.generate_response(text, conv_id)
-                        logger.info(f"📨 WebSocket: Üzenet a Kingnek: {text[:50]}...")
+                        logger.info(f"📨 WebSocket: Üzenet a Kingnek (conv:{conv_id}): {text[:50]}...")
                     except Exception as e:
                         logger.error(f"King hiba: {e}")
                         self._send_text(client_id, {
@@ -348,11 +400,43 @@ class WebSocketHandler:
                     if client_id in self.connections:
                         self.connections[client_id].subscribed_topics.discard(topic)
         
+        elif msg_type == 'set_conversation':
+            conv_id = data.get('conversation_id')
+            if conv_id is not None:
+                with self.connection_lock:
+                    if client_id in self.connections:
+                        self.connections[client_id].conversation_id = conv_id
+                        logger.info(f"📨 WebSocket: conversation_id manuálisan beállítva: {conv_id}")
+        
+        # Egyéb callback-ek
         for callback in self.on_message_callbacks.values():
             try:
                 callback(client_id, data)
             except:
                 pass
+    
+    def _get_user_id_for_client(self, client_id: str) -> Optional[int]:
+        """Klienshez tartozó user_id lekérése"""
+        if self.soulcore and hasattr(self.soulcore, 'current_user'):
+            return self.soulcore.current_user.get('id')
+        return None
+    
+    def _create_conversation(self, db, user_id: int, title: str) -> int:
+        """Új beszélgetés létrehozása"""
+        try:
+            with db.lock:
+                conn = db._get_connection()
+                cursor = conn.execute("""
+                    INSERT INTO conversations (user_id, title)
+                    VALUES (?, ?)
+                """, (user_id, title[:100]))
+                conv_id = cursor.lastrowid
+                conn.commit()
+                conn.close()
+                return conv_id
+        except Exception as e:
+            logger.error(f"Conversation creation error: {e}")
+            return int(time.time() * 1000)
     
     def _parse_frames(self, data: bytes) -> list:
         """WebSocket frame-ek feldolgozása"""
@@ -361,6 +445,9 @@ class WebSocketHandler:
         length = len(data)
         
         while i < length:
+            if i + 1 >= length:
+                break
+                
             byte1 = data[i]
             byte2 = data[i + 1]
             
@@ -372,17 +459,26 @@ class WebSocketHandler:
             i += 2
             
             if payload_len == 126:
+                if i + 1 >= length:
+                    break
                 payload_len = int.from_bytes(data[i:i+2], 'big')
                 i += 2
             elif payload_len == 127:
+                if i + 7 >= length:
+                    break
                 payload_len = int.from_bytes(data[i:i+8], 'big')
                 i += 8
             
             mask = None
             if masked:
+                if i + 3 >= length:
+                    break
                 mask = data[i:i+4]
                 i += 4
             
+            if i + payload_len > length:
+                break
+                
             payload = data[i:i+payload_len]
             i += payload_len
             
@@ -394,7 +490,7 @@ class WebSocketHandler:
         return frames
     
     def _create_frame(self, opcode: int, payload: bytes) -> bytes:
-        """WebSocket frame létrehozása - JAVÍTVA: payload már bytes"""
+        """WebSocket frame létrehozása"""
         frame = bytearray()
         
         frame.append(0x80 | opcode)
@@ -477,7 +573,10 @@ class WebSocketHandler:
     
     def broadcast_to_conversation(self, conversation_id: int, data: Dict):
         """Üzenet küldése egy beszélgetés résztvevőinek"""
-        self.broadcast(data)
+        with self.connection_lock:
+            for client_id, conn in self.connections.items():
+                if conn.conversation_id == conversation_id:
+                    conn.send_queue.put(data)
     
     def broadcast_telemetry(self, telemetry_data: Dict):
         """Telemetria adatok broadcast-olása"""
@@ -495,9 +594,9 @@ class WebSocketHandler:
             'timestamp': time.time()
         }, topic='notifications')
     
-    def on_message(self, handler: Callable):
+    def on_message(self, handler: Callable) -> str:
         """Üzenetkezelő regisztrálása"""
-        callback_id = f"callback_{len(self.on_message_callbacks)}"
+        callback_id = f"callback_{len(self.on_message_callbacks)}_{int(time.time())}"
         self.on_message_callbacks[callback_id] = handler
         return callback_id
     
@@ -517,7 +616,8 @@ class WebSocketHandler:
                     'address': conn.address,
                     'connected_at': conn.connected_at,
                     'last_activity': conn.last_activity,
-                    'subscribed_topics': list(conn.subscribed_topics)
+                    'subscribed_topics': list(conn.subscribed_topics),
+                    'conversation_id': conn.conversation_id
                 }
                 for client_id, conn in self.connections.items()
             }
@@ -526,3 +626,13 @@ class WebSocketHandler:
         """Aktív kapcsolatok száma"""
         with self.connection_lock:
             return len(self.connections)
+    
+    def handle_upgrade(self, http_handler):
+        """
+        HTTP handlerből WebSocket upgrade kezelése.
+        Ezt a metódust hívja az APIHandler a WebSocket upgrade-hez.
+        """
+        # Itt valósítjuk meg a WebSocket upgrade-t a HTTP handler socket-jéből
+        # Jelenleg a WebSocketHandler saját szerveren fut, de ha a HTTP szerveren
+        # keresztül akarjuk upgrade-elni, itt kell implementálni
+        pass
