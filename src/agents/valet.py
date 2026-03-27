@@ -877,6 +877,80 @@ class Valet:
         
         return default
     
+    # ========== GRAPH-VAULT INTEGRÁCIÓ (KING SZÁMÁRA) ==========
+    
+    def get_emotional_charge(self, topic: str) -> float:
+        """
+        Egy adott téma érzelmi töltésének lekérése.
+        A King ezt használja a hangulatfüggő válaszadáshoz.
+        """
+        if not self.graph_available:
+            return 0.0
+        
+        try:
+            with self.graph_driver.session() as session:
+                # Próbáljuk Topic-ként
+                result = session.run(
+                    """
+                    MATCH (t:Topic {name: $topic})
+                    OPTIONAL MATCH (t)<-[:MENTIONS]-(m:Memory)
+                    RETURN avg(m.emotional_charge) as avg_charge
+                    """,
+                    topic=topic
+                )
+                record = result.single()
+                if record and record['avg_charge'] is not None:
+                    return float(record['avg_charge'])
+                
+                # Próbáljuk Entity-ként
+                result = session.run(
+                    """
+                    MATCH (e:Entity {name: $topic})
+                    OPTIONAL MATCH (e)<-[:MENTIONS]-(m:Memory)
+                    RETURN avg(m.emotional_charge) as avg_charge
+                    """,
+                    topic=topic
+                )
+                record = result.single()
+                if record and record['avg_charge'] is not None:
+                    return float(record['avg_charge'])
+                
+                return 0.0
+        except Exception as e:
+            self.state['errors'].append(f"get_emotional_charge hiba: {e}")
+            return 0.0
+    
+    def get_related_topics(self, topic: str, limit: int = 5) -> List[str]:
+        """
+        Kapcsolódó témák lekérése.
+        """
+        if not self.graph_available:
+            return []
+        
+        try:
+            with self.graph_driver.session() as session:
+                result = session.run(
+                    """
+                    MATCH (t:Topic {name: $topic})
+                    OPTIONAL MATCH (t)<-[:MENTIONS]-(m:Memory)-[:MENTIONS]->(related:Topic)
+                    WHERE related.name <> $topic
+                    RETURN related.name as name, count(m) as weight
+                    ORDER BY weight DESC
+                    LIMIT $limit
+                    """,
+                    topic=topic,
+                    limit=limit
+                )
+                topics = []
+                for record in result:
+                    name = record.get('name')
+                    if name:
+                        topics.append(name)
+                return topics
+        except Exception as e:
+            self.state['errors'].append(f"get_related_topics hiba: {e}")
+            return []
+    
     # ========== MEGLÉVŐ FUNKCIÓK (kompatibilitás) ==========
     
     def _process_recent_messages(self, recent_entries: List) -> List[str]:
@@ -1043,8 +1117,8 @@ class Valet:
             return 0.0
         
         text_lower = text.lower()
-        positive_words = ['good', 'great', 'love', 'like', 'happy', 'jó', 'szuper', 'remek']
-        negative_words = ['bad', 'terrible', 'hate', 'error', 'rossz', 'szar', 'hiba']
+        positive_words = ['good', 'great', 'love', 'like', 'happy', 'jó', 'szuper', 'remek', 'köszönöm', 'szíves']
+        negative_words = ['bad', 'terrible', 'hate', 'error', 'rossz', 'szar', 'hiba', 'nem működik', 'dühös']
         
         positive_count = sum(1 for w in positive_words if w in text_lower)
         negative_count = sum(1 for w in negative_words if w in text_lower)
@@ -1097,12 +1171,19 @@ class Valet:
         
         try:
             with self.graph_driver.session() as session:
-                session.run("""
-                    CREATE CONSTRAINT IF NOT EXISTS FOR (m:Memory) REQUIRE m.uuid IS UNIQUE
-                """)
-                session.run("""
-                    CREATE INDEX IF NOT EXISTS FOR (m:Memory) ON (m.created_at)
-                """)
+                # Constraints
+                session.run("CREATE CONSTRAINT IF NOT EXISTS FOR (m:Memory) REQUIRE m.uuid IS UNIQUE")
+                session.run("CREATE CONSTRAINT IF NOT EXISTS FOR (t:Topic) REQUIRE t.name IS UNIQUE")
+                session.run("CREATE CONSTRAINT IF NOT EXISTS FOR (e:Entity) REQUIRE e.name IS UNIQUE")
+                session.run("CREATE CONSTRAINT IF NOT EXISTS FOR (p:Person) REQUIRE p.uuid IS UNIQUE")
+                
+                # Indexes
+                session.run("CREATE INDEX IF NOT EXISTS FOR (m:Memory) ON (m.created_at)")
+                session.run("CREATE INDEX IF NOT EXISTS FOR (t:Topic) ON (t.name)")
+                session.run("CREATE INDEX IF NOT EXISTS FOR (e:Entity) ON (e.name)")
+                session.run("CREATE INDEX IF NOT EXISTS FOR ()-[r:MENTIONS]-() ON (r.emotional_charge)")
+                session.run("CREATE INDEX IF NOT EXISTS FOR ()-[r:RELATIONSHIP]-() ON (r.emotional_charge)")
+                
         except Exception as e:
             self.state['errors'].append(f"Graph séma hiba: {e}")
     
